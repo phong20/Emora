@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - agent/recursive-specialization-tco-guard
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -51,9 +54,10 @@ jobs:
             tests/recursive-stack-guard-native.js
           do
             cargo run -p ecmora-cli -- check "$test"
+            cargo run -p ecmora-cli -- dump-ssa "$test"
             cargo run -p ecmora-cli -- dump-llvm "$test"
           done
-          grep -R "tail_call" target/ecmora/*.ssa.txt 2>/dev/null || true
+          grep -R "tail_call" target/ecmora/*.ssa.txt
 
       - name: Build and execute success fixtures
         shell: bash
@@ -90,6 +94,7 @@ jobs:
           grep -q "Ecmora RangeError: maximum native recursion depth" "target/${stem}.stderr"
 
       - name: Commit validated implementation
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euxo pipefail
