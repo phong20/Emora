@@ -21,6 +21,8 @@ recursive function does not prove stack-overflow protection.
 - **IGNORED CONTRACT**: desired compile/IR behaviour is already represented by
   an ignored test. The owning phase must enable it and remove the matching
   baseline-error assertion.
+- **PARSE FIXTURE**: the complete source case is reserved and frontend-tested,
+  but its owning compiler/runtime layer does not exist yet.
 - **HARNESS REQUIRED**: the source fixture is reserved, but a native executable
   runner is required before the runtime claim can be tested honestly.
 
@@ -36,12 +38,12 @@ recursive function does not prove stack-overflow protection.
 | R06 | A recursive edge changes the argument type and creates another specialization | BASELINE ERROR + IGNORED CONTRACT | phases 8-9 | The specialization graph reaches a fixed point without infinite compiler recursion. |
 | R07 | A recursive specialization carries a devirtualized callback | BASELINE ERROR + IGNORED CONTRACT | phases 10-11 | Callable identity/signature participates in the specialization key and recursive graph. |
 | R08 | Self tail recursion | GREEN baseline + IGNORED CONTRACT | phases 13-15, 18 | Before TCO a normal self-call exists; after TCO no normal recursive call remains. |
-| R09 | Mutual tail recursion | source fixture to add with TailCall IR | phase 16 | The recursive SCC executes through a trampoline or equivalent bounded-stack dispatch loop. |
-| R10 | Tail call through a statically proven callback | source fixture to add with callable TailCall support | phase 17 | The optimized path does not allocate one native frame per logical call. |
-| R11 | Deep non-tail recursion | HARNESS REQUIRED | phases 19-20 | Execution terminates with a JavaScript `RangeError`; the process must not crash or abort. |
-| R12 | Infinite recursion whose return participates in arithmetic | HARNESS REQUIRED | phases 7, 19-20 | It compiles using the expected Number type and later throws `RangeError` through the completion ABI. |
-| R13 | Specialization explosion | source fixture to add with budget policy | phase 9 | Compilation terminates at the configured budget and widens or selects generic fallback deterministically. |
-| R14 | Typed specialization crossing to tagged generic fallback | source fixture to add with generic ABI | phase 22 | Arguments, return value and thrown completion survive both boundary directions. |
+| R09 | Mutual tail recursion | PARSE FIXTURE + IGNORED CONTRACT | phase 16 | The normal direct-call cycle is replaced by a bounded-stack trampoline or equivalent dispatch loop. |
+| R10 | Tail call through a statically proven callback | PARSE FIXTURE + IGNORED CONTRACT | phase 17 | The source reaches tail lowering and does not allocate one native frame per logical call. |
+| R11 | Deep non-tail recursion | PARSE FIXTURE + HARNESS REQUIRED | phases 19-20 | Execution terminates with a JavaScript `RangeError`; the process must not crash or abort. |
+| R12 | Infinite recursion whose return participates in arithmetic | PARSE FIXTURE + HARNESS REQUIRED | phases 7, 19-20 | It compiles using the expected Number type and later throws `RangeError` through the completion ABI. |
+| R13 | Recursive callback identities exceed the specialization budget | PARSE FIXTURE | phase 9 | Compilation terminates at the configured budget and widens or selects generic fallback deterministically. |
+| R14 | Typed recursion crosses to tagged generic fallback | PARSE FIXTURE | phase 22 | Arguments, return value and thrown completion survive both boundary directions. |
 
 ## Implemented test file
 
@@ -50,9 +52,14 @@ recursive function does not prove stack-overflow protection.
 - enabled positive IR tests for R01-R04;
 - an enabled pre-TCO baseline for R08;
 - enabled stable current-diagnostic tests for R05-R07;
-- ignored future acceptance tests for R05-R08;
-- frontend parse checks for every source fixture already introduced, including
-  the stack-overflow fixture.
+- ignored future acceptance tests for R05-R10;
+- frontend parse checks for all source contracts R05-R14, including deep
+  non-tail recursion, infinite recursion, specialization-budget pressure and
+  the typed/generic fallback boundary.
+
+The stack rows are intentionally not represented by a fake analysis-only
+assertion. Phases 19-20 must add a native executable test harness and verify the
+actual process result and JavaScript error completion.
 
 ## Rules for later phases
 
