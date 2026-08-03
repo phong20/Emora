@@ -73,6 +73,18 @@ struct ClosureBinding {
     captures: Vec<CapturedBinding>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveSpecialization {
+    /// Tên function trong IR, ví dụ `js.__m0_sum.0`.
+    function_name: String,
+
+    /// Return type được suy ra trước khi lower body.
+    ///
+    /// Recursive call cần biết type ngay lập tức, trước khi body của function
+    /// hiện tại được hoàn tất.
+    return_type: ValueType,
+}
+
 #[derive(Debug, Clone, Default)]
 struct StaticAccessor {
     getter: Option<ClosureBinding>,
@@ -113,7 +125,7 @@ struct Lowerer {
     return_types: Vec<ValueType>,
     next_function: u32,
     specializations: HashMap<String, (String, ValueType)>,
-    active_specializations: HashSet<String>,
+    active_specializations: HashMap<String, ActiveSpecialization>,
     static_accessors: HashMap<(ValueId, String), StaticAccessor>,
     static_object_callables: HashMap<(ValueId, String), ClosureBinding>,
     promise_payloads: HashMap<ValueId, (ValueId, ValueType, Option<Value>)>,
@@ -348,7 +360,7 @@ impl Lowerer {
                         ..
                     }) = &declaration.init
                     {
-                        let captures = self.capture_environment();
+                        let captures = self.capture_environment_for(function);
                         self.closure_callables.insert(
                             declaration.name.clone(),
                             ClosureBinding {
@@ -1126,18 +1138,22 @@ impl Lowerer {
                         ObjectEntry::Property(property) => {
                             let key = self.lower_property_key(&property.key)?;
                             if let ExpressionKind::Global(name) = &property.value.kind {
-                                let callable = self
-                                    .closure_callables
-                                    .get(name)
-                                    .cloned()
-                                    .or_else(|| {
-                                        self.function_defs.get(name).cloned().map(|function| {
-                                            ClosureBinding {
-                                                function,
-                                                captures: self.capture_environment(),
-                                            }
+                                let callable = if let Some(closure) =
+                                        self.closure_callables.get(name).cloned()
+                                    {
+                                        Some(closure)
+                                    } else if let Some(function) =
+                                        self.function_defs.get(name).cloned()
+                                    {
+                                        let captures = self.capture_environment_for(&function);
+
+                                        Some(ClosureBinding {
+                                            function,
+                                            captures,
                                         })
-                                    });
+                                    } else {
+                                        None
+                                    };
                                 if let Some(callable) = callable {
                                     self.static_object_callables
                                         .insert((object_id, key), callable);
@@ -1178,24 +1194,34 @@ impl Lowerer {
                             }
                         }
                         ObjectEntry::Accessor { key, get, set } => {
-                            let getter = get.as_ref().map(|expression| {
+                            let getter = if let Some(expression) = get {
                                 let ExpressionKind::Function(function) = &expression.kind else {
                                     unreachable!("frontend accessor getter phải là function")
                                 };
-                                ClosureBinding {
+
+                                let captures = self.capture_environment_for(function);
+
+                                Some(ClosureBinding {
                                     function: function.clone(),
-                                    captures: self.capture_environment(),
-                                }
-                            });
-                            let setter = set.as_ref().map(|expression| {
+                                    captures,
+                                })
+                            } else {
+                                None
+                            };
+                            let setter = if let Some(expression) = set {
                                 let ExpressionKind::Function(function) = &expression.kind else {
                                     unreachable!("frontend accessor setter phải là function")
                                 };
-                                ClosureBinding {
+
+                                let captures = self.capture_environment_for(function);
+
+                                Some(ClosureBinding {
                                     function: function.clone(),
-                                    captures: self.capture_environment(),
-                                }
-                            });
+                                    captures,
+                                })
+                            } else {
+                                None
+                            };
                             let entry = self
                                 .static_accessors
                                 .entry((object_id, key.clone()))
@@ -2127,16 +2153,32 @@ impl Lowerer {
             }
         }
         if let ExpressionKind::Global(name) = &callee.kind {
-            let function = self
-                .inline_callables
-                .get(name)
-                .or_else(|| self.function_defs.get(name))
-                .cloned();
-            if let Some(function) = function {
+            if let Some(function) = self.inline_callables.get(name).cloned() {
                 if function.r#async {
                     return self.lower_async_call(name, &function, arguments);
                 }
-                return self.lower_inline_call(name, &function, arguments, None);
+
+                return self.lower_inline_call(
+                    name,
+                    &function,
+                    arguments,
+                    None,
+                );
+            }
+
+            if let Some(function) = self.function_defs.get(name).cloned() {
+                if function.r#async {
+                    return self.lower_async_call(name, &function, arguments);
+                }
+
+                let captures = self.capture_environment_for(&function);
+
+                return self.lower_inline_call(
+                    name,
+                    &function,
+                    arguments,
+                    Some(&captures),
+                );
             }
         }
         if let ExpressionKind::Global(name) = &callee.kind {
@@ -2232,17 +2274,23 @@ impl Lowerer {
                     anyhow::anyhow!("Promise.{method} cần callback")
                 })?;
                 let callback = match &callback.kind {
-                    ExpressionKind::Function(function) => ClosureBinding {
-                        function: function.clone(),
-                        captures: self.capture_environment(),
-                    },
+                    ExpressionKind::Function(function) => {
+                        let captures = self.capture_environment_for(function);
+
+                        ClosureBinding {
+                            function: function.clone(),
+                            captures,
+                        }
+                    }
                     ExpressionKind::Global(name) => {
                         if let Some(closure) = self.closure_callables.get(name).cloned() {
                             closure
                         } else if let Some(function) = self.function_defs.get(name).cloned() {
+                            let captures = self.capture_environment_for(&function);
+
                             ClosureBinding {
                                 function,
-                                captures: self.capture_environment(),
+                                captures,
                             }
                         } else {
                             bail!("Promise callback `{name}` không phải function tĩnh")
@@ -2559,7 +2607,6 @@ impl Lowerer {
             self.promise_order.push(result);
             return Ok((result, ValueType::Promise, None));
         }
-        let captures = self.capture_environment();
         let continuation = HirFunction {
             name: None,
             parameters: Vec::new(),
@@ -2568,6 +2615,8 @@ impl Lowerer {
             arrow: true,
             lowering_error: function.lowering_error.clone(),
         };
+
+        let captures = self.capture_environment_for(&continuation);
         self.scopes.pop();
         let result = self.new_value();
         self.emit(Instruction::PromisePending { result });
@@ -2585,6 +2634,67 @@ impl Lowerer {
         );
         self.promise_order.push(result);
         Ok((result, ValueType::Promise, None))
+    }
+
+    fn emit_specialization_call(
+        &mut self,
+        function_name: &str,
+        return_type: ValueType,
+        call_arguments: &[(ValueId, ValueType, Option<Value>)],
+        captures: &[CapturedBinding],
+    ) -> (ValueId, ValueType, Option<Value>) {
+        let result = self.new_value();
+
+        if captures.is_empty() {
+            self.last_callable = None;
+
+            self.emit(Instruction::CallDirect {
+                result,
+                function: function_name.to_owned(),
+                arguments: call_arguments
+                    .iter()
+                    .map(|value| value.0)
+                    .collect(),
+                argument_types: call_arguments
+                    .iter()
+                    .map(|value| value.1)
+                    .collect(),
+                return_type,
+            });
+        } else {
+            // Recursive function có closure environment vẫn có thể gọi lại chính
+            // nó bằng cách tạo closure mới trỏ tới cùng function body nhưng dùng
+            // các Cell capture hiện tại.
+            let closure = self.new_value();
+
+            self.emit(Instruction::ClosureNew {
+                result: closure,
+                function: function_name.to_owned(),
+                captures: captures
+                    .iter()
+                    .map(|capture| capture.cell)
+                    .collect(),
+                capture_types: vec![ValueType::Cell; captures.len()],
+            });
+
+            self.last_callable = Some(closure);
+
+            self.emit(Instruction::CallIndirect {
+                result,
+                callee: closure,
+                arguments: call_arguments
+                    .iter()
+                    .map(|value| value.0)
+                    .collect(),
+                argument_types: call_arguments
+                    .iter()
+                    .map(|value| value.1)
+                    .collect(),
+                return_type,
+            });
+        }
+
+        (result, return_type, None)
     }
 
     fn lower_inline_call(
@@ -2607,54 +2717,122 @@ impl Lowerer {
         let mut call_arguments = Vec::new();
         let mut parameters = Vec::new();
         let mut callbacks = HashMap::new();
+        let mut parameter_type_hints = HashMap::new();
         for (parameter, argument) in function.parameters.iter().zip(arguments) {
             if let ExpressionKind::Function(callback) = &argument.kind {
-                callbacks.insert(parameter.clone(), callback.clone());
+                parameter_type_hints.insert(
+                    parameter.clone(),
+                    ValueType::Callable,
+                );
+
+                callbacks.insert(
+                    parameter.clone(),
+                    callback.clone(),
+                );
             } else {
                 let value = self.lower_expression(argument)?;
-                parameters.push((parameter.clone(), value.1));
+
+                parameter_type_hints.insert(
+                    parameter.clone(),
+                    value.1,
+                );
+
+                parameters.push((
+                    parameter.clone(),
+                    value.1,
+                ));
+
                 call_arguments.push(value);
             }
         }
 
         let captures = captures.unwrap_or_default();
+
+        let capture_signature = captures
+            .iter()
+            .map(|capture| {
+                (
+                    capture.name.as_str(),
+                    capture.value_type,
+                )
+            })
+            .collect::<Vec<_>>();
+
         let specialization_key = format!(
-            "{}::{:?}",
+            "{}::{:?}::{capture_signature:?}",
             name,
             parameters
                 .iter()
                 .map(|(_, value_type)| *value_type)
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         );
-        if callbacks.is_empty() && captures.is_empty() {
-            if let Some((function_name, return_type)) =
-                self.specializations.get(&specialization_key).cloned()
+
+        // Trường hợp function hiện đang được lower: đây chính là recursive
+        // hoặc mutually-recursive call.
+        if let Some(active) = self
+            .active_specializations
+            .get(&specialization_key)
+            .cloned()
+        {
+            if !callbacks.is_empty() {
+                bail!(
+                    "recursive function `{name}` với devirtualized callback \
+                    chưa được hỗ trợ"
+                )
+            }
+
+            return Ok(self.emit_specialization_call(
+                &active.function_name,
+                active.return_type,
+                &call_arguments,
+                captures,
+            ));
+        }
+
+        // Giữ chính sách cache cũ. Function có captures vẫn được predeclare cho
+        // recursion, nhưng chưa cache lâu dài sau khi lower xong.
+        let cacheable = callbacks.is_empty() && captures.is_empty();
+
+        if cacheable {
+            if let Some((function_name, return_type)) = self
+                .specializations
+                .get(&specialization_key)
+                .cloned()
             {
-                let result = self.new_value();
-                self.emit(Instruction::CallDirect {
-                    result,
-                    function: function_name,
-                    arguments: call_arguments.iter().map(|value| value.0).collect(),
-                    argument_types: call_arguments.iter().map(|value| value.1).collect(),
+                return Ok(self.emit_specialization_call(
+                    &function_name,
                     return_type,
-                });
-                return Ok((result, return_type, None));
+                    &call_arguments,
+                    captures,
+                ));
             }
         }
-        if self.active_specializations.contains(&specialization_key) {
-            bail!(
-                "recursive specialization `{name}` detected; native recursion ABI cần function predeclaration"
-            )
-        }
-        self.active_specializations.insert(specialization_key.clone());
-        let cacheable = callbacks.is_empty() && captures.is_empty();
+
+        let declared_return_type = infer_function_return_type(
+            function,
+            &parameter_type_hints,
+            captures,
+        );
 
         let specialization_id = self.next_function;
         self.next_function += 1;
+
         let function_name = format!(
             "js.{}.{}",
             sanitize_function_name(name),
-            specialization_id
+            specialization_id,
+        );
+
+        // Đây là function predeclaration ở tầng analysis.
+        //
+        // Từ thời điểm này, recursive calls có thể phát CallDirect/CallIndirect
+        // tới function_name dù body chưa được lower xong.
+        self.active_specializations.insert(
+            specialization_key.clone(),
+            ActiveSpecialization {
+                function_name: function_name.clone(),
+                return_type: declared_return_type,
+            },
         );
         let mut child = Lowerer {
             next_value: self.next_value,
@@ -2734,12 +2912,20 @@ impl Lowerer {
                 value_type: ValueType::Undefined,
             });
         }
-        let return_type = child
-            .return_types
-            .first()
-            .copied()
-            .filter(|first| child.return_types.iter().all(|value| value == first))
-            .unwrap_or(ValueType::Dynamic);
+        if declared_return_type != ValueType::Dynamic {
+            for actual in &child.return_types {
+                if *actual != declared_return_type {
+                    bail!(
+                        "recursive specialization `{name}` được predeclare trả \
+                        {:?}, nhưng body có return {:?}",
+                        declared_return_type,
+                        actual,
+                    )
+                }
+            }
+        }
+
+        let return_type = declared_return_type;
         let blocks = std::mem::take(&mut child.blocks)
             .into_iter()
             .map(|block| BasicBlock {
@@ -2769,66 +2955,93 @@ impl Lowerer {
             );
         }
 
-        let result = self.new_value();
-        if captures.is_empty() {
-            self.last_callable = None;
-            self.emit(Instruction::CallDirect {
-                result,
-                function: function_name,
-                arguments: call_arguments.iter().map(|value| value.0).collect(),
-                argument_types: call_arguments.iter().map(|value| value.1).collect(),
-                return_type,
-            });
-        } else {
-            let closure = self.new_value();
-            self.last_callable = Some(closure);
-            self.emit(Instruction::ClosureNew {
-                result: closure,
-                function: function_name,
-                captures: captures.iter().map(|capture| capture.cell).collect(),
-                capture_types: vec![ValueType::Cell; captures.len()],
-            });
-            self.emit(Instruction::CallIndirect {
-                result,
-                callee: closure,
-                arguments: call_arguments.iter().map(|value| value.0).collect(),
-                argument_types: call_arguments.iter().map(|value| value.1).collect(),
-                return_type,
-            });
-        }
-        Ok((result, return_type, None))
+        Ok(self.emit_specialization_call(
+            &function_name,
+            return_type,
+            &call_arguments,
+            captures,
+        ))
     }
 
-    fn capture_environment(&mut self) -> Vec<CapturedBinding> {
+    fn capture_environment_for(
+        &mut self,
+        function: &HirFunction,
+    ) -> Vec<CapturedBinding> {
+        let free_names = FreeVariableCollector::collect(function);
+
         let callable_names = self
             .closure_callables
             .keys()
             .cloned()
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<HashSet<_>>();
+
+        // Sắp xếp để thứ tự capture ổn định giữa các lần build.
+        let mut free_names = free_names.into_iter().collect::<Vec<_>>();
+        free_names.sort();
+
         let mut bindings = Vec::new();
-        for (scope_index, scope) in self.scopes.iter().enumerate() {
-            for (name, binding) in scope {
-                if binding.initialized && !callable_names.contains(name) {
-                    bindings.push((scope_index, name.clone(), binding.clone()));
-                }
+
+        for name in free_names {
+            // Function-valued binding hiện được lower thông qua closure_callables,
+            // chưa được truyền như một runtime Cell thông thường.
+            if callable_names.contains(&name) {
+                continue;
             }
+
+            // Một identifier có thể bị shadow. Chỉ capture binding gần nhất.
+            let binding = self
+                .scopes
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(scope_index, scope)| {
+                    scope
+                        .get(&name)
+                        .cloned()
+                        .map(|binding| (scope_index, binding))
+                });
+
+            let Some((scope_index, binding)) = binding else {
+                // Builtin như console, Promise, Object hoặc một function được
+                // quản lý bởi function_defs không phải lexical capture.
+                continue;
+            };
+
+            if !binding.initialized {
+                // Không capture binding vẫn đang ở TDZ.
+                continue;
+            }
+
+            bindings.push((scope_index, name, binding));
         }
+
         let mut captures = Vec::with_capacity(bindings.len());
+
         for (scope_index, name, binding) in bindings {
             let cell = if let Some(cell) = binding.cell {
                 cell
             } else {
                 let cell = self.new_value();
+
                 self.emit(Instruction::CellNew {
                     result: cell,
                     value: binding.value_id,
                     value_type: binding.value_type,
                 });
-                let binding = self.scopes[scope_index].get_mut(&name).unwrap();
-                binding.cell = Some(cell);
-                binding.value = None;
+
+                let outer_binding = self.scopes[scope_index]
+                    .get_mut(&name)
+                    .expect("captured binding phải còn tồn tại");
+
+                outer_binding.cell = Some(cell);
+
+                // Từ thời điểm biến nằm trong Cell, compiler không được giữ
+                // literal value cũ làm nguồn chân lý nữa.
+                outer_binding.value = None;
+
                 cell
             };
+
             captures.push(CapturedBinding {
                 name,
                 kind: binding.kind,
@@ -2836,9 +3049,9 @@ impl Lowerer {
                 value_type: binding.value_type,
             });
         }
+
         captures
     }
-
     fn drain_promise_jobs(&mut self) -> Result<()> {
         let chained = self
             .promise_chains
@@ -3062,6 +3275,956 @@ impl Lowerer {
             }
         });
         result
+    }
+}
+
+#[derive(Debug, Default)]
+struct FreeVariableCollector {
+    /// Các lexical scope nằm bên trong function đang được phân tích.
+    scopes: Vec<HashSet<String>>,
+
+    /// Identifier được dùng nhưng không được khai báo trong function.
+    free: HashSet<String>,
+}
+
+impl FreeVariableCollector {
+    fn collect(function: &HirFunction) -> HashSet<String> {
+        let mut collector = Self::default();
+
+        // Function scope chứa tên function và parameters.
+        let mut function_scope = HashSet::new();
+
+        // Tên function phải được coi là local để recursion không trở thành
+        // một captured variable.
+        if let Some(name) = &function.name {
+            function_scope.insert(name.clone());
+        }
+
+        function_scope.extend(function.parameters.iter().cloned());
+
+        collector.scopes.push(function_scope);
+        collector.predeclare_current_scope(&function.body);
+        collector.walk_statements(&function.body);
+        collector.scopes.pop();
+
+        collector.free
+    }
+
+    fn current_scope_mut(&mut self) -> &mut HashSet<String> {
+        self.scopes
+            .last_mut()
+            .expect("free-variable collector phải có scope")
+    }
+
+    /// Khai báo trước các binding trực tiếp thuộc lexical scope hiện tại.
+    ///
+    /// Không đi vào block con vì block con có scope riêng.
+    fn predeclare_current_scope(&mut self, statements: &[Statement]) {
+        for statement in statements {
+            match &statement.kind {
+                StatementKind::VariableDeclaration { declarations, .. } => {
+                    for declaration in declarations {
+                        self.current_scope_mut()
+                            .insert(declaration.name.clone());
+                    }
+                }
+
+                StatementKind::FunctionDeclaration(function) => {
+                    if let Some(name) = &function.name {
+                        self.current_scope_mut().insert(name.clone());
+                    }
+                }
+
+                _ => {}
+            }
+        }
+    }
+
+    fn use_name(&mut self, name: &str) {
+        let is_local = self
+            .scopes
+            .iter()
+            .rev()
+            .any(|scope| scope.contains(name));
+
+        if !is_local {
+            self.free.insert(name.to_owned());
+        }
+    }
+
+    fn walk_statements(&mut self, statements: &[Statement]) {
+        for statement in statements {
+            self.walk_statement(statement);
+        }
+    }
+
+    fn walk_statement(&mut self, statement: &Statement) {
+        match &statement.kind {
+            StatementKind::Expression(expression)
+            | StatementKind::Throw(expression) => {
+                self.walk_expression(expression);
+            }
+
+            StatementKind::VariableDeclaration { declarations, .. } => {
+                // Tên đã được predeclare. Ở đây chỉ phân tích initializer.
+                for declaration in declarations {
+                    if let Some(initializer) = &declaration.init {
+                        self.walk_expression(initializer);
+                    }
+                }
+            }
+
+            StatementKind::Block(statements) => {
+                self.scopes.push(HashSet::new());
+                self.predeclare_current_scope(statements);
+                self.walk_statements(statements);
+                self.scopes.pop();
+            }
+
+            StatementKind::If {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.walk_expression(test);
+                self.walk_statement(consequent);
+
+                if let Some(alternate) = alternate {
+                    self.walk_statement(alternate);
+                }
+            }
+
+            StatementKind::While { test, body } => {
+                self.walk_expression(test);
+                self.walk_statement(body);
+            }
+
+            StatementKind::DoWhile { body, test } => {
+                self.walk_statement(body);
+                self.walk_expression(test);
+            }
+
+            StatementKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                // Lowerer hiện tạo scope riêng khi for có initializer.
+                let has_for_scope = init.is_some();
+
+                if has_for_scope {
+                    self.scopes.push(HashSet::new());
+                }
+
+                if let Some(init) = init {
+                    match init {
+                        ForInit::VariableDeclaration { declarations, .. } => {
+                            // Binding trong for phải tồn tại trước initializer
+                            // để xử lý shadowing/TDZ chính xác hơn.
+                            for declaration in declarations {
+                                self.current_scope_mut()
+                                    .insert(declaration.name.clone());
+                            }
+
+                            for declaration in declarations {
+                                if let Some(initializer) = &declaration.init {
+                                    self.walk_expression(initializer);
+                                }
+                            }
+                        }
+
+                        ForInit::Expression(expression) => {
+                            self.walk_expression(expression);
+                        }
+                    }
+                }
+
+                if let Some(test) = test {
+                    self.walk_expression(test);
+                }
+
+                if let Some(update) = update {
+                    self.walk_expression(update);
+                }
+
+                self.walk_statement(body);
+
+                if has_for_scope {
+                    self.scopes.pop();
+                }
+            }
+
+            StatementKind::ForIn {
+                name,
+                right,
+                body,
+                ..
+            }
+            | StatementKind::ForOf {
+                name,
+                right,
+                body,
+                ..
+            } => {
+                // RHS được đánh giá ngoài binding của vòng lặp.
+                self.walk_expression(right);
+
+                self.scopes.push(HashSet::new());
+                self.current_scope_mut().insert(name.clone());
+                self.walk_statement(body);
+                self.scopes.pop();
+            }
+
+            StatementKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.walk_expression(discriminant);
+
+                // Các case dùng chung lexical scope của switch.
+                self.scopes.push(HashSet::new());
+
+                for case in cases {
+                    self.predeclare_current_scope(&case.consequent);
+                }
+
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        self.walk_expression(test);
+                    }
+
+                    self.walk_statements(&case.consequent);
+                }
+
+                self.scopes.pop();
+            }
+
+            StatementKind::FunctionDeclaration(function) => {
+                // Function declaration là closure được tạo trong scope hiện tại.
+                // Ta phải đi vào function con để propagate captures xuyên cấp.
+                self.walk_nested_function(function);
+            }
+
+            StatementKind::Return(expression) => {
+                if let Some(expression) = expression {
+                    self.walk_expression(expression);
+                }
+            }
+
+            StatementKind::Break | StatementKind::Continue => {}
+        }
+    }
+
+    fn walk_expression(&mut self, expression: &Expression) {
+        match &expression.kind {
+            ExpressionKind::Global(name) => {
+                self.use_name(name);
+            }
+
+            ExpressionKind::Member { object, property } => {
+                self.walk_expression(object);
+
+                if let MemberProperty::Computed(property) = property {
+                    self.walk_expression(property);
+                }
+            }
+
+            ExpressionKind::Object(entries) => {
+                for entry in entries {
+                    match entry {
+                        ObjectEntry::Property(property) => {
+                            if let MemberProperty::Computed(key) = &property.key {
+                                self.walk_expression(key);
+                            }
+
+                            self.walk_expression(&property.value);
+                        }
+
+                        ObjectEntry::Spread(expression) => {
+                            self.walk_expression(expression);
+                        }
+
+                        ObjectEntry::Accessor { get, set, .. } => {
+                            if let Some(getter) = get {
+                                self.walk_expression(getter);
+                            }
+
+                            if let Some(setter) = set {
+                                self.walk_expression(setter);
+                            }
+                        }
+                    }
+                }
+            }
+
+            ExpressionKind::Array(elements) => {
+                for element in elements {
+                    match element {
+                        ArrayElement::Expression(expression)
+                        | ArrayElement::Spread(expression) => {
+                            self.walk_expression(expression);
+                        }
+
+                        ArrayElement::Hole => {}
+                    }
+                }
+            }
+
+            ExpressionKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.walk_expression(test);
+                self.walk_expression(consequent);
+                self.walk_expression(alternate);
+            }
+
+            ExpressionKind::Unary { argument, .. }
+            | ExpressionKind::Await(argument) => {
+                self.walk_expression(argument);
+            }
+
+            ExpressionKind::Binary { left, right, .. }
+            | ExpressionKind::Logical { left, right, .. } => {
+                self.walk_expression(left);
+                self.walk_expression(right);
+            }
+
+            ExpressionKind::Assignment { target, value, .. } => {
+                self.walk_assignment_target(target);
+                self.walk_expression(value);
+            }
+
+            ExpressionKind::Update { target, .. } => {
+                self.walk_assignment_target(target);
+            }
+
+            ExpressionKind::Call { callee, arguments }
+            | ExpressionKind::New { callee, arguments } => {
+                self.walk_expression(callee);
+
+                for argument in arguments {
+                    self.walk_expression(argument);
+                }
+            }
+
+            ExpressionKind::Function(function) => {
+                self.walk_nested_function(function);
+            }
+
+            ExpressionKind::String(_)
+            | ExpressionKind::Number(_)
+            | ExpressionKind::Bool(_)
+            | ExpressionKind::Null => {}
+        }
+    }
+
+    fn walk_assignment_target(&mut self, target: &AssignmentTarget) {
+        match target {
+            AssignmentTarget::Identifier(name) => {
+                // Gán vào identifier vẫn là một binding reference.
+                self.use_name(name);
+            }
+
+            AssignmentTarget::Member { object, property } => {
+                self.walk_expression(object);
+
+                if let MemberProperty::Computed(property) = property {
+                    self.walk_expression(property);
+                }
+            }
+        }
+    }
+
+    fn walk_nested_function(&mut self, function: &HirFunction) {
+        let mut function_scope = HashSet::new();
+
+        if let Some(name) = &function.name {
+            function_scope.insert(name.clone());
+        }
+
+        function_scope.extend(function.parameters.iter().cloned());
+
+        self.scopes.push(function_scope);
+        self.predeclare_current_scope(&function.body);
+        self.walk_statements(&function.body);
+        self.scopes.pop();
+    }
+}
+
+#[derive(Debug, Default)]
+struct ReturnTypeHints {
+    known: Vec<ValueType>,
+    has_unknown: bool,
+}
+
+fn infer_function_return_type(
+    function: &HirFunction,
+    parameter_types: &HashMap<String, ValueType>,
+    captures: &[CapturedBinding],
+) -> ValueType {
+    let mut bindings = parameter_types.clone();
+
+    for capture in captures {
+        bindings.insert(capture.name.clone(), capture.value_type);
+    }
+
+    let mut hints = ReturnTypeHints::default();
+
+    collect_return_type_hints(
+        &function.body,
+        &mut bindings,
+        function.name.as_deref(),
+        &mut hints,
+    );
+
+    // Function có đường chạy tới cuối body sẽ return undefined.
+    if !statements_always_terminate(&function.body) {
+        hints.known.push(ValueType::Undefined);
+    }
+
+    let Some(first) = hints.known.first().copied() else {
+        return if hints.has_unknown {
+            ValueType::Dynamic
+        } else {
+            ValueType::Undefined
+        };
+    };
+
+    if hints.known.iter().all(|value_type| *value_type == first) {
+        // Unknown return thường chính là recursive call. Base case đã cung cấp
+        // type seed cho nó.
+        first
+    } else {
+        ValueType::Dynamic
+    }
+}
+
+fn collect_return_type_hints(
+    statements: &[Statement],
+    bindings: &mut HashMap<String, ValueType>,
+    recursive_name: Option<&str>,
+    hints: &mut ReturnTypeHints,
+) {
+    for statement in statements {
+        match &statement.kind {
+            StatementKind::Expression(_) => {}
+
+            StatementKind::VariableDeclaration { declarations, .. } => {
+                for declaration in declarations {
+                    let value_type = declaration
+                        .init
+                        .as_ref()
+                        .and_then(|expression| {
+                            infer_expression_type_hint(
+                                expression,
+                                bindings,
+                                recursive_name,
+                            )
+                        })
+                        .unwrap_or(ValueType::Undefined);
+
+                    bindings.insert(declaration.name.clone(), value_type);
+                }
+            }
+
+            StatementKind::Block(body) => {
+                let mut block_bindings = bindings.clone();
+
+                collect_return_type_hints(
+                    body,
+                    &mut block_bindings,
+                    recursive_name,
+                    hints,
+                );
+            }
+
+            StatementKind::If {
+                test: _,
+                consequent,
+                alternate,
+            } => {
+                let mut then_bindings = bindings.clone();
+
+                collect_return_type_hint_from_statement(
+                    consequent,
+                    &mut then_bindings,
+                    recursive_name,
+                    hints,
+                );
+
+                if let Some(alternate) = alternate {
+                    let mut else_bindings = bindings.clone();
+
+                    collect_return_type_hint_from_statement(
+                        alternate,
+                        &mut else_bindings,
+                        recursive_name,
+                        hints,
+                    );
+                }
+            }
+
+            StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. } => {
+                let mut loop_bindings = bindings.clone();
+
+                collect_return_type_hint_from_statement(
+                    body,
+                    &mut loop_bindings,
+                    recursive_name,
+                    hints,
+                );
+            }
+
+            StatementKind::For {
+                init,
+                body,
+                ..
+            } => {
+                let mut loop_bindings = bindings.clone();
+
+                if let Some(init) = init {
+                    match init {
+                        ForInit::VariableDeclaration {
+                            declarations,
+                            ..
+                        } => {
+                            for declaration in declarations {
+                                let value_type = declaration
+                                    .init
+                                    .as_ref()
+                                    .and_then(|expression| {
+                                        infer_expression_type_hint(
+                                            expression,
+                                            &loop_bindings,
+                                            recursive_name,
+                                        )
+                                    })
+                                    .unwrap_or(ValueType::Undefined);
+
+                                loop_bindings.insert(
+                                    declaration.name.clone(),
+                                    value_type,
+                                );
+                            }
+                        }
+
+                        ForInit::Expression(_) => {}
+                    }
+                }
+
+                collect_return_type_hint_from_statement(
+                    body,
+                    &mut loop_bindings,
+                    recursive_name,
+                    hints,
+                );
+            }
+
+            StatementKind::ForIn {
+                name,
+                body,
+                ..
+            }
+            | StatementKind::ForOf {
+                name,
+                body,
+                ..
+            } => {
+                let mut loop_bindings = bindings.clone();
+                loop_bindings.insert(name.clone(), ValueType::Dynamic);
+
+                collect_return_type_hint_from_statement(
+                    body,
+                    &mut loop_bindings,
+                    recursive_name,
+                    hints,
+                );
+            }
+
+            StatementKind::Switch { cases, .. } => {
+                for case in cases {
+                    let mut case_bindings = bindings.clone();
+
+                    collect_return_type_hints(
+                        &case.consequent,
+                        &mut case_bindings,
+                        recursive_name,
+                        hints,
+                    );
+                }
+            }
+
+            StatementKind::FunctionDeclaration(function) => {
+                if let Some(name) = &function.name {
+                    bindings.insert(name.clone(), ValueType::Callable);
+                }
+
+                // Không gom return của nested function vào outer function.
+            }
+
+            StatementKind::Return(expression) => {
+                match expression {
+                    Some(expression) => {
+                        if let Some(value_type) =
+                            infer_expression_type_hint(
+                                expression,
+                                bindings,
+                                recursive_name,
+                            )
+                        {
+                            hints.known.push(value_type);
+                        } else {
+                            hints.has_unknown = true;
+                        }
+                    }
+
+                    None => {
+                        hints.known.push(ValueType::Undefined);
+                    }
+                }
+            }
+
+            StatementKind::Throw(expression) => {
+                // Hiện native lowering vẫn xử lý throw như ReturnValue.
+                // Khi có exception ABI, phần này sẽ được tách riêng.
+                if let Some(value_type) =
+                    infer_expression_type_hint(
+                        expression,
+                        bindings,
+                        recursive_name,
+                    )
+                {
+                    hints.known.push(value_type);
+                } else {
+                    hints.has_unknown = true;
+                }
+            }
+
+            StatementKind::Break | StatementKind::Continue => {}
+        }
+    }
+}
+
+fn collect_return_type_hint_from_statement(
+    statement: &Statement,
+    bindings: &mut HashMap<String, ValueType>,
+    recursive_name: Option<&str>,
+    hints: &mut ReturnTypeHints,
+) {
+    collect_return_type_hints(
+        std::slice::from_ref(statement),
+        bindings,
+        recursive_name,
+        hints,
+    );
+}
+
+fn statements_always_terminate(statements: &[Statement]) -> bool {
+    for statement in statements {
+        if statement_always_terminates(statement) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn statement_always_terminates(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Return(_)
+        | StatementKind::Throw(_) => true,
+
+        StatementKind::Block(body) => {
+            statements_always_terminate(body)
+        }
+
+        StatementKind::If {
+            consequent,
+            alternate: Some(alternate),
+            ..
+        } => {
+            statement_always_terminates(consequent)
+                && statement_always_terminates(alternate)
+        }
+
+        // Bảo thủ với loop/switch: giả định vẫn có thể fallthrough.
+        StatementKind::Expression(_)
+        | StatementKind::VariableDeclaration { .. }
+        | StatementKind::If {
+            alternate: None,
+            ..
+        }
+        | StatementKind::While { .. }
+        | StatementKind::DoWhile { .. }
+        | StatementKind::For { .. }
+        | StatementKind::ForIn { .. }
+        | StatementKind::ForOf { .. }
+        | StatementKind::Switch { .. }
+        | StatementKind::FunctionDeclaration(_)
+        | StatementKind::Break
+        | StatementKind::Continue => false,
+    }
+}
+
+fn infer_expression_type_hint(
+    expression: &Expression,
+    bindings: &HashMap<String, ValueType>,
+    recursive_name: Option<&str>,
+) -> Option<ValueType> {
+    match &expression.kind {
+        ExpressionKind::String(_) => Some(ValueType::String),
+        ExpressionKind::Number(_) => Some(ValueType::Number),
+        ExpressionKind::Bool(_) => Some(ValueType::Bool),
+        ExpressionKind::Null => Some(ValueType::Null),
+
+        ExpressionKind::Global(name) => {
+            if recursive_name == Some(name.as_str()) {
+                // Self-recursive call/name được xử lý bằng provisional type.
+                return None;
+            }
+
+            bindings
+                .get(name)
+                .copied()
+                .or_else(|| match name.as_str() {
+                    "undefined" => Some(ValueType::Undefined),
+                    "NaN" | "Infinity" => Some(ValueType::Number),
+                    _ => None,
+                })
+        }
+
+        ExpressionKind::Object(_) | ExpressionKind::Array(_) => {
+            Some(ValueType::Object)
+        }
+
+        ExpressionKind::Function(_) => Some(ValueType::Callable),
+
+        ExpressionKind::Conditional {
+            consequent,
+            alternate,
+            ..
+        } => {
+            let left = infer_expression_type_hint(
+                consequent,
+                bindings,
+                recursive_name,
+            );
+
+            let right = infer_expression_type_hint(
+                alternate,
+                bindings,
+                recursive_name,
+            );
+
+            match (left, right) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                _ => None,
+            }
+        }
+
+        ExpressionKind::Unary {
+            operator,
+            argument: _,
+        } => {
+            Some(match operator {
+                UnaryOperator::Plus
+                | UnaryOperator::Minus
+                | UnaryOperator::BitwiseNot => ValueType::Number,
+
+                UnaryOperator::Not
+                | UnaryOperator::Delete => ValueType::Bool,
+
+                UnaryOperator::Typeof => ValueType::String,
+                UnaryOperator::Void => ValueType::Undefined,
+            })
+        }
+
+        ExpressionKind::Binary {
+            operator,
+            left,
+            right,
+        } => {
+            match operator {
+                BinaryOperator::Equal
+                | BinaryOperator::NotEqual
+                | BinaryOperator::StrictEqual
+                | BinaryOperator::StrictNotEqual
+                | BinaryOperator::LessThan
+                | BinaryOperator::LessEqual
+                | BinaryOperator::GreaterThan
+                | BinaryOperator::GreaterEqual
+                | BinaryOperator::In
+                | BinaryOperator::InstanceOf => {
+                    Some(ValueType::Bool)
+                }
+
+                BinaryOperator::Add => {
+                    let left = infer_expression_type_hint(
+                        left,
+                        bindings,
+                        recursive_name,
+                    );
+
+                    let right = infer_expression_type_hint(
+                        right,
+                        bindings,
+                        recursive_name,
+                    );
+
+                    match (left, right) {
+                        (
+                            Some(ValueType::Number),
+                            Some(ValueType::Number),
+                        ) => Some(ValueType::Number),
+
+                        (Some(ValueType::String), _)
+                        | (_, Some(ValueType::String)) => {
+                            Some(ValueType::String)
+                        }
+
+                        _ => None,
+                    }
+                }
+
+                BinaryOperator::Subtract
+                | BinaryOperator::Multiply
+                | BinaryOperator::Divide
+                | BinaryOperator::Remainder
+                | BinaryOperator::Exponential
+                | BinaryOperator::ShiftLeft
+                | BinaryOperator::ShiftRight
+                | BinaryOperator::ShiftRightZeroFill
+                | BinaryOperator::BitwiseOr
+                | BinaryOperator::BitwiseXor
+                | BinaryOperator::BitwiseAnd => {
+                    Some(ValueType::Number)
+                }
+            }
+        }
+
+        ExpressionKind::Logical {
+            left,
+            right,
+            ..
+        } => {
+            let left = infer_expression_type_hint(
+                left,
+                bindings,
+                recursive_name,
+            );
+
+            let right = infer_expression_type_hint(
+                right,
+                bindings,
+                recursive_name,
+            );
+
+            match (left, right) {
+                (Some(left), Some(right)) if left == right => Some(left),
+                _ => None,
+            }
+        }
+
+        ExpressionKind::Assignment {
+            operator,
+            value,
+            ..
+        } => {
+            match operator {
+                AssignmentOperator::Assign
+                | AssignmentOperator::LogicalOr
+                | AssignmentOperator::LogicalAnd
+                | AssignmentOperator::LogicalNullish => {
+                    infer_expression_type_hint(
+                        value,
+                        bindings,
+                        recursive_name,
+                    )
+                }
+
+                AssignmentOperator::Add => {
+                    infer_expression_type_hint(
+                        value,
+                        bindings,
+                        recursive_name,
+                    )
+                }
+
+                AssignmentOperator::Subtract
+                | AssignmentOperator::Multiply
+                | AssignmentOperator::Divide
+                | AssignmentOperator::Remainder
+                | AssignmentOperator::Exponential
+                | AssignmentOperator::ShiftLeft
+                | AssignmentOperator::ShiftRight
+                | AssignmentOperator::ShiftRightZeroFill
+                | AssignmentOperator::BitwiseOr
+                | AssignmentOperator::BitwiseXor
+                | AssignmentOperator::BitwiseAnd => {
+                    Some(ValueType::Number)
+                }
+            }
+        }
+
+        ExpressionKind::Update { .. } => Some(ValueType::Number),
+
+        ExpressionKind::Call {
+            callee,
+            arguments: _,
+        } => {
+            match &callee.kind {
+                ExpressionKind::Global(name) => {
+                    if recursive_name == Some(name.as_str()) {
+                        None
+                    } else {
+                        match name.as_str() {
+                            "Number" => Some(ValueType::Number),
+                            "String" => Some(ValueType::String),
+                            "Boolean" => Some(ValueType::Bool),
+                            _ => None,
+                        }
+                    }
+                }
+
+                ExpressionKind::Member {
+                    object,
+                    property: MemberProperty::Static(method),
+                } => {
+                    match &object.kind {
+                        ExpressionKind::Global(name)
+                            if name == "Promise"
+                                && matches!(
+                                    method.as_str(),
+                                    "resolve" | "reject"
+                                ) =>
+                        {
+                            Some(ValueType::Promise)
+                        }
+
+                        _ => None,
+                    }
+                }
+
+                _ => None,
+            }
+        }
+
+        ExpressionKind::New { callee, .. } => {
+            match &callee.kind {
+                ExpressionKind::Global(name) if name == "Promise" => {
+                    Some(ValueType::Promise)
+                }
+
+                _ => Some(ValueType::Object),
+            }
+        }
+
+        ExpressionKind::Member { .. }
+        | ExpressionKind::Await(_) => None,
     }
 }
 
