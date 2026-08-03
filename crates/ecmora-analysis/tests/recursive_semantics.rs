@@ -66,12 +66,71 @@ function sumTo(n, acc) {
 console.log(sumTo(1000000, 0));
 "#;
 
+const MUTUAL_TAIL_RECURSION: &str = r#"
+function evenStep(n) {
+    if (n === 0) return true;
+    return oddStep(n - 1);
+}
+
+function oddStep(n) {
+    if (n === 0) return false;
+    return evenStep(n - 1);
+}
+
+console.log(evenStep(1000000));
+"#;
+
+const CALLBACK_TAIL_RECURSION: &str = r#"
+function bounce(n, next) {
+    if (n <= 0) return 0;
+    return next(n - 1, bounce);
+}
+
+console.log(bounce(1000000, function step(n, next) {
+    if (n <= 0) return 0;
+    return next(n - 1, step);
+}));
+"#;
+
+const DEEP_NON_TAIL_RECURSION: &str = r#"
+function count(n) {
+    if (n <= 0) return 0;
+    return 1 + count(n - 1);
+}
+
+console.log(count(1000000));
+"#;
+
 const STACK_OVERFLOW: &str = r#"
 function overflow() {
     return 1 + overflow();
 }
 
 overflow();
+"#;
+
+const SPECIALIZATION_BUDGET: &str = r#"
+function specialize(depth, callback) {
+    if (depth <= 0) return 0;
+
+    return specialize(depth - 1, function nested(value) {
+        return callback(value);
+    });
+}
+
+console.log(specialize(1000000, function identity(value) {
+    return value;
+}));
+"#;
+
+const GENERIC_FALLBACK_BOUNDARY: &str = r#"
+function crossBoundary(value, depth) {
+    if (depth <= 0) return value;
+    if (depth === 1) return crossBoundary({ value: value }, 0);
+    return crossBoundary("fallback", depth - 1);
+}
+
+console.log(crossBoundary(1, 2));
 "#;
 
 fn lower(source: &str) -> Result<Program> {
@@ -256,13 +315,18 @@ fn recursive_callback_specialization_has_a_stable_baseline_diagnostic() {
 }
 
 #[test]
-fn all_future_contract_sources_are_valid_frontend_input() {
+fn all_recursive_contract_sources_are_valid_frontend_input() {
     for (name, source) in [
         ("unseeded arithmetic recursion", UNSEEDED_ARITHMETIC_RECURSION),
         ("polymorphic recursion", POLYMORPHIC_RECURSION),
         ("recursive callback", RECURSIVE_CALLBACK),
         ("tail recursion", TAIL_RECURSION),
+        ("mutual tail recursion", MUTUAL_TAIL_RECURSION),
+        ("callback tail recursion", CALLBACK_TAIL_RECURSION),
+        ("deep non-tail recursion", DEEP_NON_TAIL_RECURSION),
         ("stack overflow", STACK_OVERFLOW),
+        ("specialization budget", SPECIALIZATION_BUDGET),
+        ("generic fallback boundary", GENERIC_FALLBACK_BOUNDARY),
     ] {
         ecmora_frontend_oxc::lower_source(
             Path::new("recursive-contract.js"),
@@ -306,4 +370,23 @@ fn future_tail_recursion_removes_the_normal_self_call() {
         !has_direct_call(sum_to, &sum_to.name),
         "optimized tail recursion must not retain a normal recursive call",
     );
+}
+
+#[test]
+#[ignore = "phase 16: mutual recursive SCC trampoline"]
+fn future_mutual_tail_recursion_removes_normal_cycle_calls() {
+    let program = lower_optimized(MUTUAL_TAIL_RECURSION)
+        .expect("mutual tail-recursive source must optimize");
+    let even = only_function_named(&program, "evenStep");
+    let odd = only_function_named(&program, "oddStep");
+
+    assert!(!has_direct_call(even, &odd.name));
+    assert!(!has_direct_call(odd, &even.name));
+}
+
+#[test]
+#[ignore = "phase 17: indirect and callback tail calls"]
+fn future_callback_tail_recursion_compiles_for_tail_lowering() {
+    lower_optimized(CALLBACK_TAIL_RECURSION)
+        .expect("callback tail recursion must enter the optimizer");
 }
