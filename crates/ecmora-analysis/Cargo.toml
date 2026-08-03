@@ -9,3 +9,6 @@ anyhow.workspace = true
 ecmora-hir = { path = "../ecmora-hir" }
 ecmora-ir = { path = "../ecmora-ir" }
 ecmora-value = { path = "../ecmora-value" }
+
+[dev-dependencies]
+ecmora-frontend-oxc = { path = "../ecmora-frontend-oxc" }
