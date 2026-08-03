@@ -12,3 +12,4 @@ ecmora-value = { path = "../ecmora-value" }
 
 [dev-dependencies]
 ecmora-frontend-oxc = { path = "../ecmora-frontend-oxc" }
+ecmora-opt = { path = "../ecmora-opt" }
