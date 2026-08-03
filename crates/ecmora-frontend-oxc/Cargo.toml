@@ -1,0 +1,16 @@
+[package]
+name = "ecmora-frontend-oxc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+
+ecmora-hir = { path = "../ecmora-hir" }
+
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_parser.workspace = true
+oxc_span.workspace = true

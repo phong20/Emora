@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "crates/ecmora-cli",
+    "crates/ecmora-driver",
+    "crates/ecmora-diagnostics",
+    "crates/ecmora-frontend-oxc",
+    "crates/ecmora-hir",
+    "crates/ecmora-ir",
+    "crates/ecmora-analysis",
+    "crates/ecmora-opt",
+    "crates/ecmora-codegen-llvm",
+    "crates/ecmora-runtime",
+    "crates/ecmora-native-host",
+    "crates/ecmora-value",
+]
+
+default-members = [
+    "crates/ecmora-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+
+# Oxc frontend 
+oxc_allocator = "=0.142.0"
+oxc_ast = "=0.142.0"
+oxc_parser = "=0.142.0"
+oxc_semantic = "=0.142.0"
+oxc_span = "=0.142.0"
+
+inkwell = {
+    version = "0.9.0",
+    default-features = false,
+    features = ["llvm22-1-no-llvm-linking", "target-x86"],
+}
+
+ryu-js = "1.0.3"

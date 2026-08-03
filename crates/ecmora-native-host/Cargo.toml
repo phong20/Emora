@@ -1,0 +1,12 @@
+[package]
+name = "ecmora-native-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+ecmora-frontend-oxc = { path = "../ecmora-frontend-oxc" }
+ecmora-runtime = { path = "../ecmora-runtime" }

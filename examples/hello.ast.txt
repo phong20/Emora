@@ -1,0 +1,114 @@
+Program {
+    span: Span {
+        start: 0,
+        end: 27,
+    },
+    node_id: Cell {
+        value: NodeId(0),
+    },
+    scope_id: Cell {
+        value: None,
+    },
+    source_text: "console.log(\"Hello world!\")",
+    comments: Vec(
+        [],
+    ),
+    hashbang: None,
+    directives: Vec(
+        [],
+    ),
+    body: Vec(
+        [
+            ExpressionStatement(
+                ExpressionStatement {
+                    span: Span {
+                        start: 0,
+                        end: 27,
+                    },
+                    node_id: Cell {
+                        value: NodeId(0),
+                    },
+                    expression: CallExpression(
+                        CallExpression {
+                            span: Span {
+                                start: 0,
+                                end: 27,
+                            },
+                            node_id: Cell {
+                                value: NodeId(0),
+                            },
+                            optional: false,
+                            pure: false,
+                            callee: StaticMemberExpression(
+                                StaticMemberExpression {
+                                    span: Span {
+                                        start: 0,
+                                        end: 11,
+                                    },
+                                    node_id: Cell {
+                                        value: NodeId(0),
+                                    },
+                                    optional: false,
+                                    object: Identifier(
+                                        IdentifierReference {
+                                            span: Span {
+                                                start: 0,
+                                                end: 7,
+                                            },
+                                            node_id: Cell {
+                                                value: NodeId(0),
+                                            },
+                                            reference_id: Cell {
+                                                value: None,
+                                            },
+                                            name: "console",
+                                        },
+                                    ),
+                                    property: IdentifierName {
+                                        span: Span {
+                                            start: 8,
+                                            end: 11,
+                                        },
+                                        node_id: Cell {
+                                            value: NodeId(0),
+                                        },
+                                        name: "log",
+                                    },
+                                },
+                            ),
+                            type_arguments: None,
+                            arguments: Vec(
+                                [
+                                    StringLiteral(
+                                        StringLiteral {
+                                            span: Span {
+                                                start: 12,
+                                                end: 26,
+                                            },
+                                            node_id: Cell {
+                                                value: NodeId(0),
+                                            },
+                                            lone_surrogates: false,
+                                            value: "Hello world!",
+                                            raw: Some(
+                                                "\"Hello world!\"",
+                                            ),
+                                        },
+                                    ),
+                                ],
+                            ),
+                        },
+                    ),
+                },
+            ),
+        ],
+    ),
+    source_type: SourceType {
+        language: JavaScript,
+        module_kind: Script,
+        variant: Standard,
+        extension: Some(
+            Js,
+        ),
+    },
+}

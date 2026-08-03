@@ -1,0 +1,13 @@
+[package]
+name = "ecmora-codegen-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+inkwell.workspace = true
+
+ecmora-ir = {
+    path = "../ecmora-ir"
+}

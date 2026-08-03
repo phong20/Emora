@@ -1,0 +1,13 @@
+[package]
+name = "ecmora-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ecmora"
+path = "src/main.rs"
+
+[dependencies]
+ecmora-driver = { path = "../ecmora-driver" }
+anyhow.workspace = true

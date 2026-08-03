@@ -1,0 +1,17 @@
+[package]
+name = "ecmora-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+ecmora-frontend-oxc = { path = "../ecmora-frontend-oxc" }
+ecmora-hir = { path = "../ecmora-hir" }
+ecmora-ir = { path = "../ecmora-ir" }
+ecmora-analysis = { path = "../ecmora-analysis" }
+ecmora-opt = { path = "../ecmora-opt" }
+ecmora-codegen-llvm = { path = "../ecmora-codegen-llvm" }
+ecmora-runtime = { path = "../ecmora-runtime" }
+ecmora-native-host = { path = "../ecmora-native-host" }
