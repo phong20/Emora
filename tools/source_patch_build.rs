@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn main() {
+pub fn generate() {
     let package = env::var("CARGO_PKG_NAME").expect("CARGO_PKG_NAME missing");
     let (target_path, output_name) = match package.as_str() {
         "ecmora-analysis" => (
