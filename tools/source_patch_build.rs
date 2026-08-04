@@ -31,55 +31,45 @@ pub fn generate() {
     println!("cargo:rerun-if-changed={}", spec_path.display());
     println!("cargo:rerun-if-changed={}", base_path.display());
 
-    let spec = fs::read_to_string(&spec_path).expect("cannot read recursive patch specification");
+    // Git may check files out as CRLF on Windows. Patch matching must operate
+    // on a canonical representation rather than depending on core.autocrlf.
+    let spec = fs::read_to_string(&spec_path)
+        .expect("cannot read recursive patch specification")
+        .replace("\r\n", "\n");
     let variables = parse_assignments(&spec);
     let mut replacements = parse_replace_calls(&spec, &variables, target_path);
 
-    // The original connector bootstrap swapped this one call-site pair while
-    // preparing the branch. Ignore that malformed pair and insert the intended
-    // source transformation deterministically.
-    if target_path == "crates/ecmora-analysis/src/lib.rs" {
-        replacements.retain(|(old, _)| {
-            !old.contains("recursive function `{name}` với devirtualized callback")
-        });
-        replacements.push((
-            r#"        if let Some(active) = self
-            .active_specializations
-            .get(&specialization_key)
-            .cloned()
-        {
-            if !callbacks.is_empty() {
-                bail!(
-                    "recursive function `{name}` với devirtualized callback \
-                    chưa được hỗ trợ"
-                )
-            }
+    // Python triple-quoted strings treat a backslash immediately followed by a
+    // newline as a continuation. The original callback diagnostic contains a
+    // Rust source line-continuation backslash, so matching that whole block via
+    // a reconstructed Python string is unnecessarily fragile. Extract its new
+    // body from the patch specification, then replace the old region using two
+    // stable structural anchors.
+    let callback_active_replacement = if target_path == "crates/ecmora-analysis/src/lib.rs" {
+        let index = replacements
+            .iter()
+            .position(|(old, _)| {
+                old.contains("recursive function `{name}` với devirtualized callback")
+            })
+            .expect("callback recursion replacement missing from patch specification");
+        Some(replacements.remove(index).1)
+    } else {
+        None
+    };
 
-            return Ok(self.emit_specialization_call(
-                &active.function_name,
-                active.return_type,
-                &call_arguments,
-                captures,
-            ));
-        }"#
-                .to_owned(),
-            r#"        if let Some(active) = self
-            .active_specializations
-            .get(&specialization_key)
-            .cloned()
-        {
-            return Ok(self.emit_specialization_call(
-                &active.function_name,
-                active.return_type,
-                &call_arguments,
-                &specialization_captures,
-            ));
-        }"#
-                .to_owned(),
-        ));
+    let mut source = fs::read_to_string(&base_path)
+        .expect("cannot read generated-source base")
+        .replace("\r\n", "\n");
+
+    if let Some(replacement) = callback_active_replacement {
+        replace_between_once(
+            &mut source,
+            "        if let Some(active) = self\n            .active_specializations\n            .get(&specialization_key)\n            .cloned()\n        {",
+            "\n\n        // Giữ chính sách cache cũ.",
+            &replacement,
+        );
     }
 
-    let mut source = fs::read_to_string(&base_path).expect("cannot read generated-source base");
     for (old, new) in replacements {
         let count = source.match_indices(&old).count();
         assert_eq!(
@@ -93,6 +83,21 @@ pub fn generate() {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
     fs::write(out_dir.join(output_name), source).expect("cannot write generated Rust source");
+}
+
+fn replace_between_once(source: &mut String, start: &str, end: &str, replacement: &str) {
+    let start_index = source
+        .find(start)
+        .unwrap_or_else(|| panic!("source patch start anchor not found: {start}"));
+    assert!(
+        source[start_index + start.len()..].find(start).is_none(),
+        "source patch start anchor is ambiguous: {start}"
+    );
+
+    let end_offset = source[start_index..]
+        .find(end)
+        .unwrap_or_else(|| panic!("source patch end anchor not found after: {start}"));
+    source.replace_range(start_index..start_index + end_offset, replacement);
 }
 
 fn parse_assignments(source: &str) -> HashMap<String, String> {
