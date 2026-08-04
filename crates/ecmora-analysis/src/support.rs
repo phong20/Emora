@@ -1328,6 +1328,7 @@ mod throw_inference_tests {
             parameters: Vec::new(),
             body,
             r#async: false,
+            generator: false,
             arrow: false,
             lowering_error: None,
         }

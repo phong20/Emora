@@ -28,6 +28,25 @@ pub struct PromiseSubclass {
     pub parent: String,
     /// Static `@@species`; `None` means the constructor itself.
     pub species: Option<String>,
+    /// Explicit derived constructor. `None` uses default `super(...args)`.
+    pub constructor: Option<Function>,
+    /// Instance/static methods and accessors retained for compatibility class objects.
+    pub methods: Vec<ClassMethod>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassMethod {
+    pub key: String,
+    pub function: Function,
+    pub kind: ClassMethodKind,
+    pub r#static: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassMethodKind {
+    Method,
+    Get,
+    Set,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +153,9 @@ pub struct VariableDeclarator {
 pub enum VariableKind {
     Const,
     Let,
+    /// Function-scoped declaration. The frontend normalizes hoisting before
+    /// runtime/analysis while retaining this variant for faithful HIR input.
+    Var,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +233,7 @@ pub struct Function {
     pub parameters: Vec<String>,
     pub body: Vec<Statement>,
     pub r#async: bool,
+    pub generator: bool,
     pub arrow: bool,
     /// Function bodies are lowered lazily from the native pipeline's point of
     /// view. Unsupported syntax in an unreachable function must not force the

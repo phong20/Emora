@@ -29,6 +29,10 @@ impl EffectSet {
         Self(self.0 | other.0)
     }
 
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
     fn insert(&mut self, other: Self) {
         self.0 |= other.0;
     }
@@ -41,6 +45,8 @@ pub struct SemanticSummary {
     pub dynamic_property_reads: usize,
     pub dynamic_property_writes: usize,
     pub suspension_points: usize,
+    pub generator_functions: usize,
+    pub var_declarations: usize,
 }
 
 pub fn summarize(program: &Program) -> SemanticSummary {
@@ -48,7 +54,36 @@ pub fn summarize(program: &Program) -> SemanticSummary {
     for statement in &program.statements {
         visit_statement(statement, &mut summary);
     }
+    for class in &program.promise_subclasses {
+        if let Some(constructor) = &class.constructor {
+            visit_function(constructor, &mut summary);
+        }
+        for method in &class.methods {
+            visit_function(&method.function, &mut summary);
+        }
+    }
     summary
+}
+
+pub(crate) fn expression_effects(expression: &Expression) -> EffectSet {
+    let mut summary = SemanticSummary::default();
+    visit_expression(expression, &mut summary);
+    summary.effects
+}
+
+fn visit_function(function: &ecmora_hir::Function, summary: &mut SemanticSummary) {
+    if function.generator {
+        summary.generator_functions += 1;
+        summary.effects.insert(
+            EffectSet::GENERATOR_STATE
+                .union(EffectSet::ENQUEUE_JOB)
+                .union(EffectSet::SUSPEND)
+                .union(EffectSet::MAY_THROW),
+        );
+    }
+    for statement in &function.body {
+        visit_statement(statement, summary);
+    }
 }
 
 pub(super) fn validate_native_semantics(program: &Program) -> Result<()> {
@@ -67,7 +102,10 @@ fn visit_statement(statement: &Statement, summary: &mut SemanticSummary) {
         StatementKind::Expression(value) | StatementKind::Throw(value) => {
             visit_expression(value, summary)
         }
-        StatementKind::VariableDeclaration { declarations, .. } => {
+        StatementKind::VariableDeclaration { kind, declarations } => {
+            if *kind == ecmora_hir::VariableKind::Var {
+                summary.var_declarations += declarations.len();
+            }
             for declaration in declarations {
                 if let Some(value) = &declaration.init {
                     visit_expression(value, summary);
@@ -154,9 +192,7 @@ fn visit_statement(statement: &Statement, summary: &mut SemanticSummary) {
             }
         }
         StatementKind::FunctionDeclaration(function) => {
-            for statement in &function.body {
-                visit_statement(statement, summary);
-            }
+            visit_function(function, summary);
         }
         StatementKind::Return(value) => {
             if let Some(value) = value {
@@ -279,6 +315,15 @@ fn visit_expression(expression: &Expression, summary: &mut SemanticSummary) {
         }
         ExpressionKind::Update { target, .. } => visit_target(target, summary, true),
         ExpressionKind::Call { callee, arguments } => {
+            if matches!(&callee.kind, ExpressionKind::Global(name) if name == "@yield") {
+                summary.suspension_points += 1;
+                summary.effects.insert(
+                    EffectSet::GENERATOR_STATE
+                        .union(EffectSet::ENQUEUE_JOB)
+                        .union(EffectSet::SUSPEND)
+                        .union(EffectSet::MAY_THROW),
+                );
+            }
             summary.effects.insert(
                 EffectSet::CALL_USER_CODE
                     .union(EffectSet::MAY_THROW)
@@ -302,9 +347,7 @@ fn visit_expression(expression: &Expression, summary: &mut SemanticSummary) {
             }
         }
         ExpressionKind::Function(function) => {
-            for statement in &function.body {
-                visit_statement(statement, summary);
-            }
+            visit_function(function, summary);
         }
         ExpressionKind::Await(value) => {
             summary.suspension_points += 1;

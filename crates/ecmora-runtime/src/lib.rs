@@ -5,6 +5,9 @@ use ecmora_hir::{
     Statement, StatementKind, UnaryOperator, UpdateOperator, VariableKind,
 };
 use ecmora_value::{BinaryOperator as SemBinary, RealmId, Value};
+
+mod async_generator;
+use async_generator::{GeneratorResumeAction, direct_yield};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
@@ -79,6 +82,11 @@ enum RuntimeValue {
     PromiseCatch(u64),
     PromiseFinally(u64),
     Function(u64),
+    FunctionWithThis(u64, Value),
+    ClassConstructor(String),
+    AsyncGeneratorNext(u64),
+    AsyncGeneratorReturn(u64),
+    AsyncGeneratorThrow(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +106,7 @@ enum FunctionKind {
     Reject(u64),
     AsyncResume { task: u64, rejected: bool },
     FinallyPreserve { original: Value, rejected: bool },
+    Noop,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +140,7 @@ struct PromiseObject {
     reported_unhandled: bool,
     constructor: String,
     realm: RealmId,
+    object: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +166,17 @@ struct AsyncTask {
     action: AsyncResumeAction,
 }
 
+#[derive(Debug, Clone)]
+struct AsyncGeneratorRuntime {
+    object: Value,
+    statements: Vec<Statement>,
+    next_statement: usize,
+    scopes: Vec<Scope>,
+    strict: bool,
+    resume_action: Option<GeneratorResumeAction>,
+    completed: bool,
+}
+
 #[derive(Default)]
 struct Machine {
     functions: Vec<FunctionObject>,
@@ -163,6 +184,8 @@ struct Machine {
     jobs: VecDeque<PromiseJob>,
     async_tasks: Vec<Option<AsyncTask>>,
     promise_subclasses: HashMap<String, ecmora_hir::PromiseSubclass>,
+    class_constructors: HashMap<String, Value>,
+    async_generators: Vec<Option<AsyncGeneratorRuntime>>,
     current_realm: RealmId,
     host_hooks: HostHooks,
     host_events: VecDeque<PromiseRejectionEvent>,
@@ -203,6 +226,546 @@ impl Machine {
         id
     }
 
+    fn promise_object_view(&self, value: &Value) -> Option<Value> {
+        let Value::Promise(id) = value else {
+            return None;
+        };
+        self.promises
+            .get(*id as usize)
+            .map(|promise| promise.object.clone())
+    }
+
+    fn class_name_from_value(&self, value: &Value) -> Option<String> {
+        ecmora_value::class_constructor_slots(value).map(|slots| slots.name)
+    }
+
+    fn class_prototype(&self, name: &str) -> Option<ecmora_value::ObjectRef> {
+        self.class_constructors
+            .get(name)
+            .and_then(ecmora_value::class_constructor_slots)
+            .map(|slots| slots.prototype)
+    }
+
+    fn is_promise_subclass(&self, name: &str) -> bool {
+        let mut current = name;
+        loop {
+            if current == "Promise" {
+                return true;
+            }
+            let Some(parent) = self
+                .promise_subclasses
+                .get(current)
+                .map(|class| class.parent.as_str())
+            else {
+                return false;
+            };
+            current = parent;
+        }
+    }
+
+    fn predeclare_promise_subclasses(
+        &mut self,
+        subclasses: &[ecmora_hir::PromiseSubclass],
+        scopes: &mut [Scope],
+    ) -> Result<()> {
+        let scope = scopes
+            .first_mut()
+            .ok_or_else(|| anyhow!("thiếu global scope"))?;
+        for subclass in subclasses {
+            if scope.contains_key(&subclass.name) {
+                bail!("class `{}` được khai báo trùng", subclass.name)
+            }
+            scope.insert(
+                subclass.name.clone(),
+                binding(VariableKind::Const, false, Value::Undefined),
+            );
+        }
+        Ok(())
+    }
+
+    fn install_promise_subclasses(
+        &mut self,
+        subclasses: &[ecmora_hir::PromiseSubclass],
+        scopes: &mut Vec<Scope>,
+    ) -> Result<()> {
+        for subclass in subclasses {
+            if self.class_constructors.contains_key(&subclass.name) {
+                bail!("class `{}` được khai báo trùng", subclass.name)
+            }
+            if subclass.parent != "Promise"
+                && !self.class_constructors.contains_key(&subclass.parent)
+            {
+                bail!(
+                    "parent class `{}` của `{}` chưa được khởi tạo",
+                    subclass.parent,
+                    subclass.name
+                )
+            }
+
+            let parent_constructor = self.class_constructors.get(&subclass.parent).cloned();
+            let parent_prototype = parent_constructor
+                .as_ref()
+                .and_then(ecmora_value::class_constructor_slots)
+                .map(|slots| slots.prototype);
+            let prototype_value =
+                ecmora_value::object_with_prototype_in_realm(parent_prototype, self.current_realm);
+            let Value::Object(prototype) = &prototype_value else {
+                unreachable!()
+            };
+            let constructor_value = ecmora_value::class_constructor_object(
+                subclass.name.clone(),
+                Some(subclass.parent.clone()),
+                None,
+                prototype.clone(),
+                self.current_realm,
+            );
+            if let Some(Value::Object(parent)) = parent_constructor.as_ref() {
+                ecmora_value::set_prototype(&constructor_value, Some(parent.clone()))?;
+            }
+            ecmora_value::set_property(
+                &constructor_value,
+                "name".to_owned(),
+                Value::String(subclass.name.clone()),
+            )?;
+            ecmora_value::set_property(
+                &constructor_value,
+                "prototype".to_owned(),
+                prototype_value.clone(),
+            )?;
+            ecmora_value::set_property(
+                &prototype_value,
+                "constructor".to_owned(),
+                constructor_value.clone(),
+            )?;
+
+            let class_binding = scopes[0]
+                .get(&subclass.name)
+                .cloned()
+                .ok_or_else(|| anyhow!("class binding `{}` chưa được predeclare", subclass.name))?;
+            {
+                let mut class_binding = class_binding.borrow_mut();
+                class_binding.initialized = true;
+                class_binding.value = constructor_value.clone();
+            }
+            self.class_constructors
+                .insert(subclass.name.clone(), constructor_value.clone());
+
+            let constructor_id = if let Some(constructor) = &subclass.constructor {
+                Some(self.register_function(constructor.clone(), scopes.clone()))
+            } else {
+                None
+            };
+
+            for method in &subclass.methods {
+                let super_base = if method.r#static {
+                    parent_constructor.clone().unwrap_or(Value::Undefined)
+                } else {
+                    self.class_prototype(&subclass.parent)
+                        .map(Value::Object)
+                        .unwrap_or(Value::Null)
+                };
+                let mut closure = scopes.clone();
+                let mut home_scope = HashMap::new();
+                home_scope.insert(
+                    "@super_base".to_owned(),
+                    binding(VariableKind::Const, true, super_base),
+                );
+                closure.push(home_scope);
+                let function = self.register_function(method.function.clone(), closure);
+                let target = if method.r#static {
+                    &constructor_value
+                } else {
+                    &prototype_value
+                };
+                match method.kind {
+                    ecmora_hir::ClassMethodKind::Method => {
+                        ecmora_value::set_property(
+                            target,
+                            method.key.clone(),
+                            Value::Function(function),
+                        )?;
+                    }
+                    ecmora_hir::ClassMethodKind::Get => {
+                        ecmora_value::define_accessor(
+                            target,
+                            method.key.clone(),
+                            Some(function),
+                            None,
+                        )?;
+                    }
+                    ecmora_hir::ClassMethodKind::Set => {
+                        ecmora_value::define_accessor(
+                            target,
+                            method.key.clone(),
+                            None,
+                            Some(function),
+                        )?;
+                    }
+                }
+            }
+
+            ecmora_value::set_object_kind(
+                &constructor_value,
+                ecmora_value::ObjectKind::ClassConstructor(ecmora_value::ClassConstructorSlots {
+                    name: subclass.name.clone(),
+                    parent: Some(subclass.parent.clone()),
+                    realm: self.current_realm,
+                    constructor: constructor_id,
+                    prototype: prototype.clone(),
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn new_promise_capability(&mut self, constructor: &str) -> Result<u64> {
+        let promise = self.new_promise_with_constructor(constructor);
+        let executor = self.register_native_function(FunctionKind::Noop);
+        if let Some(override_value) = self.run_promise_constructor(
+            constructor,
+            promise,
+            vec![Value::Function(executor)],
+            true,
+        )? {
+            if override_value != Value::Promise(promise) {
+                bail!(
+                    "Promise capability constructor `{constructor}` returned \
+                     a different object"
+                )
+            }
+        }
+        Ok(promise)
+    }
+
+    fn initialize_intrinsic_promise(
+        &mut self,
+        promise: u64,
+        arguments: Vec<Value>,
+        strict: bool,
+    ) -> Result<()> {
+        let Some(Value::Function(executor)) = arguments.first() else {
+            bail!("Promise executor phải là function")
+        };
+        let resolve = self.register_native_function(FunctionKind::Resolve(promise));
+        let reject = self.register_native_function(FunctionKind::Reject(promise));
+        match self.call_function(
+            *executor,
+            vec![Value::Function(resolve), Value::Function(reject)],
+            strict,
+        )? {
+            CallOutcome::Value(_) => {}
+            CallOutcome::Throw(reason) => {
+                self.settle(promise, PromiseState::Rejected(reason));
+            }
+        }
+        Ok(())
+    }
+
+    fn run_promise_constructor(
+        &mut self,
+        constructor: &str,
+        promise: u64,
+        arguments: Vec<Value>,
+        strict: bool,
+    ) -> Result<Option<Value>> {
+        if constructor == "Promise" {
+            self.initialize_intrinsic_promise(promise, arguments, strict)?;
+            return Ok(None);
+        }
+        let class = self
+            .promise_subclasses
+            .get(constructor)
+            .cloned()
+            .ok_or_else(|| anyhow!("Promise subclass `{constructor}` không tồn tại"))?;
+        let Some(constructor_value) = self.class_constructors.get(constructor).cloned() else {
+            bail!("class constructor object `{constructor}` chưa được cài đặt")
+        };
+        let constructor_id = ecmora_value::class_constructor_slots(&constructor_value)
+            .and_then(|slots| slots.constructor);
+
+        let Some(constructor_id) = constructor_id else {
+            return self.run_promise_constructor(&class.parent, promise, arguments, strict);
+        };
+
+        let super_called = binding(VariableKind::Let, true, Value::Bool(false));
+        let this_binding = binding(VariableKind::Const, true, Value::Promise(promise));
+        let mut extra = HashMap::new();
+        extra.insert("@this".to_owned(), this_binding.clone());
+        extra.insert(
+            "@derived_promise_id".to_owned(),
+            binding(VariableKind::Const, true, Value::Number(promise as f64)),
+        );
+        extra.insert(
+            "@super_constructor".to_owned(),
+            binding(
+                VariableKind::Const,
+                true,
+                Value::String(class.parent.clone()),
+            ),
+        );
+        extra.insert("@derived_super_called".to_owned(), super_called.clone());
+        extra.insert(
+            "@super_base".to_owned(),
+            binding(
+                VariableKind::Const,
+                true,
+                self.class_prototype(&class.parent)
+                    .map(Value::Object)
+                    .unwrap_or(Value::Null),
+            ),
+        );
+
+        let outcome = self.call_function_with_bindings(
+            constructor_id,
+            Value::Promise(promise),
+            arguments,
+            strict,
+            Some(extra),
+        )?;
+        match outcome {
+            CallOutcome::Throw(reason) => {
+                bail!(
+                    "constructor `{constructor}` threw {}",
+                    ecmora_value::to_string(&reason)
+                )
+            }
+            CallOutcome::Value(value) if ecmora_value::is_object_like(&value) => Ok(Some(value)),
+            CallOutcome::Value(Value::Undefined)
+                if matches!(&super_called.borrow().value, Value::Bool(true)) =>
+            {
+                let this_value = this_binding.borrow().value.clone();
+                if this_value == Value::Promise(promise) {
+                    Ok(None)
+                } else {
+                    Ok(Some(this_value))
+                }
+            }
+            CallOutcome::Value(Value::Undefined) => {
+                bail!(
+                    "derived constructor `{constructor}` phải gọi super()                      hoặc return object"
+                )
+            }
+            CallOutcome::Value(_) => {
+                bail!("derived constructor chỉ được return object hoặc undefined")
+            }
+        }
+    }
+
+    fn iterator_result(&mut self, value: Value, done: bool) -> Result<Value> {
+        let result = ecmora_value::object_with_prototype_in_realm(None, self.current_realm);
+        ecmora_value::set_property(&result, "value".to_owned(), value)?;
+        ecmora_value::set_property(&result, "done".to_owned(), Value::Bool(done))?;
+        Ok(result)
+    }
+
+    fn create_async_generator(
+        &mut self,
+        definition: HirFunction,
+        mut scopes: Vec<Scope>,
+        strict: bool,
+    ) -> Result<Value> {
+        predeclare(&definition.body, &mut scopes, self)?;
+        let id = self.async_generators.len() as u64;
+        let object = ecmora_value::async_generator_object(id, self.current_realm);
+        self.async_generators.push(Some(AsyncGeneratorRuntime {
+            object: object.clone(),
+            statements: definition.body,
+            next_statement: 0,
+            scopes,
+            strict,
+            resume_action: None,
+            completed: false,
+        }));
+        Ok(object)
+    }
+
+    fn enqueue_async_generator(
+        &mut self,
+        id: u64,
+        completion: ecmora_value::GeneratorCompletion,
+    ) -> Result<Value> {
+        let promise = self.new_promise();
+        let object = self
+            .async_generators
+            .get(id as usize)
+            .and_then(Option::as_ref)
+            .map(|generator| generator.object.clone())
+            .ok_or_else(|| anyhow!("async generator handle không hợp lệ"))?;
+        ecmora_value::async_generator_enqueue(
+            &object,
+            ecmora_value::AsyncGeneratorRequest {
+                completion,
+                capability: promise,
+            },
+        )?;
+        self.resume_async_generator(id)?;
+        Ok(Value::Promise(promise))
+    }
+
+    fn resume_async_generator(&mut self, id: u64) -> Result<()> {
+        let Some(mut generator) = self
+            .async_generators
+            .get_mut(id as usize)
+            .and_then(Option::take)
+        else {
+            return Ok(());
+        };
+        let Some(request) = ecmora_value::async_generator_dequeue(&generator.object)? else {
+            self.async_generators[id as usize] = Some(generator);
+            return Ok(());
+        };
+
+        if generator.completed {
+            match request.completion {
+                ecmora_value::GeneratorCompletion::Throw(reason) => {
+                    self.settle(request.capability, PromiseState::Rejected(reason));
+                }
+                ecmora_value::GeneratorCompletion::Normal(_) => {
+                    let result = self.iterator_result(Value::Undefined, true)?;
+                    self.settle(request.capability, PromiseState::Fulfilled(result));
+                }
+                ecmora_value::GeneratorCompletion::Return(value) => {
+                    let result = self.iterator_result(value, true)?;
+                    self.settle(request.capability, PromiseState::Fulfilled(result));
+                }
+            }
+            self.async_generators[id as usize] = Some(generator);
+            return Ok(());
+        }
+
+        match request.completion {
+            ecmora_value::GeneratorCompletion::Throw(reason) => {
+                generator.completed = true;
+                ecmora_value::set_async_generator_state(
+                    &generator.object,
+                    ecmora_value::AsyncGeneratorState::Completed,
+                )?;
+                self.settle(request.capability, PromiseState::Rejected(reason));
+                self.async_generators[id as usize] = Some(generator);
+                return Ok(());
+            }
+            ecmora_value::GeneratorCompletion::Return(value) => {
+                generator.completed = true;
+                ecmora_value::set_async_generator_state(
+                    &generator.object,
+                    ecmora_value::AsyncGeneratorState::Completed,
+                )?;
+                let result = self.iterator_result(value, true)?;
+                self.settle(request.capability, PromiseState::Fulfilled(result));
+                self.async_generators[id as usize] = Some(generator);
+                return Ok(());
+            }
+            ecmora_value::GeneratorCompletion::Normal(input) => {
+                if let Some(action) = generator.resume_action.take() {
+                    match action {
+                        GeneratorResumeAction::Discard => {}
+                        GeneratorResumeAction::Initialize(name) => {
+                            let binding =
+                                find_binding(&generator.scopes, &name).ok_or_else(|| {
+                                    anyhow!("generator binding `{name}` không tồn tại")
+                                })?;
+                            let mut binding = binding.borrow_mut();
+                            binding.initialized = true;
+                            binding.value = input;
+                        }
+                        GeneratorResumeAction::Assign(target) => {
+                            write_target(
+                                &target,
+                                input,
+                                &mut generator.scopes,
+                                generator.strict,
+                                self,
+                            )?;
+                        }
+                        GeneratorResumeAction::Return => {
+                            generator.completed = true;
+                            ecmora_value::set_async_generator_state(
+                                &generator.object,
+                                ecmora_value::AsyncGeneratorState::Completed,
+                            )?;
+                            let result = self.iterator_result(input, true)?;
+                            self.settle(request.capability, PromiseState::Fulfilled(result));
+                            self.async_generators[id as usize] = Some(generator);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+
+        ecmora_value::set_async_generator_state(
+            &generator.object,
+            ecmora_value::AsyncGeneratorState::Executing,
+        )?;
+        while generator.next_statement < generator.statements.len() {
+            let index = generator.next_statement;
+            let statement = generator.statements[index].clone();
+            if let Some((argument, action)) = direct_yield(&statement)? {
+                let value = match argument {
+                    Some(argument) => evaluate_expression(
+                        &argument,
+                        &mut generator.scopes,
+                        generator.strict,
+                        self,
+                    )?,
+                    None => Value::Undefined,
+                };
+                generator.next_statement += 1;
+                generator.resume_action = Some(action);
+                ecmora_value::set_async_generator_state(
+                    &generator.object,
+                    ecmora_value::AsyncGeneratorState::SuspendedYield,
+                )?;
+                let result = self.iterator_result(value, false)?;
+                self.settle(request.capability, PromiseState::Fulfilled(result));
+                self.async_generators[id as usize] = Some(generator);
+                return Ok(());
+            }
+
+            generator.next_statement += 1;
+            match execute_statement(&statement, &mut generator.scopes, generator.strict, self)? {
+                Completion::Normal => {}
+                Completion::Return(value) => {
+                    generator.completed = true;
+                    ecmora_value::set_async_generator_state(
+                        &generator.object,
+                        ecmora_value::AsyncGeneratorState::Completed,
+                    )?;
+                    let result = self.iterator_result(value, true)?;
+                    self.settle(request.capability, PromiseState::Fulfilled(result));
+                    self.async_generators[id as usize] = Some(generator);
+                    return Ok(());
+                }
+                Completion::Throw(reason) => {
+                    generator.completed = true;
+                    ecmora_value::set_async_generator_state(
+                        &generator.object,
+                        ecmora_value::AsyncGeneratorState::Completed,
+                    )?;
+                    self.settle(request.capability, PromiseState::Rejected(reason));
+                    self.async_generators[id as usize] = Some(generator);
+                    return Ok(());
+                }
+                Completion::Break | Completion::Continue => {
+                    bail!(
+                        "break/continue vượt generator top-level; \
+                         yield trong CFG cần continuation lowering"
+                    )
+                }
+            }
+        }
+
+        generator.completed = true;
+        ecmora_value::set_async_generator_state(
+            &generator.object,
+            ecmora_value::AsyncGeneratorState::Completed,
+        )?;
+        let result = self.iterator_result(Value::Undefined, true)?;
+        self.settle(request.capability, PromiseState::Fulfilled(result));
+        self.async_generators[id as usize] = Some(generator);
+        Ok(())
+    }
+
     fn proxy_trap(&mut self, handler: &Value, name: &str, strict: bool) -> Result<Option<u64>> {
         let trap = self.get_property_value(handler, name, handler.clone(), strict)?;
         match trap {
@@ -234,6 +797,8 @@ impl Machine {
         receiver: Value,
         strict: bool,
     ) -> Result<Value> {
+        let promise_object = self.promise_object_view(object);
+        let object = promise_object.as_ref().unwrap_or(object);
         if let Some(slots) = ecmora_value::proxy_slots(object) {
             if slots.revoked {
                 bail!("không thể thực hiện [[Get]] trên Proxy đã revoke")
@@ -278,6 +843,8 @@ impl Machine {
         receiver: Value,
         strict: bool,
     ) -> Result<Value> {
+        let promise_object = self.promise_object_view(object);
+        let object = promise_object.as_ref().unwrap_or(object);
         if let Some(slots) = ecmora_value::proxy_slots(object) {
             if slots.revoked {
                 bail!("không thể thực hiện [[Set]] trên Proxy đã revoke")
@@ -337,6 +904,8 @@ impl Machine {
     }
 
     fn has_property_value(&mut self, object: &Value, key: &str, strict: bool) -> Result<bool> {
+        let promise_object = self.promise_object_view(object);
+        let object = promise_object.as_ref().unwrap_or(object);
         if let Some(slots) = ecmora_value::proxy_slots(object) {
             if slots.revoked {
                 bail!("không thể thực hiện [[HasProperty]] trên Proxy đã revoke")
@@ -369,6 +938,8 @@ impl Machine {
     }
 
     fn delete_property_value(&mut self, object: &Value, key: &str, strict: bool) -> Result<bool> {
+        let promise_object = self.promise_object_view(object);
+        let object = promise_object.as_ref().unwrap_or(object);
         if let Some(slots) = ecmora_value::proxy_slots(object) {
             if slots.revoked {
                 bail!("không thể thực hiện [[Delete]] trên Proxy đã revoke")
@@ -401,6 +972,8 @@ impl Machine {
     }
 
     fn own_property_keys_value(&mut self, object: &Value, strict: bool) -> Result<Vec<String>> {
+        let promise_object = self.promise_object_view(object);
+        let object = promise_object.as_ref().unwrap_or(object);
         if let Some(slots) = ecmora_value::proxy_slots(object) {
             if slots.revoked {
                 bail!("không thể thực hiện [[OwnPropertyKeys]] trên Proxy đã revoke")
@@ -457,6 +1030,8 @@ impl Machine {
 
     fn new_promise_with_constructor(&mut self, constructor: &str) -> u64 {
         let id = self.promises.len() as u64;
+        let prototype = self.class_prototype(constructor);
+        let object = ecmora_value::object_with_prototype_in_realm(prototype, self.current_realm);
         self.promises.push(PromiseObject {
             state: PromiseState::Pending,
             reactions: Vec::new(),
@@ -464,6 +1039,7 @@ impl Machine {
             reported_unhandled: false,
             constructor: constructor.to_owned(),
             realm: self.current_realm,
+            object,
         });
         id
     }
@@ -492,19 +1068,20 @@ impl Machine {
             if self.promises[id as usize].constructor == constructor {
                 return Ok(Value::Promise(id));
             }
-            let target = self.new_promise_with_constructor(constructor);
-            self.resolve_into(target, Value::Promise(id))?;
-            return Ok(Value::Promise(target));
         }
-        let id = self.new_promise_with_constructor(constructor);
-        self.resolve_into(id, value)?;
-        Ok(Value::Promise(id))
+        let target = self.new_promise_capability(constructor)?;
+        self.resolve_into(target, value)?;
+        Ok(Value::Promise(target))
     }
 
-    fn promise_reject_with_constructor(&mut self, constructor: &str, value: Value) -> Value {
-        let id = self.new_promise_with_constructor(constructor);
-        self.settle(id, PromiseState::Rejected(value));
-        Value::Promise(id)
+    fn promise_reject_with_constructor(
+        &mut self,
+        constructor: &str,
+        value: Value,
+    ) -> Result<Value> {
+        let target = self.new_promise_capability(constructor)?;
+        self.settle(target, PromiseState::Rejected(value));
+        Ok(Value::Promise(target))
     }
 
     fn settle(&mut self, id: u64, state: PromiseState) {
@@ -527,21 +1104,10 @@ impl Machine {
         arguments: Vec<Value>,
         strict: bool,
     ) -> Result<Value> {
-        let Some(Value::Function(executor)) = arguments.first() else {
-            bail!("Promise executor phải là function")
-        };
         let promise = self.new_promise_with_constructor(constructor);
-        let resolve = self.register_native_function(FunctionKind::Resolve(promise));
-        let reject = self.register_native_function(FunctionKind::Reject(promise));
-        match self.call_function(
-            *executor,
-            vec![Value::Function(resolve), Value::Function(reject)],
-            strict,
-        )? {
-            CallOutcome::Value(_) => {}
-            CallOutcome::Throw(reason) => self.settle(promise, PromiseState::Rejected(reason)),
-        }
-        Ok(Value::Promise(promise))
+        let override_value =
+            self.run_promise_constructor(constructor, promise, arguments, strict)?;
+        Ok(override_value.unwrap_or(Value::Promise(promise)))
     }
 
     fn call_as_expression(
@@ -571,6 +1137,17 @@ impl Machine {
         this_value: Value,
         arguments: Vec<Value>,
         strict: bool,
+    ) -> Result<CallOutcome> {
+        self.call_function_with_bindings(id, this_value, arguments, strict, None)
+    }
+
+    fn call_function_with_bindings(
+        &mut self,
+        id: u64,
+        this_value: Value,
+        arguments: Vec<Value>,
+        strict: bool,
+        extra_scope: Option<Scope>,
     ) -> Result<CallOutcome> {
         let function = self
             .functions
@@ -602,6 +1179,7 @@ impl Machine {
                     Ok(CallOutcome::Value(original))
                 }
             }
+            FunctionKind::Noop => Ok(CallOutcome::Value(Value::Undefined)),
             FunctionKind::User(definition) => {
                 if let Some(error) = &definition.lowering_error {
                     bail!("function reachable nhưng frontend không hạ được body: {error}")
@@ -628,7 +1206,17 @@ impl Machine {
                         .entry(name.clone())
                         .or_insert_with(|| binding(VariableKind::Const, true, Value::Function(id)));
                 }
+                if let Some(extra_scope) = extra_scope {
+                    call_scope.extend(extra_scope);
+                }
                 scopes.push(call_scope);
+                if definition.generator {
+                    if !is_async {
+                        bail!("sync generator execution chưa được bật")
+                    }
+                    let generator = self.create_async_generator(definition, scopes, strict)?;
+                    return Ok(CallOutcome::Value(generator));
+                }
                 if is_async {
                     let promise = self.new_promise();
                     predeclare(&definition.body, &mut scopes, self)?;
@@ -828,7 +1416,7 @@ impl Machine {
         }
         let constructor = self.promises[source as usize].constructor.clone();
         let species = self.promise_species(&constructor);
-        let next = self.new_promise_with_constructor(&species);
+        let next = self.new_promise_capability(&species)?;
         self.attach_reaction(
             source,
             PromiseReaction {
@@ -1050,7 +1638,10 @@ pub fn execute_in_realm_with_host_hooks(
         .map(|class| (class.name.clone(), class))
         .collect();
     let mut scopes = vec![HashMap::new()];
-    match execute_scope(
+    machine.predeclare_promise_subclasses(&program.promise_subclasses, &mut scopes)?;
+    predeclare(&program.statements, &mut scopes, &mut machine)?;
+    machine.install_promise_subclasses(&program.promise_subclasses, &mut scopes)?;
+    match execute_predeclared_scope(
         &program.statements,
         &mut scopes,
         program.strict,
@@ -1069,6 +1660,15 @@ fn execute_scope(
     machine: &mut Machine,
 ) -> Result<Completion> {
     predeclare(statements, scopes, machine)?;
+    execute_predeclared_scope(statements, scopes, strict, machine)
+}
+
+fn execute_predeclared_scope(
+    statements: &[Statement],
+    scopes: &mut Vec<Scope>,
+    strict: bool,
+    machine: &mut Machine,
+) -> Result<Completion> {
     for statement in statements {
         let completion = execute_statement(statement, scopes, strict, machine)?;
         if completion != Completion::Normal {
@@ -1396,7 +1996,14 @@ fn evaluate_expression(
         ExpressionKind::Number(value) => Ok(Value::Number(*value)),
         ExpressionKind::Bool(value) => Ok(Value::Bool(*value)),
         ExpressionKind::Null => Ok(Value::Null),
-        ExpressionKind::This => lookup(scopes, "@this"),
+        ExpressionKind::This => {
+            if let Some(flag) = find_binding(scopes, "@derived_super_called") {
+                if matches!(&flag.borrow().value, Value::Bool(false)) {
+                    bail!("không thể truy cập `this` trước super()")
+                }
+            }
+            lookup(scopes, "@this")
+        }
         ExpressionKind::Global(name) => match name.as_str() {
             "undefined" => Ok(Value::Undefined),
             "NaN" => Ok(Value::Number(f64::NAN)),
@@ -1404,8 +2011,21 @@ fn evaluate_expression(
             _ => lookup(scopes, name),
         },
         ExpressionKind::Member { object, property } => {
-            let object = evaluate_expression(object, scopes, strict, machine)?;
             let key = property_key(property, scopes, strict, machine)?;
+            if matches!(&object.kind, ExpressionKind::Global(name) if name == "@super") {
+                let base = lookup(scopes, "@super_base")?;
+                let receiver = evaluate_expression(
+                    &Expression {
+                        kind: ExpressionKind::This,
+                        span: expression.span,
+                    },
+                    scopes,
+                    strict,
+                    machine,
+                )?;
+                return machine.get_property_value(&base, &key, receiver, strict);
+            }
+            let object = evaluate_expression(object, scopes, strict, machine)?;
             machine.get_property_value(&object, &key, object.clone(), strict)
         }
         ExpressionKind::Object(properties) => {
@@ -1519,12 +2139,14 @@ fn evaluate_expression(
                     }
                 }
                 let value = evaluate_expression(argument, scopes, strict, machine)?;
+                let class_constructor = ecmora_value::class_constructor_slots(&value).is_some();
                 let kind = match value {
                     Value::Undefined => "undefined",
                     Value::Null => "object",
                     Value::Bool(_) => "boolean",
                     Value::Number(_) => "number",
                     Value::String(_) => "string",
+                    Value::Object(_) if class_constructor => "function",
                     Value::Object(_) | Value::Array(_) | Value::Promise(_) => "object",
                     Value::Function(_) => "function",
                 };
@@ -1568,10 +2190,39 @@ fn evaluate_expression(
             }
             if *operator == BinaryOperator::InstanceOf {
                 if let ExpressionKind::Global(name) = &right.kind {
+                    if find_binding(scopes, name).is_some() {
+                        let constructor = lookup(scopes, name)?;
+                        if let Some(class) = ecmora_value::class_constructor_slots(&constructor) {
+                            let value = evaluate_expression(left, scopes, strict, machine)?;
+                            return Ok(Value::Bool(match value {
+                                Value::Promise(id) => {
+                                    let mut current =
+                                        machine.promises[id as usize].constructor.as_str();
+                                    loop {
+                                        if current == class.name {
+                                            break true;
+                                        }
+                                        let Some(parent) = machine
+                                            .promise_subclasses
+                                            .get(current)
+                                            .map(|value| value.parent.as_str())
+                                        else {
+                                            break false;
+                                        };
+                                        current = parent;
+                                    }
+                                }
+                                _ => false,
+                            }));
+                        }
+                    }
                     if name == "Object" && find_binding(scopes, name).is_none() {
                         return Ok(Value::Bool(matches!(
                             evaluate_expression(left, scopes, strict, machine)?,
-                            Value::Object(_) | Value::Array(_)
+                            Value::Object(_)
+                                | Value::Array(_)
+                                | Value::Function(_)
+                                | Value::Promise(_)
                         )));
                     }
                     if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name)
@@ -1660,6 +2311,10 @@ fn evaluate_expression(
                     return machine.construct_promise_with_constructor(name, arguments, strict);
                 }
             }
+            let constructor = evaluate_expression(callee, scopes, strict, machine)?;
+            if let Some(name) = machine.class_name_from_value(&constructor) {
+                return machine.construct_promise_with_constructor(&name, arguments, strict);
+            }
             bail!("constructor này chưa được hỗ trợ")
         }
         ExpressionKind::Function(function) => Ok(Value::Function(
@@ -1670,6 +2325,34 @@ fn evaluate_expression(
             machine.await_value(value)
         }
         ExpressionKind::Call { callee, arguments } => {
+            if matches!(&callee.kind, ExpressionKind::Global(name) if name == "@super") {
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| evaluate_expression(argument, scopes, strict, machine))
+                    .collect::<Result<Vec<_>>>()?;
+                let promise = match lookup(scopes, "@derived_promise_id")? {
+                    Value::Number(id) => id as u64,
+                    _ => bail!("derived Promise constructor thiếu promise id"),
+                };
+                let parent = match lookup(scopes, "@super_constructor")? {
+                    Value::String(name) => name,
+                    _ => bail!("derived Promise constructor thiếu super constructor"),
+                };
+                let flag = find_binding(scopes, "@derived_super_called")
+                    .ok_or_else(|| anyhow!("super() ngoài derived constructor"))?;
+                if matches!(&flag.borrow().value, Value::Bool(true)) {
+                    bail!("super() chỉ được gọi một lần")
+                }
+                let override_value =
+                    machine.run_promise_constructor(&parent, promise, arguments, strict)?;
+                flag.borrow_mut().value = Value::Bool(true);
+                if let Some(value) = override_value {
+                    let this = find_binding(scopes, "@this")
+                        .ok_or_else(|| anyhow!("derived constructor thiếu this binding"))?;
+                    this.borrow_mut().value = value;
+                }
+                return lookup(scopes, "@this");
+            }
             let callee = evaluate_runtime_expression(callee, scopes, strict, machine)?;
             let arguments = arguments
                 .iter()
@@ -1710,6 +2393,35 @@ fn evaluate_expression(
                     ))
                 }
                 RuntimeValue::Function(id) => machine.call_as_expression(id, arguments, strict),
+                RuntimeValue::FunctionWithThis(id, receiver) => {
+                    match machine.call_function_with_this(id, receiver, arguments, strict)? {
+                        CallOutcome::Value(value) => Ok(value),
+                        CallOutcome::Throw(value) => {
+                            bail!("uncaught {}", ecmora_value::to_string(&value))
+                        }
+                    }
+                }
+                RuntimeValue::ClassConstructor(name) => {
+                    bail!("class constructor `{name}` phải được gọi bằng `new`")
+                }
+                RuntimeValue::AsyncGeneratorNext(id) => machine.enqueue_async_generator(
+                    id,
+                    ecmora_value::GeneratorCompletion::Normal(
+                        arguments.first().cloned().unwrap_or(Value::Undefined),
+                    ),
+                ),
+                RuntimeValue::AsyncGeneratorReturn(id) => machine.enqueue_async_generator(
+                    id,
+                    ecmora_value::GeneratorCompletion::Return(
+                        arguments.first().cloned().unwrap_or(Value::Undefined),
+                    ),
+                ),
+                RuntimeValue::AsyncGeneratorThrow(id) => machine.enqueue_async_generator(
+                    id,
+                    ecmora_value::GeneratorCompletion::Throw(
+                        arguments.first().cloned().unwrap_or(Value::Undefined),
+                    ),
+                ),
                 RuntimeValue::PromiseConstructor(constructor) => {
                     bail!("Promise constructor `{constructor}` phải được gọi bằng `new`")
                 }
@@ -1734,12 +2446,16 @@ fn evaluate_expression(
                         Some(Value::Null) => None,
                         _ => bail!("Object.setPrototypeOf prototype phải là Object hoặc null"),
                     };
-                    ecmora_value::set_prototype(&target, prototype)?;
+                    let storage = machine
+                        .promise_object_view(&target)
+                        .unwrap_or_else(|| target.clone());
+                    ecmora_value::set_prototype(&storage, prototype)?;
                     Ok(target)
                 }
                 RuntimeValue::ObjectGetPrototypeOf => {
                     let target = arguments.first().cloned().unwrap_or(Value::Undefined);
-                    Ok(ecmora_value::get_prototype(&target)
+                    let storage = machine.promise_object_view(&target).unwrap_or(target);
+                    Ok(ecmora_value::get_prototype(&storage)
                         .map(Value::Object)
                         .unwrap_or(Value::Null))
                 }
@@ -1748,11 +2464,11 @@ fn evaluate_expression(
                         &constructor,
                         arguments.first().cloned().unwrap_or(Value::Undefined),
                     ),
-                RuntimeValue::PromiseReject(constructor) => Ok(machine
+                RuntimeValue::PromiseReject(constructor) => machine
                     .promise_reject_with_constructor(
                         &constructor,
                         arguments.first().cloned().unwrap_or(Value::Undefined),
-                    )),
+                    ),
                 RuntimeValue::PromiseThen(id) => machine.promise_then(
                     id,
                     argument_function(&arguments, 0),
@@ -1829,42 +2545,113 @@ fn evaluate_runtime_expression(
             });
         }
     }
-    if let ExpressionKind::Member {
-        object,
-        property: MemberProperty::Static(property),
-    } = &expression.kind
-    {
-        if let ExpressionKind::Global(name) = &object.kind {
-            if name == "console" && property == "log" && find_binding(scopes, name).is_none() {
+
+    if let ExpressionKind::Member { object, property } = &expression.kind {
+        if let (ExpressionKind::Global(name), MemberProperty::Static(key)) =
+            (&object.kind, property)
+        {
+            if name == "console" && key == "log" && find_binding(scopes, name).is_none() {
                 return Ok(RuntimeValue::ConsoleLog);
             }
-            if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name) {
-                return Ok(match property.as_str() {
-                    "resolve" => RuntimeValue::PromiseResolve(name.clone()),
-                    "reject" => RuntimeValue::PromiseReject(name.clone()),
-                    _ => RuntimeValue::Js,
-                });
-            }
             if name == "Object" && find_binding(scopes, name).is_none() {
-                return Ok(match property.as_str() {
+                return Ok(match key.as_str() {
                     "create" => RuntimeValue::ObjectCreate,
                     "setPrototypeOf" => RuntimeValue::ObjectSetPrototypeOf,
                     "getPrototypeOf" => RuntimeValue::ObjectGetPrototypeOf,
                     _ => RuntimeValue::Js,
                 });
             }
+            if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name) {
+                return Ok(match key.as_str() {
+                    "resolve" => RuntimeValue::PromiseResolve(name.clone()),
+                    "reject" => RuntimeValue::PromiseReject(name.clone()),
+                    _ => RuntimeValue::Js,
+                });
+            }
         }
-        if let Value::Promise(id) = evaluate_expression(object, scopes, strict, machine)? {
-            return Ok(match property.as_str() {
+
+        if matches!(&object.kind, ExpressionKind::Global(name) if name == "@super") {
+            let base = lookup(scopes, "@super_base")?;
+            let receiver = evaluate_expression(
+                &Expression {
+                    kind: ExpressionKind::This,
+                    span: expression.span,
+                },
+                scopes,
+                strict,
+                machine,
+            )?;
+            let key = property_key(property, scopes, strict, machine)?;
+            let value = machine.get_property_value(&base, &key, receiver.clone(), strict)?;
+            return Ok(match value {
+                Value::Function(function) => RuntimeValue::FunctionWithThis(function, receiver),
+                _ => RuntimeValue::Js,
+            });
+        }
+
+        // ECMAScript evaluates the base before a computed property key.
+        let receiver = evaluate_expression(object, scopes, strict, machine)?;
+        let key = property_key(property, scopes, strict, machine)?;
+
+        if let Value::Promise(id) = &receiver {
+            let id = *id;
+            let receiver = Value::Promise(id);
+            if machine.has_property_value(&receiver, &key, strict)? {
+                let value =
+                    machine.get_property_value(&receiver, &key, receiver.clone(), strict)?;
+                return Ok(match value {
+                    Value::Function(function) => RuntimeValue::FunctionWithThis(function, receiver),
+                    _ => RuntimeValue::Js,
+                });
+            }
+            return Ok(match key.as_str() {
                 "then" => RuntimeValue::PromiseThen(id),
                 "catch" => RuntimeValue::PromiseCatch(id),
                 "finally" => RuntimeValue::PromiseFinally(id),
                 _ => RuntimeValue::Js,
             });
         }
+
+        if let Some(slots) = ecmora_value::async_generator_slots(&receiver) {
+            return Ok(match key.as_str() {
+                "next" => RuntimeValue::AsyncGeneratorNext(slots.runtime_id),
+                "return" => RuntimeValue::AsyncGeneratorReturn(slots.runtime_id),
+                "throw" => RuntimeValue::AsyncGeneratorThrow(slots.runtime_id),
+                _ => RuntimeValue::Js,
+            });
+        }
+
+        if let Some(class) = ecmora_value::class_constructor_slots(&receiver) {
+            if machine.has_property_value(&receiver, &key, strict)? {
+                let value =
+                    machine.get_property_value(&receiver, &key, receiver.clone(), strict)?;
+                return Ok(match value {
+                    Value::Function(function) => RuntimeValue::FunctionWithThis(function, receiver),
+                    _ => RuntimeValue::Js,
+                });
+            }
+            if machine.is_promise_subclass(&class.name) {
+                match key.as_str() {
+                    "resolve" => return Ok(RuntimeValue::PromiseResolve(class.name)),
+                    "reject" => return Ok(RuntimeValue::PromiseReject(class.name)),
+                    _ => {}
+                }
+            }
+            return Ok(RuntimeValue::Js);
+        }
+
+        let value = machine.get_property_value(&receiver, &key, receiver.clone(), strict)?;
+        return Ok(match value {
+            Value::Function(function) => RuntimeValue::FunctionWithThis(function, receiver),
+            _ => RuntimeValue::Js,
+        });
     }
+
     match evaluate_expression(expression, scopes, strict, machine)? {
         Value::Function(id) => Ok(RuntimeValue::Function(id)),
+        value if machine.class_name_from_value(&value).is_some() => Ok(
+            RuntimeValue::ClassConstructor(machine.class_name_from_value(&value).unwrap()),
+        ),
         _ => Ok(RuntimeValue::Js),
     }
 }
@@ -1908,8 +2695,21 @@ fn read_target(
     match target {
         AssignmentTarget::Identifier(name) => lookup(scopes, name),
         AssignmentTarget::Member { object, property } => {
-            let object = evaluate_expression(object, scopes, strict, machine)?;
             let key = property_key(property, scopes, strict, machine)?;
+            if matches!(&object.kind, ExpressionKind::Global(name) if name == "@super") {
+                let base = lookup(scopes, "@super_base")?;
+                let receiver = evaluate_expression(
+                    &Expression {
+                        kind: ExpressionKind::This,
+                        span: object.span,
+                    },
+                    scopes,
+                    strict,
+                    machine,
+                )?;
+                return machine.get_property_value(&base, &key, receiver, strict);
+            }
+            let object = evaluate_expression(object, scopes, strict, machine)?;
             machine.get_property_value(&object, &key, object.clone(), strict)
         }
     }
@@ -1925,8 +2725,21 @@ fn write_target(
     match target {
         AssignmentTarget::Identifier(name) => store_identifier(name, value, scopes, strict),
         AssignmentTarget::Member { object, property } => {
-            let object = evaluate_expression(object, scopes, strict, machine)?;
             let key = property_key(property, scopes, strict, machine)?;
+            if matches!(&object.kind, ExpressionKind::Global(name) if name == "@super") {
+                let base = lookup(scopes, "@super_base")?;
+                let receiver = evaluate_expression(
+                    &Expression {
+                        kind: ExpressionKind::This,
+                        span: object.span,
+                    },
+                    scopes,
+                    strict,
+                    machine,
+                )?;
+                return machine.set_property_value(&base, key, value, receiver, strict);
+            }
+            let object = evaluate_expression(object, scopes, strict, machine)?;
             machine.set_property_value(&object, key, value, object.clone(), strict)
         }
     }

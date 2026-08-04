@@ -12,11 +12,13 @@ use ecmora_ir::{
 use ecmora_value::{BinaryOperator as SemBinary, UnaryOperator as SemUnary, Value};
 use std::collections::{HashMap, HashSet};
 
+mod abstract_value;
 mod async_normalize;
 pub mod effects;
 mod specialization;
 mod support;
 
+use abstract_value::AbstractValue;
 use async_normalize::normalize_async_function;
 use effects::validate_native_semantics;
 use specialization::*;
@@ -283,7 +285,8 @@ impl Lowerer {
 
     fn is_pure_initializer(&self, expression: &Expression) -> bool {
         let functions = self.function_defs.keys().cloned().collect::<HashSet<_>>();
-        is_pure_expression_known(expression, &functions)
+        effects::expression_effects(expression).is_empty()
+            && is_pure_expression_known(expression, &functions)
     }
 
     fn lower_statement(&mut self, statement: &Statement) -> Result<()> {
@@ -1185,15 +1188,22 @@ impl Lowerer {
     }
 
     fn expression_type_hint(&self, expression: &Expression) -> Option<ValueType> {
-        let mut bindings = HashMap::new();
+        let mut abstract_bindings = HashMap::new();
+        let mut simple_bindings = HashMap::new();
         for scope in &self.scopes {
             for (name, binding) in scope {
                 if binding.initialized {
-                    bindings.insert(name.clone(), binding.value_type);
+                    abstract_bindings.insert(
+                        name.clone(),
+                        AbstractValue::from_type(binding.value_type, binding.value.clone()),
+                    );
+                    simple_bindings.insert(name.clone(), binding.value_type);
                 }
             }
         }
-        infer_expression_type_hint(expression, &bindings, None)
+        abstract_value::evaluate(expression, &abstract_bindings)
+            .single_type()
+            .or_else(|| infer_expression_type_hint(expression, &simple_bindings, None))
     }
 
     fn take_direct_tail_call(&mut self, result: ValueId) -> Option<Terminator> {
@@ -1246,6 +1256,12 @@ impl Lowerer {
             ExpressionKind::This => bail!(
                 "`this` requires runtime receiver ABI; route this function to compatibility backend"
             ),
+            ExpressionKind::Global(name) if name == "@yield" => {
+                bail!("async generator cần compatibility request-queue lowering")
+            }
+            ExpressionKind::Global(name) if name == "@super" => {
+                bail!("super reference cần compatibility class-object lowering")
+            }
             ExpressionKind::Global(name) => self.lookup(name),
             ExpressionKind::Member { object, property } => self.lower_object_get(object, property),
             ExpressionKind::Object(properties) => {
@@ -2126,6 +2142,20 @@ impl Lowerer {
             Err(_) => None,
         };
         if operator == AssignmentOperator::Assign {
+            if let ExpressionKind::Function(function) = &expression.kind {
+                let captures = self.capture_environment_for(function);
+                self.closure_callables.insert(
+                    name.to_owned(),
+                    ClosureBinding {
+                        function: function.clone(),
+                        captures,
+                    },
+                );
+                let placeholder = self.emit_value(Value::Undefined);
+                let value = (placeholder.0, ValueType::Callable, None);
+                return self.store_assignment(name, value, old.is_none());
+            }
+            self.closure_callables.remove(name);
             let value = self.lower_expression(expression)?;
             return self.store_assignment(name, value, old.is_none());
         }
@@ -2243,6 +2273,12 @@ impl Lowerer {
         arguments: &[Expression],
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
         if let ExpressionKind::Global(name) = &callee.kind {
+            if name == "@yield" {
+                bail!("async generator cần compatibility request-queue lowering")
+            }
+            if name == "@super" {
+                bail!("super() cần compatibility class-constructor lowering")
+            }
             if name == "__ecmora_dynamic_import" {
                 if arguments.len() != 1 {
                     bail!("import() cần đúng một argument")
@@ -2612,6 +2648,9 @@ impl Lowerer {
         arguments: &[Expression],
         captures: Option<&[CapturedBinding]>,
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        if function.generator {
+            bail!("async generator `{name}` cần compatibility request-queue lowering")
+        }
         let normalized_function = normalize_async_function(function)?;
         let function = &normalized_function;
         if let Some(error) = &function.lowering_error {
@@ -2759,6 +2798,7 @@ impl Lowerer {
                 body: function.body[index + 1..].to_vec(),
                 // Recursive continuation lowering supports more than one await.
                 r#async: true,
+                generator: false,
                 arrow: true,
                 lowering_error: function.lowering_error.clone(),
             };
@@ -2875,6 +2915,9 @@ impl Lowerer {
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
         if let Some(error) = &function.lowering_error {
             bail!("function `{name}` reachable nhưng native frontend không hạ được body: {error}")
+        }
+        if function.generator {
+            bail!("generator function `{name}` cần generator state-machine lowering")
         }
         if function.r#async {
             bail!("async function `{name}` phải đi qua async lowering")

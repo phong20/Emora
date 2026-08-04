@@ -272,6 +272,87 @@ pub fn same_value(left: &Value, right: &Value) -> bool {
     }
 }
 
+pub fn class_constructor_object(
+    name: String,
+    parent: Option<String>,
+    constructor: Option<u64>,
+    prototype: ObjectRef,
+    realm: RealmId,
+) -> Value {
+    let object = object_with_prototype_in_realm(None, realm);
+    set_object_kind(
+        &object,
+        ObjectKind::ClassConstructor(ClassConstructorSlots {
+            name,
+            parent,
+            realm,
+            constructor,
+            prototype,
+        }),
+    )
+    .expect("fresh class constructor object");
+    object
+}
+
+pub fn class_constructor_slots(value: &Value) -> Option<ClassConstructorSlots> {
+    match object_kind(value)? {
+        ObjectKind::ClassConstructor(slots) => Some(slots),
+        _ => None,
+    }
+}
+
+pub fn async_generator_object(runtime_id: u64, realm: RealmId) -> Value {
+    let object = object_with_prototype_in_realm(None, realm);
+    set_object_kind(
+        &object,
+        ObjectKind::AsyncGenerator(AsyncGeneratorSlots::new(runtime_id)),
+    )
+    .expect("fresh async generator object");
+    object
+}
+
+pub fn async_generator_slots(value: &Value) -> Option<AsyncGeneratorSlots> {
+    match object_kind(value)? {
+        ObjectKind::AsyncGenerator(slots) => Some(slots),
+        _ => None,
+    }
+}
+
+pub fn async_generator_enqueue(value: &Value, request: AsyncGeneratorRequest) -> Result<()> {
+    let Value::Object(object) = value else {
+        bail!("async generator request target không phải object")
+    };
+    let mut object = object.borrow_mut();
+    let ObjectKind::AsyncGenerator(slots) = &mut object.internal_slots.kind else {
+        bail!("object không có [[AsyncGeneratorState]]")
+    };
+    slots.queue.push_back(request);
+    Ok(())
+}
+
+pub fn async_generator_dequeue(value: &Value) -> Result<Option<AsyncGeneratorRequest>> {
+    let Value::Object(object) = value else {
+        bail!("async generator request target không phải object")
+    };
+    let mut object = object.borrow_mut();
+    let ObjectKind::AsyncGenerator(slots) = &mut object.internal_slots.kind else {
+        bail!("object không có [[AsyncGeneratorState]]")
+    };
+    Ok(slots.queue.pop_front())
+}
+
+pub fn set_async_generator_state(value: &Value, state: AsyncGeneratorState) -> Result<()> {
+    let Value::Object(object) = value else {
+        bail!("async generator state target không phải object")
+    };
+    let mut object = object.borrow_mut();
+    let ObjectKind::AsyncGenerator(slots) = &mut object.internal_slots.kind else {
+        bail!("object không có [[AsyncGeneratorState]]")
+    };
+    slots.state = state;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

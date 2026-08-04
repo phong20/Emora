@@ -7,8 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use ecmora_hir::{
     ArrayElement, AssignmentTarget, ExportBinding, Expression, ExpressionKind, ForInit,
-    ImportSpecifier, MemberProperty, ObjectEntry, ObjectProperty, Program, Statement,
-    StatementKind,
+    ImportSpecifier, MemberProperty, ObjectEntry, ObjectProperty, Program, PromiseSubclass,
+    Statement, StatementKind,
 };
 
 pub(super) fn load_program(entry: &Path) -> Result<Program> {
@@ -25,7 +25,7 @@ pub(super) fn load_program(entry: &Path) -> Result<Program> {
         imports: Vec::new(),
         exports: Vec::new(),
         export_all: Vec::new(),
-        promise_subclasses: Vec::new(),
+        promise_subclasses: loader.promise_subclasses,
     })
 }
 
@@ -36,6 +36,7 @@ struct ModuleLoader {
     predeclared: HashMap<PathBuf, HashMap<String, String>>,
     pending: HashMap<PathBuf, PendingModule>,
     statements: Vec<Statement>,
+    promise_subclasses: Vec<PromiseSubclass>,
 }
 
 struct PendingModule {
@@ -71,7 +72,11 @@ impl ModuleLoader {
         let id = self.next_id;
         self.next_id += 1;
         let mut rename = HashMap::new();
-        for name in top_level_names(&hir.statements) {
+        for name in top_level_names(&hir.statements).into_iter().chain(
+            hir.promise_subclasses
+                .iter()
+                .map(|class| class.name.clone()),
+        ) {
             rename.insert(name.clone(), format!("__m{id}_{}", sanitize(&name)));
         }
         let mut provisional_exports = HashMap::new();
@@ -134,7 +139,11 @@ impl ModuleLoader {
             true,
             &HashSet::new(),
         );
+        for class in &mut hir.promise_subclasses {
+            rename_promise_subclass(class, &rename, &namespaces);
+        }
         self.statements.extend(hir.statements);
+        self.promise_subclasses.extend(hir.promise_subclasses);
 
         let mut exports = HashMap::new();
         for ExportBinding {
@@ -173,6 +182,42 @@ impl ModuleLoader {
         self.predeclared.insert(path.to_owned(), exports.clone());
         Ok(exports)
     }
+}
+
+fn rename_promise_subclass(
+    class: &mut PromiseSubclass,
+    rename: &HashMap<String, String>,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    if let Some(name) = rename.get(&class.name) {
+        class.name = name.clone();
+    }
+    if let Some(parent) = rename.get(&class.parent) {
+        class.parent = parent.clone();
+    }
+    if let Some(species) = &mut class.species {
+        if let Some(name) = rename.get(species) {
+            *species = name.clone();
+        }
+    }
+    if let Some(constructor) = &mut class.constructor {
+        rename_class_function(constructor, rename, namespaces);
+    }
+    for method in &mut class.methods {
+        rename_class_function(&mut method.function, rename, namespaces);
+    }
+}
+
+fn rename_class_function(
+    function: &mut ecmora_hir::Function,
+    rename: &HashMap<String, String>,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    let mut shadowed = function.parameters.iter().cloned().collect::<HashSet<_>>();
+    if let Some(name) = &function.name {
+        shadowed.insert(name.clone());
+    }
+    rename_scope(&mut function.body, rename, namespaces, false, &shadowed);
 }
 
 fn canonical_source(path: &Path) -> Result<PathBuf> {

@@ -1,5 +1,6 @@
 use std::path::Path;
 mod lower;
+mod var_hoist;
 use anyhow::{Context, Result, bail};
 use ecmora_hir::Program as HirProgram;
 use oxc_allocator::Allocator;
@@ -30,6 +31,7 @@ pub fn lower_source(path: &Path, source_text: &str) -> Result<HirProgram> {
     }
 
     let hir = lower::lower_program(&result.program)?;
+    let hir = var_hoist::normalize_var_hoisting(hir)?;
 
     Ok(hir)
 }

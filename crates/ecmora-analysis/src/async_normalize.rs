@@ -209,6 +209,7 @@ fn make_async_helper_call(
                         parameters: Vec::new(),
                         body,
                         r#async: true,
+                        generator: false,
                         arrow: true,
                         lowering_error: None,
                     }),

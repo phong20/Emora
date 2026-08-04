@@ -514,26 +514,26 @@ fn lower_promise_subclass(class: &oxc_ast::ast::Class<'_>) -> Result<ecmora_hir:
     };
 
     let mut species = None;
+    let mut constructor = None;
+    let mut methods = Vec::new();
     for element in &class.body.body {
         let ClassElement::MethodDefinition(method) = element else {
             bail!(
-                "Promise subclass `{name}` chỉ hỗ trợ method constructor và static @@species getter"
+                "Promise subclass `{name}` hiện hỗ trợ constructor/method/getter/setter; \
+                 class field/static block cần field-initializer lowering"
             )
         };
 
+        let mut function = lower_function(&method.value, false)?;
+        function.name = method
+            .key
+            .static_name()
+            .map(|name| name.into_owned())
+            .or_else(|| function.name.clone());
+
         if method.kind == MethodDefinitionKind::Constructor {
-            // Default/trivial forwarding constructors are semantically
-            // equivalent for the Promise-focused model. A non-empty custom
-            // constructor needs the full class/super object model.
-            let non_empty = method
-                .value
-                .body
-                .as_ref()
-                .is_some_and(|body| !body.statements.is_empty());
-            if non_empty {
-                bail!(
-                    "custom Promise subclass constructor `{name}` cần general class/super lowering"
-                )
+            if constructor.replace(function).is_some() {
+                bail!("Promise subclass `{name}` có nhiều constructor")
             }
             continue;
         }
@@ -552,28 +552,55 @@ fn lower_promise_subclass(class: &oxc_ast::ast::Class<'_>) -> Result<ecmora_hir:
                         ) && member.property.name == "species"
                 )
             });
-        if !is_species {
-            bail!("Promise subclass `{name}` có class element ngoài static get [Symbol.species]")
+
+        let key = if is_species {
+            "@@species".to_owned()
+        } else if method.computed {
+            bail!("computed class method key chưa được hỗ trợ ngoài Symbol.species")
+        } else {
+            method
+                .key
+                .static_name()
+                .ok_or_else(|| anyhow!("class method key chưa được hỗ trợ"))?
+                .into_owned()
+        };
+
+        let kind = match method.kind {
+            MethodDefinitionKind::Method => ecmora_hir::ClassMethodKind::Method,
+            MethodDefinitionKind::Get => ecmora_hir::ClassMethodKind::Get,
+            MethodDefinitionKind::Set => ecmora_hir::ClassMethodKind::Set,
+            MethodDefinitionKind::Constructor => unreachable!(),
+        };
+
+        if is_species {
+            let body = method
+                .value
+                .body
+                .as_ref()
+                .ok_or_else(|| anyhow!("@@species getter thiếu body"))?;
+            let [Statement::ReturnStatement(statement)] = body.statements.as_slice() else {
+                bail!("@@species getter phải chỉ chứa `return Constructor`")
+            };
+            let Some(Expression::Identifier(identifier)) = statement.argument.as_ref() else {
+                bail!("@@species getter phải return identifier constructor")
+            };
+            species = Some(identifier.name.to_string());
         }
 
-        let body = method
-            .value
-            .body
-            .as_ref()
-            .ok_or_else(|| anyhow!("@@species getter thiếu body"))?;
-        let [Statement::ReturnStatement(statement)] = body.statements.as_slice() else {
-            bail!("@@species getter phải chỉ chứa `return Constructor`")
-        };
-        let Some(Expression::Identifier(identifier)) = statement.argument.as_ref() else {
-            bail!("@@species getter phải return identifier constructor")
-        };
-        species = Some(identifier.name.to_string());
+        methods.push(ecmora_hir::ClassMethod {
+            key,
+            function,
+            kind,
+            r#static: method.r#static,
+        });
     }
 
     Ok(ecmora_hir::PromiseSubclass {
         name,
         parent,
         species,
+        constructor,
+        methods,
     })
 }
 
@@ -777,7 +804,8 @@ fn lower_variable_declaration(
     let kind = match declaration.kind {
         VariableDeclarationKind::Const => VariableKind::Const,
         VariableDeclarationKind::Let => VariableKind::Let,
-        _ => bail!("chỉ hỗ trợ khai báo let/const"),
+        VariableDeclarationKind::Var => VariableKind::Var,
+        _ => bail!("declaration kind chưa được hỗ trợ"),
     };
     let mut declarations = Vec::with_capacity(declaration.declarations.len());
     for declarator in &declaration.declarations {
@@ -944,7 +972,8 @@ fn lower_for_left(left: &ForStatementLeft<'_>) -> Result<(String, VariableKind)>
             let kind = match declaration.kind {
                 VariableDeclarationKind::Const => VariableKind::Const,
                 VariableDeclarationKind::Let => VariableKind::Let,
-                _ => bail!("for-in/of chỉ hỗ trợ let/const"),
+                VariableDeclarationKind::Var => VariableKind::Var,
+                _ => bail!("for-in/of declaration kind chưa được hỗ trợ"),
             };
             Ok((identifier.name.to_string(), kind))
         }
@@ -967,6 +996,9 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
         Expression::BooleanLiteral(literal) => (ExpressionKind::Bool(literal.value), literal.span),
         Expression::NullLiteral(literal) => (ExpressionKind::Null, literal.span),
         Expression::ThisExpression(expression) => (ExpressionKind::This, expression.span),
+        Expression::Super(expression) => {
+            (ExpressionKind::Global("@super".to_owned()), expression.span)
+        }
         Expression::Identifier(identifier) => (
             ExpressionKind::Global(identifier.name.to_string()),
             identifier.span,
@@ -1166,6 +1198,30 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
             ExpressionKind::Await(Box::new(lower_expression(&expression.argument)?)),
             expression.span,
         ),
+        Expression::YieldExpression(expression) => (
+            ExpressionKind::Call {
+                callee: Box::new(HirExpression {
+                    kind: ExpressionKind::Global("@yield".to_owned()),
+                    span: convert_span(expression.span),
+                }),
+                arguments: vec![
+                    expression
+                        .argument
+                        .as_ref()
+                        .map(lower_expression)
+                        .transpose()?
+                        .unwrap_or(HirExpression {
+                            kind: ExpressionKind::Global("undefined".to_owned()),
+                            span: convert_span(expression.span),
+                        }),
+                    HirExpression {
+                        kind: ExpressionKind::Bool(expression.delegate),
+                        span: convert_span(expression.span),
+                    },
+                ],
+            },
+            expression.span,
+        ),
         unsupported => bail!("expression chưa được hỗ trợ trong HIR: {unsupported:#?}"),
     };
     Ok(HirExpression {
@@ -1175,9 +1231,7 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
 }
 
 fn lower_function(function: &OxcFunction<'_>, arrow: bool) -> Result<HirFunction> {
-    let mut lowering_error = function
-        .generator
-        .then(|| "generator function chưa được native analysis hỗ trợ".to_owned());
+    let mut lowering_error = None;
     let parameters = match lower_parameters(&function.params) {
         Ok(parameters) => parameters,
         Err(error) => {
@@ -1208,6 +1262,7 @@ fn lower_function(function: &OxcFunction<'_>, arrow: bool) -> Result<HirFunction
         parameters,
         body,
         r#async: function.r#async,
+        generator: function.generator,
         arrow,
         lowering_error,
     })
@@ -1255,6 +1310,7 @@ fn lower_arrow_function(function: &ArrowFunctionExpression<'_>) -> Result<HirFun
         parameters,
         body,
         r#async: function.r#async,
+        generator: false,
         arrow: true,
         lowering_error,
     })
