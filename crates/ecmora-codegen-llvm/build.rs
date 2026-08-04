@@ -1,13 +1,9 @@
-#[path = "../../tools/source_patch_build.rs"]
-mod source_patch_build;
-
 use std::{
     env, fs,
     path::{Path, PathBuf},
 };
 
 fn main() {
-    source_patch_build::generate();
     println!("cargo:rerun-if-env-changed=LLVM_SYS_221_PREFIX");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
