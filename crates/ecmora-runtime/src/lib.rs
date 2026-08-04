@@ -4,12 +4,51 @@ use ecmora_hir::{
     ForInit, Function as HirFunction, LogicalOperator, MemberProperty, ObjectEntry, Program,
     Statement, StatementKind, UnaryOperator, UpdateOperator, VariableKind,
 };
-use ecmora_value::{BinaryOperator as SemBinary, Value};
+use ecmora_value::{BinaryOperator as SemBinary, RealmId, Value};
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromiseRejectionOperation {
+    Reject,
+    Handle,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromiseRejectionEvent {
+    pub promise: u64,
+    pub reason: Value,
+    pub operation: PromiseRejectionOperation,
+    pub realm: RealmId,
+}
+
+pub type PromiseRejectionTracker = fn(&PromiseRejectionEvent) -> Result<()>;
+
+#[derive(Clone, Copy)]
+pub struct HostHooks {
+    pub promise_rejection_tracker: PromiseRejectionTracker,
+}
+
+impl Default for HostHooks {
+    fn default() -> Self {
+        Self {
+            promise_rejection_tracker: default_promise_rejection_tracker,
+        }
+    }
+}
+
+fn default_promise_rejection_tracker(event: &PromiseRejectionEvent) -> Result<()> {
+    if event.operation == PromiseRejectionOperation::Reject {
+        bail!(
+            "unhandled promise rejection: {}",
+            ecmora_value::to_string(&event.reason)
+        )
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum Completion {
@@ -32,6 +71,7 @@ enum RuntimeValue {
     ObjectCreate,
     ObjectSetPrototypeOf,
     ObjectGetPrototypeOf,
+    ProxyConstructor,
     PromiseConstructor(String),
     PromiseResolve(String),
     PromiseReject(String),
@@ -64,6 +104,8 @@ enum FunctionKind {
 struct FunctionObject {
     kind: FunctionKind,
     closure: Vec<Scope>,
+    #[allow(dead_code)]
+    realm: RealmId,
 }
 
 #[derive(Debug, Clone)]
@@ -88,6 +130,7 @@ struct PromiseObject {
     handled: bool,
     reported_unhandled: bool,
     constructor: String,
+    realm: RealmId,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +163,10 @@ struct Machine {
     jobs: VecDeque<PromiseJob>,
     async_tasks: Vec<Option<AsyncTask>>,
     promise_subclasses: HashMap<String, ecmora_hir::PromiseSubclass>,
+    current_realm: RealmId,
+    host_hooks: HostHooks,
+    host_events: VecDeque<PromiseRejectionEvent>,
+    proxy_depth: usize,
 }
 
 fn binding(kind: VariableKind, initialized: bool, value: Value) -> BindingRef {
@@ -141,6 +188,7 @@ impl Machine {
         self.functions.push(FunctionObject {
             kind: FunctionKind::User(function),
             closure,
+            realm: self.current_realm,
         });
         id
     }
@@ -150,8 +198,257 @@ impl Machine {
         self.functions.push(FunctionObject {
             kind,
             closure: Vec::new(),
+            realm: self.current_realm,
         });
         id
+    }
+
+    fn proxy_trap(&mut self, handler: &Value, name: &str, strict: bool) -> Result<Option<u64>> {
+        let trap = self.get_property_value(handler, name, handler.clone(), strict)?;
+        match trap {
+            Value::Undefined => Ok(None),
+            Value::Function(id) => Ok(Some(id)),
+            _ => bail!("Proxy `{name}` trap phải là callable hoặc undefined"),
+        }
+    }
+
+    fn call_proxy_trap(
+        &mut self,
+        trap: u64,
+        handler: Value,
+        arguments: Vec<Value>,
+        strict: bool,
+    ) -> Result<Value> {
+        match self.call_function_with_this(trap, handler, arguments, strict)? {
+            CallOutcome::Value(value) => Ok(value),
+            CallOutcome::Throw(reason) => {
+                bail!("Proxy trap threw {}", ecmora_value::to_string(&reason))
+            }
+        }
+    }
+
+    fn get_property_value(
+        &mut self,
+        object: &Value,
+        key: &str,
+        receiver: Value,
+        strict: bool,
+    ) -> Result<Value> {
+        if let Some(slots) = ecmora_value::proxy_slots(object) {
+            if slots.revoked {
+                bail!("không thể thực hiện [[Get]] trên Proxy đã revoke")
+            }
+            if self.proxy_depth >= 256 {
+                bail!("Proxy trap recursion limit exceeded")
+            }
+            self.proxy_depth += 1;
+            let result = (|| {
+                if let Some(trap) = self.proxy_trap(&slots.handler, "get", strict)? {
+                    return self.call_proxy_trap(
+                        trap,
+                        slots.handler,
+                        vec![slots.target, Value::String(key.to_owned()), receiver],
+                        strict,
+                    );
+                }
+                self.get_property_value(&slots.target, key, receiver, strict)
+            })();
+            self.proxy_depth -= 1;
+            return result;
+        }
+
+        if let Some(getter) =
+            ecmora_value::get_accessor(object, key).and_then(|descriptor| descriptor.getter)
+        {
+            return match self.call_function_with_this(getter, receiver, Vec::new(), strict)? {
+                CallOutcome::Value(value) => Ok(value),
+                CallOutcome::Throw(value) => {
+                    bail!("getter threw {}", ecmora_value::to_string(&value))
+                }
+            };
+        }
+        Ok(ecmora_value::get_property(object, key))
+    }
+
+    fn set_property_value(
+        &mut self,
+        object: &Value,
+        key: String,
+        value: Value,
+        receiver: Value,
+        strict: bool,
+    ) -> Result<Value> {
+        if let Some(slots) = ecmora_value::proxy_slots(object) {
+            if slots.revoked {
+                bail!("không thể thực hiện [[Set]] trên Proxy đã revoke")
+            }
+            if self.proxy_depth >= 256 {
+                bail!("Proxy trap recursion limit exceeded")
+            }
+            self.proxy_depth += 1;
+            let result = (|| {
+                if let Some(trap) = self.proxy_trap(&slots.handler, "set", strict)? {
+                    let accepted = self.call_proxy_trap(
+                        trap,
+                        slots.handler,
+                        vec![
+                            slots.target.clone(),
+                            Value::String(key.clone()),
+                            value.clone(),
+                            receiver,
+                        ],
+                        strict,
+                    )?;
+                    if !ecmora_value::to_boolean(&accepted) {
+                        if strict {
+                            bail!("Proxy set trap returned false")
+                        }
+                        return Ok(value);
+                    }
+                    if let Some(current) =
+                        ecmora_value::is_non_writable_non_configurable_data_property(
+                            &slots.target,
+                            &key,
+                        )
+                    {
+                        if !ecmora_value::same_value(&current, &value) {
+                            bail!("Proxy set trap violated non-writable non-configurable invariant")
+                        }
+                    }
+                    return Ok(value);
+                }
+                self.set_property_value(&slots.target, key, value, receiver, strict)
+            })();
+            self.proxy_depth -= 1;
+            return result;
+        }
+
+        if let Some(setter) =
+            ecmora_value::get_accessor(object, &key).and_then(|descriptor| descriptor.setter)
+        {
+            return match self.call_function_with_this(setter, receiver, vec![value], strict)? {
+                CallOutcome::Value(value) => Ok(value),
+                CallOutcome::Throw(value) => {
+                    bail!("setter threw {}", ecmora_value::to_string(&value))
+                }
+            };
+        }
+        ecmora_value::set_property(object, key, value)
+    }
+
+    fn has_property_value(&mut self, object: &Value, key: &str, strict: bool) -> Result<bool> {
+        if let Some(slots) = ecmora_value::proxy_slots(object) {
+            if slots.revoked {
+                bail!("không thể thực hiện [[HasProperty]] trên Proxy đã revoke")
+            }
+            if self.proxy_depth >= 256 {
+                bail!("Proxy trap recursion limit exceeded")
+            }
+            self.proxy_depth += 1;
+            let result = (|| {
+                if let Some(trap) = self.proxy_trap(&slots.handler, "has", strict)? {
+                    let visible = ecmora_value::to_boolean(&self.call_proxy_trap(
+                        trap,
+                        slots.handler,
+                        vec![slots.target.clone(), Value::String(key.to_owned())],
+                        strict,
+                    )?);
+                    if !visible
+                        && ecmora_value::non_configurable_own_keys(&slots.target).contains(key)
+                    {
+                        bail!("Proxy has trap cannot hide non-configurable property")
+                    }
+                    return Ok(visible);
+                }
+                self.has_property_value(&slots.target, key, strict)
+            })();
+            self.proxy_depth -= 1;
+            return result;
+        }
+        Ok(ecmora_value::has_property(object, key))
+    }
+
+    fn delete_property_value(&mut self, object: &Value, key: &str, strict: bool) -> Result<bool> {
+        if let Some(slots) = ecmora_value::proxy_slots(object) {
+            if slots.revoked {
+                bail!("không thể thực hiện [[Delete]] trên Proxy đã revoke")
+            }
+            if self.proxy_depth >= 256 {
+                bail!("Proxy trap recursion limit exceeded")
+            }
+            self.proxy_depth += 1;
+            let result = (|| {
+                if let Some(trap) = self.proxy_trap(&slots.handler, "deleteProperty", strict)? {
+                    let deleted = ecmora_value::to_boolean(&self.call_proxy_trap(
+                        trap,
+                        slots.handler,
+                        vec![slots.target.clone(), Value::String(key.to_owned())],
+                        strict,
+                    )?);
+                    if deleted
+                        && ecmora_value::non_configurable_own_keys(&slots.target).contains(key)
+                    {
+                        bail!("Proxy deleteProperty trap cannot delete non-configurable property")
+                    }
+                    return Ok(deleted);
+                }
+                self.delete_property_value(&slots.target, key, strict)
+            })();
+            self.proxy_depth -= 1;
+            return result;
+        }
+        Ok(ecmora_value::delete_property(object, key))
+    }
+
+    fn own_property_keys_value(&mut self, object: &Value, strict: bool) -> Result<Vec<String>> {
+        if let Some(slots) = ecmora_value::proxy_slots(object) {
+            if slots.revoked {
+                bail!("không thể thực hiện [[OwnPropertyKeys]] trên Proxy đã revoke")
+            }
+            if self.proxy_depth >= 256 {
+                bail!("Proxy trap recursion limit exceeded")
+            }
+            self.proxy_depth += 1;
+            let result = (|| {
+                let Some(trap) = self.proxy_trap(&slots.handler, "ownKeys", strict)? else {
+                    return self.own_property_keys_value(&slots.target, strict);
+                };
+                let trap_result =
+                    self.call_proxy_trap(trap, slots.handler, vec![slots.target.clone()], strict)?;
+                let Value::Array(keys) = trap_result else {
+                    bail!("Proxy ownKeys trap phải trả Array")
+                };
+                let entries = keys.borrow().clone();
+                let mut output = Vec::with_capacity(entries.len());
+                let mut unique = HashSet::new();
+                for entry in entries {
+                    let Some(Value::String(key)) = entry else {
+                        bail!("Proxy ownKeys chỉ hỗ trợ string property keys")
+                    };
+                    if !unique.insert(key.clone()) {
+                        bail!("Proxy ownKeys trap trả duplicate key `{key}`")
+                    }
+                    output.push(key);
+                }
+                for key in ecmora_value::non_configurable_own_keys(&slots.target) {
+                    if !unique.contains(&key) {
+                        bail!("Proxy ownKeys trap thiếu non-configurable key `{key}`")
+                    }
+                }
+                if !ecmora_value::is_extensible(&slots.target) {
+                    let target_keys = ecmora_value::own_property_keys_all(&slots.target)
+                        .into_iter()
+                        .collect::<HashSet<_>>();
+                    if target_keys != unique {
+                        bail!("Proxy ownKeys trap phải trả đúng key set của non-extensible target")
+                    }
+                }
+                Ok(output)
+            })();
+            self.proxy_depth -= 1;
+            return result;
+        }
+        Ok(ecmora_value::own_property_keys(object))
     }
 
     fn new_promise(&mut self) -> u64 {
@@ -166,6 +463,7 @@ impl Machine {
             handled: false,
             reported_unhandled: false,
             constructor: constructor.to_owned(),
+            realm: self.current_realm,
         });
         id
     }
@@ -483,18 +781,15 @@ impl Machine {
 
         let then = match &value {
             Value::Object(_) | Value::Array(_) => {
-                if let Some(getter) = ecmora_value::get_accessor(&value, "then")
-                    .and_then(|descriptor| descriptor.getter)
-                {
-                    match self.call_function_with_this(getter, value.clone(), Vec::new(), true)? {
-                        CallOutcome::Value(value) => value,
-                        CallOutcome::Throw(reason) => {
-                            self.settle(promise, PromiseState::Rejected(reason));
-                            return Ok(());
-                        }
+                match self.get_property_value(&value, "then", value.clone(), true) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.settle(
+                            promise,
+                            PromiseState::Rejected(Value::String(format!("{error:#}"))),
+                        );
+                        return Ok(());
                     }
-                } else {
-                    ecmora_value::get_property(&value, "then")
                 }
             }
             _ => Value::Undefined,
@@ -548,9 +843,33 @@ impl Machine {
 
     fn attach_reaction(&mut self, source: u64, reaction: PromiseReaction) {
         // ECMAScript marks a promise handled when PerformPromiseThen attaches
-        // any reaction. A missing onRejected propagates rejection to `next`,
-        // whose own handled state is tracked independently.
-        self.promises[source as usize].handled = true;
+        // any reaction. If the host already observed the rejection, queue the
+        // matching `handle` notification.
+        let late_handle = {
+            let promise = &mut self.promises[source as usize];
+            let event = if promise.reported_unhandled {
+                match &promise.state {
+                    PromiseState::Rejected(reason) => Some(PromiseRejectionEvent {
+                        promise: source,
+                        reason: reason.clone(),
+                        operation: PromiseRejectionOperation::Handle,
+                        realm: promise.realm,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if event.is_some() {
+                promise.reported_unhandled = false;
+            }
+            promise.handled = true;
+            event
+        };
+        if let Some(event) = late_handle {
+            self.host_events.push_back(event);
+        }
+
         let state = self.promises[source as usize].state.clone();
         if matches!(state, PromiseState::Pending) {
             self.promises[source as usize].reactions.push(reaction);
@@ -566,16 +885,23 @@ impl Machine {
         while let Some(job) = self.jobs.pop_front() {
             self.run_job(job)?;
         }
-        for promise in &mut self.promises {
+
+        for (id, promise) in self.promises.iter_mut().enumerate() {
             if let PromiseState::Rejected(reason) = &promise.state {
                 if !promise.handled && !promise.reported_unhandled {
                     promise.reported_unhandled = true;
-                    bail!(
-                        "unhandled promise rejection: {}",
-                        ecmora_value::to_string(reason)
-                    )
+                    self.host_events.push_back(PromiseRejectionEvent {
+                        promise: id as u64,
+                        reason: reason.clone(),
+                        operation: PromiseRejectionOperation::Reject,
+                        realm: promise.realm,
+                    });
                 }
             }
+        }
+
+        while let Some(event) = self.host_events.pop_front() {
+            (self.host_hooks.promise_rejection_tracker)(&event)?;
         }
         Ok(())
     }
@@ -700,7 +1026,23 @@ fn direct_await(statement: &Statement) -> Option<(Expression, AsyncResumeAction)
 }
 
 pub fn execute(program: &Program) -> Result<()> {
-    let mut machine = Machine::default();
+    execute_in_realm_with_host_hooks(program, RealmId::ROOT, HostHooks::default())
+}
+
+pub fn execute_with_host_hooks(program: &Program, hooks: HostHooks) -> Result<()> {
+    execute_in_realm_with_host_hooks(program, RealmId::ROOT, hooks)
+}
+
+pub fn execute_in_realm_with_host_hooks(
+    program: &Program,
+    realm: RealmId,
+    hooks: HostHooks,
+) -> Result<()> {
+    let mut machine = Machine {
+        current_realm: realm,
+        host_hooks: hooks,
+        ..Machine::default()
+    };
     machine.promise_subclasses = program
         .promise_subclasses
         .iter()
@@ -891,7 +1233,7 @@ fn execute_statement(
             body,
         } => {
             let value = evaluate_expression(right, scopes, strict, machine)?;
-            let keys = ecmora_value::own_property_keys(&value);
+            let keys = machine.own_property_keys_value(&value, strict)?;
             scopes.push(HashMap::new());
             scopes
                 .last_mut()
@@ -1064,25 +1406,10 @@ fn evaluate_expression(
         ExpressionKind::Member { object, property } => {
             let object = evaluate_expression(object, scopes, strict, machine)?;
             let key = property_key(property, scopes, strict, machine)?;
-            if let Some(getter) =
-                ecmora_value::get_accessor(&object, &key).and_then(|descriptor| descriptor.getter)
-            {
-                return match machine.call_function_with_this(
-                    getter,
-                    object.clone(),
-                    Vec::new(),
-                    strict,
-                )? {
-                    CallOutcome::Value(value) => Ok(value),
-                    CallOutcome::Throw(value) => {
-                        bail!("getter threw {}", ecmora_value::to_string(&value))
-                    }
-                };
-            }
-            Ok(ecmora_value::get_property(&object, &key))
+            machine.get_property_value(&object, &key, object.clone(), strict)
         }
         ExpressionKind::Object(properties) => {
-            let object = ecmora_value::object();
+            let object = ecmora_value::object_with_prototype_in_realm(None, machine.current_realm);
             for entry in properties {
                 match entry {
                     ObjectEntry::Property(property) => {
@@ -1106,8 +1433,13 @@ fn evaluate_expression(
                         if matches!(source, Value::Null | Value::Undefined) {
                             continue;
                         }
-                        for key in ecmora_value::own_property_keys(&source) {
-                            let value = ecmora_value::get_property(&source, &key);
+                        for key in machine.own_property_keys_value(&source, strict)? {
+                            let value = machine.get_property_value(
+                                &source,
+                                &key,
+                                source.clone(),
+                                strict,
+                            )?;
                             ecmora_value::set_property(&object, key, value)?;
                         }
                     }
@@ -1206,7 +1538,9 @@ fn evaluate_expression(
                 ExpressionKind::Member { object, property } => {
                     let object = evaluate_expression(object, scopes, strict, machine)?;
                     let key = property_key(property, scopes, strict, machine)?;
-                    Ok(Value::Bool(ecmora_value::delete_property(&object, &key)))
+                    Ok(Value::Bool(
+                        machine.delete_property_value(&object, &key, strict)?,
+                    ))
                 }
                 ExpressionKind::Global(_) => Ok(Value::Bool(false)),
                 _ => {
@@ -1224,6 +1558,14 @@ fn evaluate_expression(
             operator,
             right,
         } => {
+            if *operator == BinaryOperator::In {
+                let key =
+                    ecmora_value::to_string(&evaluate_expression(left, scopes, strict, machine)?);
+                let object = evaluate_expression(right, scopes, strict, machine)?;
+                return Ok(Value::Bool(
+                    machine.has_property_value(&object, &key, strict)?,
+                ));
+            }
             if *operator == BinaryOperator::InstanceOf {
                 if let ExpressionKind::Global(name) = &right.kind {
                     if name == "Object" && find_binding(scopes, name).is_none() {
@@ -1304,6 +1646,16 @@ fn evaluate_expression(
                 .map(|argument| evaluate_expression(argument, scopes, strict, machine))
                 .collect::<Result<Vec<_>>>()?;
             if let ExpressionKind::Global(name) = &callee.kind {
+                if find_binding(scopes, name).is_none() && name == "Proxy" {
+                    let [target, handler] = arguments.as_slice() else {
+                        bail!("Proxy constructor cần target và handler")
+                    };
+                    return ecmora_value::proxy_object(
+                        target.clone(),
+                        handler.clone(),
+                        machine.current_realm,
+                    );
+                }
                 if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name) {
                     return machine.construct_promise_with_constructor(name, arguments, strict);
                 }
@@ -1361,13 +1713,19 @@ fn evaluate_expression(
                 RuntimeValue::PromiseConstructor(constructor) => {
                     bail!("Promise constructor `{constructor}` phải được gọi bằng `new`")
                 }
+                RuntimeValue::ProxyConstructor => {
+                    bail!("Proxy constructor phải được gọi bằng `new`")
+                }
                 RuntimeValue::ObjectCreate => {
                     let prototype = match arguments.first() {
                         Some(Value::Object(prototype)) => Some(prototype.clone()),
                         Some(Value::Null) => None,
                         _ => bail!("Object.create prototype phải là Object hoặc null"),
                     };
-                    Ok(ecmora_value::object_with_prototype(prototype))
+                    Ok(ecmora_value::object_with_prototype_in_realm(
+                        prototype,
+                        machine.current_realm,
+                    ))
                 }
                 RuntimeValue::ObjectSetPrototypeOf => {
                     let target = arguments.first().cloned().unwrap_or(Value::Undefined);
@@ -1462,6 +1820,7 @@ fn evaluate_runtime_expression(
                 "String" => RuntimeValue::StringConstructor,
                 "Boolean" => RuntimeValue::BooleanConstructor,
                 "Object" => RuntimeValue::ObjectConstructor,
+                "Proxy" => RuntimeValue::ProxyConstructor,
                 "Promise" => RuntimeValue::PromiseConstructor("Promise".to_owned()),
                 name if machine.is_promise_constructor(name) => {
                     RuntimeValue::PromiseConstructor(name.to_owned())
@@ -1551,22 +1910,7 @@ fn read_target(
         AssignmentTarget::Member { object, property } => {
             let object = evaluate_expression(object, scopes, strict, machine)?;
             let key = property_key(property, scopes, strict, machine)?;
-            if let Some(getter) =
-                ecmora_value::get_accessor(&object, &key).and_then(|descriptor| descriptor.getter)
-            {
-                return match machine.call_function_with_this(
-                    getter,
-                    object.clone(),
-                    Vec::new(),
-                    strict,
-                )? {
-                    CallOutcome::Value(value) => Ok(value),
-                    CallOutcome::Throw(value) => {
-                        bail!("getter threw {}", ecmora_value::to_string(&value))
-                    }
-                };
-            }
-            Ok(ecmora_value::get_property(&object, &key))
+            machine.get_property_value(&object, &key, object.clone(), strict)
         }
     }
 }
@@ -1583,22 +1927,7 @@ fn write_target(
         AssignmentTarget::Member { object, property } => {
             let object = evaluate_expression(object, scopes, strict, machine)?;
             let key = property_key(property, scopes, strict, machine)?;
-            if let Some(setter) =
-                ecmora_value::get_accessor(&object, &key).and_then(|descriptor| descriptor.setter)
-            {
-                return match machine.call_function_with_this(
-                    setter,
-                    object.clone(),
-                    vec![value],
-                    strict,
-                )? {
-                    CallOutcome::Value(value) => Ok(value),
-                    CallOutcome::Throw(value) => {
-                        bail!("setter threw {}", ecmora_value::to_string(&value))
-                    }
-                };
-            }
-            ecmora_value::set_property(&object, key, value)
+            machine.set_property_value(&object, key, value, object.clone(), strict)
         }
     }
 }

@@ -1,6 +1,9 @@
 use anyhow::Result;
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
+mod object_model;
+pub use object_model::*;
+
 #[derive(Debug, Clone)]
 pub enum Value {
     Undefined,
@@ -20,6 +23,8 @@ pub struct ObjectData {
     pub property_attributes: HashMap<String, PropertyAttributes>,
     pub accessors: HashMap<String, AccessorDescriptor>,
     pub prototype: Option<ObjectRef>,
+    pub extensible: bool,
+    pub internal_slots: InternalSlots,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,11 +56,17 @@ pub fn object() -> Value {
 }
 
 pub fn object_with_prototype(prototype: Option<ObjectRef>) -> Value {
+    object_with_prototype_in_realm(prototype, RealmId::ROOT)
+}
+
+pub fn object_with_prototype_in_realm(prototype: Option<ObjectRef>, realm: RealmId) -> Value {
     Value::Object(Rc::new(RefCell::new(ObjectData {
         properties: HashMap::new(),
         property_attributes: HashMap::new(),
         accessors: HashMap::new(),
         prototype,
+        extensible: true,
+        internal_slots: InternalSlots::ordinary(realm),
     })))
 }
 
@@ -133,6 +144,11 @@ pub fn set_property(value: &Value, key: String, property: Value) -> Result<Value
     match value {
         Value::Object(object) => {
             let mut object = object.borrow_mut();
+            let exists =
+                object.properties.contains_key(&key) || object.accessors.contains_key(&key);
+            if !exists && !object.extensible {
+                anyhow::bail!("object không extensible")
+            }
             if let Some(attributes) = object.property_attributes.get(&key) {
                 if !attributes.writable {
                     anyhow::bail!("property `{key}` không writable")
@@ -201,6 +217,10 @@ pub fn define_accessor_with_attributes(
         anyhow::bail!("accessor target phải là object")
     };
     let mut object = object.borrow_mut();
+    let exists = object.properties.contains_key(&key) || object.accessors.contains_key(&key);
+    if !exists && !object.extensible {
+        anyhow::bail!("object không extensible")
+    }
     if object
         .property_attributes
         .get(&key)

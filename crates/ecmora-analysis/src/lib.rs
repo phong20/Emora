@@ -13,14 +13,17 @@ use ecmora_value::{BinaryOperator as SemBinary, UnaryOperator as SemUnary, Value
 use std::collections::{HashMap, HashSet};
 
 mod async_normalize;
+pub mod effects;
 mod specialization;
 mod support;
 
 use async_normalize::normalize_async_function;
+use effects::validate_native_semantics;
 use specialization::*;
 use support::*;
 
 pub fn analyze(hir: &HirProgram) -> Result<Program> {
+    validate_native_semantics(hir)?;
     if !hir.promise_subclasses.is_empty() {
         bail!("Promise subclass/@@species requires compatibility constructor objects")
     }
