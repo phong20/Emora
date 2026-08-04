@@ -32,9 +32,9 @@ enum RuntimeValue {
     ObjectCreate,
     ObjectSetPrototypeOf,
     ObjectGetPrototypeOf,
-    PromiseConstructor,
-    PromiseResolve,
-    PromiseReject,
+    PromiseConstructor(String),
+    PromiseResolve(String),
+    PromiseReject(String),
     PromiseThen(u64),
     PromiseCatch(u64),
     PromiseFinally(u64),
@@ -87,6 +87,7 @@ struct PromiseObject {
     reactions: Vec<PromiseReaction>,
     handled: bool,
     reported_unhandled: bool,
+    constructor: String,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ struct Machine {
     promises: Vec<PromiseObject>,
     jobs: VecDeque<PromiseJob>,
     async_tasks: Vec<Option<AsyncTask>>,
+    promise_subclasses: HashMap<String, ecmora_hir::PromiseSubclass>,
 }
 
 fn binding(kind: VariableKind, initialized: bool, value: Value) -> BindingRef {
@@ -153,27 +155,56 @@ impl Machine {
     }
 
     fn new_promise(&mut self) -> u64 {
+        self.new_promise_with_constructor("Promise")
+    }
+
+    fn new_promise_with_constructor(&mut self, constructor: &str) -> u64 {
         let id = self.promises.len() as u64;
         self.promises.push(PromiseObject {
             state: PromiseState::Pending,
             reactions: Vec::new(),
             handled: false,
             reported_unhandled: false,
+            constructor: constructor.to_owned(),
         });
         id
     }
 
-    fn promise_resolve(&mut self, value: Value) -> Value {
-        if matches!(value, Value::Promise(_)) {
-            return value;
-        }
-        let id = self.new_promise();
-        self.settle(id, PromiseState::Fulfilled(value));
-        Value::Promise(id)
+    fn promise_species(&self, constructor: &str) -> String {
+        self.promise_subclasses
+            .get(constructor)
+            .and_then(|class| class.species.clone())
+            .unwrap_or_else(|| constructor.to_owned())
     }
 
-    fn promise_reject(&mut self, value: Value) -> Value {
-        let id = self.new_promise();
+    fn is_promise_constructor(&self, name: &str) -> bool {
+        name == "Promise" || self.promise_subclasses.contains_key(name)
+    }
+
+    fn promise_resolve(&mut self, value: Value) -> Result<Value> {
+        self.promise_resolve_with_constructor("Promise", value)
+    }
+
+    fn promise_resolve_with_constructor(
+        &mut self,
+        constructor: &str,
+        value: Value,
+    ) -> Result<Value> {
+        if let Value::Promise(id) = value {
+            if self.promises[id as usize].constructor == constructor {
+                return Ok(Value::Promise(id));
+            }
+            let target = self.new_promise_with_constructor(constructor);
+            self.resolve_into(target, Value::Promise(id))?;
+            return Ok(Value::Promise(target));
+        }
+        let id = self.new_promise_with_constructor(constructor);
+        self.resolve_into(id, value)?;
+        Ok(Value::Promise(id))
+    }
+
+    fn promise_reject_with_constructor(&mut self, constructor: &str, value: Value) -> Value {
+        let id = self.new_promise_with_constructor(constructor);
         self.settle(id, PromiseState::Rejected(value));
         Value::Promise(id)
     }
@@ -192,11 +223,16 @@ impl Machine {
         }
     }
 
-    fn construct_promise(&mut self, arguments: Vec<Value>, strict: bool) -> Result<Value> {
+    fn construct_promise_with_constructor(
+        &mut self,
+        constructor: &str,
+        arguments: Vec<Value>,
+        strict: bool,
+    ) -> Result<Value> {
         let Some(Value::Function(executor)) = arguments.first() else {
             bail!("Promise executor phải là function")
         };
-        let promise = self.new_promise();
+        let promise = self.new_promise_with_constructor(constructor);
         let resolve = self.register_native_function(FunctionKind::Resolve(promise));
         let reject = self.register_native_function(FunctionKind::Reject(promise));
         match self.call_function(
@@ -228,6 +264,16 @@ impl Machine {
         arguments: Vec<Value>,
         strict: bool,
     ) -> Result<CallOutcome> {
+        self.call_function_with_this(id, Value::Undefined, arguments, strict)
+    }
+
+    fn call_function_with_this(
+        &mut self,
+        id: u64,
+        this_value: Value,
+        arguments: Vec<Value>,
+        strict: bool,
+    ) -> Result<CallOutcome> {
         let function = self
             .functions
             .get(id as usize)
@@ -236,26 +282,7 @@ impl Machine {
         match function.kind {
             FunctionKind::Resolve(promise) => {
                 let value = arguments.first().cloned().unwrap_or(Value::Undefined);
-                if let Value::Promise(source) = value {
-                    if source == promise {
-                        self.settle(
-                            promise,
-                            PromiseState::Rejected(Value::String(
-                                "Chaining cycle detected for promise".to_owned(),
-                            )),
-                        );
-                    } else {
-                        let relay = PromiseReaction {
-                            fulfilled: None,
-                            rejected: None,
-                            next: promise,
-                            finally: false,
-                        };
-                        self.attach_reaction(source, relay);
-                    }
-                } else {
-                    self.settle(promise, PromiseState::Fulfilled(value));
-                }
+                self.resolve_into(promise, value)?;
                 Ok(CallOutcome::Value(Value::Undefined))
             }
             FunctionKind::Reject(promise) => {
@@ -284,6 +311,10 @@ impl Machine {
                 let is_async = definition.r#async;
                 let mut scopes = function.closure;
                 let mut call_scope = HashMap::new();
+                call_scope.insert(
+                    "@this".to_owned(),
+                    binding(VariableKind::Const, true, this_value),
+                );
                 for (index, parameter) in definition.parameters.iter().enumerate() {
                     call_scope.insert(
                         parameter.clone(),
@@ -334,7 +365,7 @@ impl Machine {
                 let source = match awaited {
                     Value::Promise(id) => id,
                     value => {
-                        let Value::Promise(id) = self.promise_resolve(value) else {
+                        let Value::Promise(id) = self.promise_resolve(value)? else {
                             unreachable!()
                         };
                         id
@@ -372,7 +403,7 @@ impl Machine {
             match execute_statement(&statements[index], &mut scopes, strict, self)? {
                 Completion::Normal => {}
                 Completion::Return(value) => {
-                    self.resolve_into(promise, value);
+                    self.resolve_into(promise, value)?;
                     return Ok(());
                 }
                 Completion::Throw(value) => {
@@ -403,7 +434,7 @@ impl Machine {
         match task.action {
             AsyncResumeAction::Discard => {}
             AsyncResumeAction::Return => {
-                self.resolve_into(task.promise, value);
+                self.resolve_into(task.promise, value)?;
                 return Ok(());
             }
             AsyncResumeAction::Initialize(name) => {
@@ -423,20 +454,71 @@ impl Machine {
         )
     }
 
-    fn resolve_into(&mut self, promise: u64, value: Value) {
-        if let Value::Promise(source) = value {
-            self.attach_reaction(
-                source,
-                PromiseReaction {
-                    fulfilled: None,
-                    rejected: None,
-                    next: promise,
-                    finally: false,
-                },
-            );
-        } else {
-            self.settle(promise, PromiseState::Fulfilled(value));
+    fn resolve_into(&mut self, promise: u64, value: Value) -> Result<()> {
+        if !matches!(self.promises[promise as usize].state, PromiseState::Pending) {
+            return Ok(());
         }
+
+        if let Value::Promise(source) = value {
+            if source == promise {
+                self.settle(
+                    promise,
+                    PromiseState::Rejected(Value::String(
+                        "Chaining cycle detected for promise".to_owned(),
+                    )),
+                );
+            } else {
+                self.attach_reaction(
+                    source,
+                    PromiseReaction {
+                        fulfilled: None,
+                        rejected: None,
+                        next: promise,
+                        finally: false,
+                    },
+                );
+            }
+            return Ok(());
+        }
+
+        let then = match &value {
+            Value::Object(_) | Value::Array(_) => {
+                if let Some(getter) = ecmora_value::get_accessor(&value, "then")
+                    .and_then(|descriptor| descriptor.getter)
+                {
+                    match self.call_function_with_this(getter, value.clone(), Vec::new(), true)? {
+                        CallOutcome::Value(value) => value,
+                        CallOutcome::Throw(reason) => {
+                            self.settle(promise, PromiseState::Rejected(reason));
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    ecmora_value::get_property(&value, "then")
+                }
+            }
+            _ => Value::Undefined,
+        };
+        let Value::Function(then) = then else {
+            self.settle(promise, PromiseState::Fulfilled(value));
+            return Ok(());
+        };
+
+        let resolve = self.register_native_function(FunctionKind::Resolve(promise));
+        let reject = self.register_native_function(FunctionKind::Reject(promise));
+        match self.call_function_with_this(
+            then,
+            value,
+            vec![Value::Function(resolve), Value::Function(reject)],
+            true,
+        )? {
+            CallOutcome::Value(_) => {}
+            CallOutcome::Throw(reason) => {
+                // First-settlement-wins is enforced by settle/resolve_into.
+                self.settle(promise, PromiseState::Rejected(reason));
+            }
+        }
+        Ok(())
     }
 
     fn promise_then(
@@ -449,7 +531,9 @@ impl Machine {
         if source as usize >= self.promises.len() {
             bail!("promise handle không hợp lệ")
         }
-        let next = self.new_promise();
+        let constructor = self.promises[source as usize].constructor.clone();
+        let species = self.promise_species(&constructor);
+        let next = self.new_promise_with_constructor(&species);
         self.attach_reaction(
             source,
             PromiseReaction {
@@ -568,7 +652,7 @@ impl Machine {
         let promise = match value {
             Value::Promise(id) => id,
             value => {
-                let Value::Promise(id) = self.promise_resolve(value) else {
+                let Value::Promise(id) = self.promise_resolve(value)? else {
                     unreachable!()
                 };
                 id
@@ -617,6 +701,12 @@ fn direct_await(statement: &Statement) -> Option<(Expression, AsyncResumeAction)
 
 pub fn execute(program: &Program) -> Result<()> {
     let mut machine = Machine::default();
+    machine.promise_subclasses = program
+        .promise_subclasses
+        .iter()
+        .cloned()
+        .map(|class| (class.name.clone(), class))
+        .collect();
     let mut scopes = vec![HashMap::new()];
     match execute_scope(
         &program.statements,
@@ -964,6 +1054,7 @@ fn evaluate_expression(
         ExpressionKind::Number(value) => Ok(Value::Number(*value)),
         ExpressionKind::Bool(value) => Ok(Value::Bool(*value)),
         ExpressionKind::Null => Ok(Value::Null),
+        ExpressionKind::This => lookup(scopes, "@this"),
         ExpressionKind::Global(name) => match name.as_str() {
             "undefined" => Ok(Value::Undefined),
             "NaN" => Ok(Value::Number(f64::NAN)),
@@ -976,7 +1067,17 @@ fn evaluate_expression(
             if let Some(getter) =
                 ecmora_value::get_accessor(&object, &key).and_then(|descriptor| descriptor.getter)
             {
-                return machine.call_as_expression(getter, Vec::new(), strict);
+                return match machine.call_function_with_this(
+                    getter,
+                    object.clone(),
+                    Vec::new(),
+                    strict,
+                )? {
+                    CallOutcome::Value(value) => Ok(value),
+                    CallOutcome::Throw(value) => {
+                        bail!("getter threw {}", ecmora_value::to_string(&value))
+                    }
+                };
             }
             Ok(ecmora_value::get_property(&object, &key))
         }
@@ -1131,6 +1232,30 @@ fn evaluate_expression(
                             Value::Object(_) | Value::Array(_)
                         )));
                     }
+                    if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name)
+                    {
+                        let value = evaluate_expression(left, scopes, strict, machine)?;
+                        return Ok(Value::Bool(match value {
+                            Value::Promise(id) => {
+                                let mut constructor =
+                                    machine.promises[id as usize].constructor.as_str();
+                                loop {
+                                    if constructor == name {
+                                        break true;
+                                    }
+                                    let Some(parent) = machine
+                                        .promise_subclasses
+                                        .get(constructor)
+                                        .map(|class| class.parent.as_str())
+                                    else {
+                                        break false;
+                                    };
+                                    constructor = parent;
+                                }
+                            }
+                            _ => false,
+                        }));
+                    }
                 }
             }
             Ok(ecmora_value::binary(
@@ -1178,9 +1303,10 @@ fn evaluate_expression(
                 .iter()
                 .map(|argument| evaluate_expression(argument, scopes, strict, machine))
                 .collect::<Result<Vec<_>>>()?;
-            if matches!(&callee.kind, ExpressionKind::Global(name) if name == "Promise" && find_binding(scopes, name).is_none())
-            {
-                return machine.construct_promise(arguments, strict);
+            if let ExpressionKind::Global(name) = &callee.kind {
+                if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name) {
+                    return machine.construct_promise_with_constructor(name, arguments, strict);
+                }
             }
             bail!("constructor này chưa được hỗ trợ")
         }
@@ -1232,6 +1358,9 @@ fn evaluate_expression(
                     ))
                 }
                 RuntimeValue::Function(id) => machine.call_as_expression(id, arguments, strict),
+                RuntimeValue::PromiseConstructor(constructor) => {
+                    bail!("Promise constructor `{constructor}` phải được gọi bằng `new`")
+                }
                 RuntimeValue::ObjectCreate => {
                     let prototype = match arguments.first() {
                         Some(Value::Object(prototype)) => Some(prototype.clone()),
@@ -1256,14 +1385,16 @@ fn evaluate_expression(
                         .map(Value::Object)
                         .unwrap_or(Value::Null))
                 }
-                RuntimeValue::PromiseResolve => {
-                    Ok(machine
-                        .promise_resolve(arguments.first().cloned().unwrap_or(Value::Undefined)))
-                }
-                RuntimeValue::PromiseReject => {
-                    Ok(machine
-                        .promise_reject(arguments.first().cloned().unwrap_or(Value::Undefined)))
-                }
+                RuntimeValue::PromiseResolve(constructor) => machine
+                    .promise_resolve_with_constructor(
+                        &constructor,
+                        arguments.first().cloned().unwrap_or(Value::Undefined),
+                    ),
+                RuntimeValue::PromiseReject(constructor) => Ok(machine
+                    .promise_reject_with_constructor(
+                        &constructor,
+                        arguments.first().cloned().unwrap_or(Value::Undefined),
+                    )),
                 RuntimeValue::PromiseThen(id) => machine.promise_then(
                     id,
                     argument_function(&arguments, 0),
@@ -1331,7 +1462,10 @@ fn evaluate_runtime_expression(
                 "String" => RuntimeValue::StringConstructor,
                 "Boolean" => RuntimeValue::BooleanConstructor,
                 "Object" => RuntimeValue::ObjectConstructor,
-                "Promise" => RuntimeValue::PromiseConstructor,
+                "Promise" => RuntimeValue::PromiseConstructor("Promise".to_owned()),
+                name if machine.is_promise_constructor(name) => {
+                    RuntimeValue::PromiseConstructor(name.to_owned())
+                }
                 _ => RuntimeValue::Js,
             });
         }
@@ -1345,10 +1479,10 @@ fn evaluate_runtime_expression(
             if name == "console" && property == "log" && find_binding(scopes, name).is_none() {
                 return Ok(RuntimeValue::ConsoleLog);
             }
-            if name == "Promise" && find_binding(scopes, name).is_none() {
+            if find_binding(scopes, name).is_none() && machine.is_promise_constructor(name) {
                 return Ok(match property.as_str() {
-                    "resolve" => RuntimeValue::PromiseResolve,
-                    "reject" => RuntimeValue::PromiseReject,
+                    "resolve" => RuntimeValue::PromiseResolve(name.clone()),
+                    "reject" => RuntimeValue::PromiseReject(name.clone()),
                     _ => RuntimeValue::Js,
                 });
             }
@@ -1420,7 +1554,17 @@ fn read_target(
             if let Some(getter) =
                 ecmora_value::get_accessor(&object, &key).and_then(|descriptor| descriptor.getter)
             {
-                return machine.call_as_expression(getter, Vec::new(), strict);
+                return match machine.call_function_with_this(
+                    getter,
+                    object.clone(),
+                    Vec::new(),
+                    strict,
+                )? {
+                    CallOutcome::Value(value) => Ok(value),
+                    CallOutcome::Throw(value) => {
+                        bail!("getter threw {}", ecmora_value::to_string(&value))
+                    }
+                };
             }
             Ok(ecmora_value::get_property(&object, &key))
         }
@@ -1442,7 +1586,17 @@ fn write_target(
             if let Some(setter) =
                 ecmora_value::get_accessor(&object, &key).and_then(|descriptor| descriptor.setter)
             {
-                return machine.call_as_expression(setter, vec![value], strict);
+                return match machine.call_function_with_this(
+                    setter,
+                    object.clone(),
+                    vec![value],
+                    strict,
+                )? {
+                    CallOutcome::Value(value) => Ok(value),
+                    CallOutcome::Throw(value) => {
+                        bail!("setter threw {}", ecmora_value::to_string(&value))
+                    }
+                };
             }
             ecmora_value::set_property(&object, key, value)
         }

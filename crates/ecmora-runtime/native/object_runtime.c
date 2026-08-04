@@ -44,7 +44,12 @@ typedef struct {
     uint64_t payload;
 } EcmoraValue;
 
-typedef void (*EcmoraCode)(void *closure, uint32_t argc, EcmoraValue *argv, EcmoraValue *out);
+typedef uint8_t (*EcmoraCode)(
+    void *closure,
+    uint32_t argc,
+    EcmoraValue *argv,
+    EcmoraValue *out
+);
 
 typedef struct {
     EcmoraCode code;
@@ -108,13 +113,18 @@ void ecmora_closure_capture(void *pointer, uint32_t index, EcmoraValue *out) {
     if (out != NULL) *out = closure->captures[index];
 }
 
-void ecmora_closure_call(void *pointer, uint32_t argc, EcmoraValue *argv, EcmoraValue *out) {
+uint8_t ecmora_closure_call(
+    void *pointer,
+    uint32_t argc,
+    EcmoraValue *argv,
+    EcmoraValue *out
+) {
     EcmoraClosure *closure = (EcmoraClosure *)pointer;
     if (closure == NULL || closure->code == NULL) {
         if (out != NULL) *out = (EcmoraValue){ ECMORA_UNDEFINED, 0 };
-        return;
+        return 0;
     }
-    closure->code(closure, argc, argv, out);
+    return closure->code(closure, argc, argv, out);
 }
 
 void *ecmora_cell_new(const EcmoraValue *initial) {
@@ -254,9 +264,9 @@ static void ecmora_resolve_promise(EcmoraPromise *promise, EcmoraValue resolutio
     }
 
     /*
-     * Arbitrary object thenables require observable property lookup and a
-     * throwable Call completion. They intentionally stay outside this fallback
-     * until the JS completion ABI exists.
+     * Dynamically shaped object thenables are rejected by native analysis and
+     * compiled through the compatibility runtime. Reaching this C fallback
+     * therefore means the value is proven non-thenable or primitive.
      */
     ecmora_fulfill_promise(promise, resolution);
 }
@@ -350,13 +360,13 @@ void ecmora_microtask_drain(void) {
             } else {
                 EcmoraValue output = ecmora_undefined_value();
                 EcmoraValue argument = job->argument;
-                ecmora_closure_call(job->handler, 1, &argument, &output);
-                /*
-                 * Native Promise output is assimilated. A callback throw still
-                 * needs the future completion-status ABI; analysis refuses
-                 * those callbacks rather than reaching this path incorrectly.
-                 */
-                ecmora_resolve_promise(job->next, output);
+                uint8_t completion =
+                    ecmora_closure_call(job->handler, 1, &argument, &output);
+                if (completion == 1) {
+                    ecmora_reject_promise(job->next, output);
+                } else {
+                    ecmora_resolve_promise(job->next, output);
+                }
             }
         }
         free(job);
@@ -444,6 +454,59 @@ void ecmora_object_set_prototype(void *pointer, void *prototype) {
 
 void *ecmora_object_get_prototype(void *pointer) {
     return pointer == NULL ? NULL : ((EcmoraObject *)pointer)->prototype;
+}
+
+
+bool ecmora_object_get_value(
+    void *pointer,
+    const char *key,
+    EcmoraValue *out
+) {
+    EcmoraProperty *property = find_property((EcmoraObject *)pointer, key);
+    if (out == NULL) return property != NULL;
+    if (property == NULL) {
+        *out = (EcmoraValue){ ECMORA_UNDEFINED, 0 };
+        return false;
+    }
+    out->tag = (uint8_t)property->tag;
+    switch (property->tag) {
+        case ECMORA_NUMBER:
+            memcpy(&out->payload, &property->payload.number, sizeof(double));
+            break;
+        case ECMORA_BOOL:
+            out->payload = property->payload.boolean ? 1 : 0;
+            break;
+        case ECMORA_UNDEFINED:
+        case ECMORA_NULL:
+            out->payload = 0;
+            break;
+        default:
+            out->payload = (uint64_t)(uintptr_t)property->payload.pointer;
+            break;
+    }
+    return true;
+}
+
+void ecmora_object_set_value(
+    void *pointer,
+    const char *key,
+    const EcmoraValue *value
+) {
+    if (pointer == NULL || value == NULL) return;
+    EcmoraProperty *property = get_or_insert((EcmoraObject *)pointer, key);
+    if (!property->writable) return;
+    property->tag = (EcmoraTag)value->tag;
+    switch ((EcmoraTag)value->tag) {
+        case ECMORA_NUMBER:
+            memcpy(&property->payload.number, &value->payload, sizeof(double));
+            break;
+        case ECMORA_BOOL:
+            property->payload.boolean = value->payload != 0;
+            break;
+        default:
+            property->payload.pointer = (void *)(uintptr_t)value->payload;
+            break;
+    }
 }
 
 double ecmora_object_get_number(void *pointer, const char *key) {

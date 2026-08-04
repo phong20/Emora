@@ -328,7 +328,8 @@ impl FreeVariableCollector {
             ExpressionKind::String(_)
             | ExpressionKind::Number(_)
             | ExpressionKind::Bool(_)
-            | ExpressionKind::Null => {}
+            | ExpressionKind::Null
+            | ExpressionKind::This => {}
         }
     }
 
@@ -642,7 +643,6 @@ fn statement_always_terminates(statement: &Statement) -> bool {
         | StatementKind::If {
             alternate: None, ..
         }
-        | StatementKind::While { .. }
         | StatementKind::For { .. }
         | StatementKind::ForIn { .. }
         | StatementKind::ForOf { .. }
@@ -658,6 +658,21 @@ fn expression_is_literal_true(expression: &Expression) -> bool {
 
 /// Detect a throw owned by this function body. Nested functions are skipped:
 /// they have an independent completion boundary and are analyzed separately.
+pub(super) fn unconditional_function_throw(function: &HirFunction) -> Option<&Expression> {
+    for statement in &function.body {
+        match &statement.kind {
+            StatementKind::Throw(reason) => return Some(reason),
+            StatementKind::FunctionDeclaration(_)
+            | StatementKind::VariableDeclaration { .. }
+            | StatementKind::Expression(_) => {}
+            // A branch/loop/switch means the throw is not statically
+            // unconditional at this abstraction level.
+            _ => return None,
+        }
+    }
+    None
+}
+
 pub(super) fn function_contains_direct_throw(function: &HirFunction) -> bool {
     function.body.iter().any(statement_contains_direct_throw)
 }
@@ -705,6 +720,9 @@ pub(super) fn infer_expression_type_hint(
         ExpressionKind::Number(_) => Some(ValueType::Number),
         ExpressionKind::Bool(_) => Some(ValueType::Bool),
         ExpressionKind::Null => Some(ValueType::Null),
+        // `this` depends on the call receiver and therefore has no stable
+        // call-site type until receiver specialization is available.
+        ExpressionKind::This => None,
 
         ExpressionKind::Global(name) => {
             if recursive_name == Some(name.as_str()) {
@@ -1080,7 +1098,8 @@ pub(super) fn collect_used_names(statements: &[Statement]) -> HashSet<String> {
             ExpressionKind::String(_)
             | ExpressionKind::Number(_)
             | ExpressionKind::Bool(_)
-            | ExpressionKind::Null => {}
+            | ExpressionKind::Null
+            | ExpressionKind::This => {}
         }
     }
 
@@ -1236,6 +1255,7 @@ pub(super) fn is_pure_expression_known(
         | ExpressionKind::Number(_)
         | ExpressionKind::Bool(_)
         | ExpressionKind::Null
+        | ExpressionKind::This
         | ExpressionKind::Function(_) => true,
         ExpressionKind::Array(elements) => elements.iter().all(|element| match element {
             ArrayElement::Expression(value) => is_pure_expression_known(value, known_functions),

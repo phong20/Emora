@@ -219,7 +219,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
     );
     let closure_call = module.add_function(
         "ecmora_closure_call",
-        context.void_type().fn_type(
+        i8_type.fn_type(
             &[
                 ptr_type.into(),
                 i32_type.into(),
@@ -278,7 +278,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         context.void_type().fn_type(&[], false),
         None,
     );
-    let js_function_type = context.void_type().fn_type(
+    let js_function_type = i8_type.fn_type(
         &[
             ptr_type.into(),
             i32_type.into(),
@@ -316,6 +316,11 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
             .collect::<Vec<_>>();
         let mut values = HashMap::<ValueId, BasicValueEnum<'ctx>>::new();
         let mut phis = HashMap::<ValueId, PhiValue<'ctx>>::new();
+        let mut llvm_block_exits = llvm_blocks.clone();
+        // Capture this before instruction-pattern bindings such as
+        // `Instruction::CallDirect { function, .. }` shadow the outer IR
+        // function with a String callee name.
+        let is_process_entry = function.return_type.is_none();
 
         for (index, block) in function.blocks.iter().enumerate() {
             builder.position_at_end(llvm_blocks[index]);
@@ -1204,7 +1209,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         )?;
                         let dynamic_ptr =
                             builder.build_alloca(dynamic_type, "call.direct.result")?;
-                        builder.build_call(
+                        let call = builder.build_call(
                             target,
                             &[
                                 ptr_type.const_null().into(),
@@ -1214,9 +1219,28 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             ],
                             "call.direct",
                         )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("direct call không trả completion status")?
+                            .into_int_value();
                         let dynamic = builder
                             .build_load(dynamic_type, dynamic_ptr, "call.direct.load")?
                             .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("direct.{}.{}", index, result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
                         values.insert(
                             *result,
                             from_dynamic(
@@ -1253,7 +1277,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         )?;
                         let dynamic_ptr =
                             builder.build_alloca(dynamic_type, "call.indirect.result")?;
-                        builder.build_call(
+                        let call = builder.build_call(
                             closure_call,
                             &[
                                 closure.into(),
@@ -1263,9 +1287,28 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             ],
                             "call.indirect",
                         )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("indirect call không trả completion status")?
+                            .into_int_value();
                         let dynamic = builder
                             .build_load(dynamic_type, dynamic_ptr, "call.indirect.load")?
                             .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("indirect.{}.{}", index, result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
                         values.insert(
                             *result,
                             from_dynamic(
@@ -1479,7 +1522,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         .context("JavaScript function thiếu return out pointer")?
                         .into_pointer_value();
                     builder.build_store(out, dynamic)?;
-                    builder.build_return(None)?;
+                    builder.build_return(Some(&i8_type.const_zero()))?;
                 }
                 Terminator::ThrowValue { value, value_type } => {
                     let value = values
@@ -1500,15 +1543,22 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                     let payload = builder
                         .build_extract_value(dynamic, 1, "throw.payload")?
                         .into_int_value();
-                    // Direct LLVM lowering of an uncaught ECMAScript abrupt
-                    // completion. The runtime boundary is noreturn in practice;
-                    // LLVM receives an explicit unreachable terminator.
-                    builder.build_call(
-                        throw_uncaught,
-                        &[tag.into(), payload.into()],
-                        "throw.uncaught",
-                    )?;
-                    builder.build_unreachable()?;
+                    if is_process_entry {
+                        builder.build_call(
+                            throw_uncaught,
+                            &[tag.into(), payload.into()],
+                            "throw.uncaught",
+                        )?;
+                        builder.build_unreachable()?;
+                    } else {
+                        let out = main
+                            .get_nth_param(3)
+                            .context("JavaScript function thiếu throw out pointer")?
+                            .into_pointer_value();
+                        builder.build_store(out, dynamic)?;
+                        builder.build_call(recursion_leave, &[], "recursion.leave.throw")?;
+                        builder.build_return(Some(&i8_type.const_int(1, false)))?;
+                    }
                 }
                 Terminator::TailCallDirect {
                     function,
@@ -1564,7 +1614,11 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         "tail.call.direct",
                     )?;
                     tail_call.set_tail_call(true);
-                    builder.build_return(None)?;
+                    let status = tail_call
+                        .try_as_basic_value()
+                        .basic()
+                        .context("tail call không trả completion status")?;
+                    builder.build_return(Some(&status))?;
                 }
                 Terminator::Unreachable => {
                     builder.build_unreachable()?;
@@ -1601,7 +1655,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                     } else {
                         value
                     };
-                    incoming_values.push((value, llvm_blocks[block_id.0 as usize]));
+                    incoming_values.push((value, llvm_block_exits[block_id.0 as usize]));
                 }
                 let refs = incoming_values
                     .iter()
@@ -1615,6 +1669,62 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         .verify()
         .map_err(|error| anyhow!("LLVM module không hợp lệ: {error}"))?;
     Ok(module)
+}
+
+fn propagate_call_completion<'ctx>(
+    context: &'ctx LlvmContext,
+    builder: &inkwell::builder::Builder<'ctx>,
+    function: inkwell::values::FunctionValue<'ctx>,
+    function_is_entry: bool,
+    status: IntValue<'ctx>,
+    dynamic: StructValue<'ctx>,
+    dynamic_type: inkwell::types::StructType<'ctx>,
+    i8_type: inkwell::types::IntType<'ctx>,
+    throw_uncaught: inkwell::values::FunctionValue<'ctx>,
+    recursion_leave: inkwell::values::FunctionValue<'ctx>,
+    suffix: &str,
+) -> Result<inkwell::basic_block::BasicBlock<'ctx>> {
+    let thrown = builder.build_int_compare(
+        IntPredicate::NE,
+        status,
+        i8_type.const_zero(),
+        &format!("call.thrown.{suffix}"),
+    )?;
+    let throw_block = context.append_basic_block(function, &format!("call.throw.{suffix}"));
+    let continue_block = context.append_basic_block(function, &format!("call.continue.{suffix}"));
+    builder.build_conditional_branch(thrown, throw_block, continue_block)?;
+
+    builder.position_at_end(throw_block);
+    if function_is_entry {
+        let tag = builder
+            .build_extract_value(dynamic, 0, &format!("call.throw.tag.{suffix}"))?
+            .into_int_value();
+        let payload = builder
+            .build_extract_value(dynamic, 1, &format!("call.throw.payload.{suffix}"))?
+            .into_int_value();
+        builder.build_call(
+            throw_uncaught,
+            &[tag.into(), payload.into()],
+            &format!("call.throw.uncaught.{suffix}"),
+        )?;
+        builder.build_unreachable()?;
+    } else {
+        let out = function
+            .get_nth_param(3)
+            .context("JavaScript function thiếu completion out pointer")?
+            .into_pointer_value();
+        builder.build_store(out, dynamic)?;
+        builder.build_call(
+            recursion_leave,
+            &[],
+            &format!("recursion.leave.throw.{suffix}"),
+        )?;
+        builder.build_return(Some(&i8_type.const_int(1, false)))?;
+    }
+
+    builder.position_at_end(continue_block);
+    let _ = dynamic_type;
+    Ok(continue_block)
 }
 
 fn build_ecmascript_exponentiation<'ctx>(

@@ -25,6 +25,7 @@ pub(super) fn load_program(entry: &Path) -> Result<Program> {
         imports: Vec::new(),
         exports: Vec::new(),
         export_all: Vec::new(),
+        promise_subclasses: Vec::new(),
     })
 }
 
@@ -519,7 +520,8 @@ fn rename_expression(
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)
         | ExpressionKind::Bool(_)
-        | ExpressionKind::Null => {}
+        | ExpressionKind::Null
+        | ExpressionKind::This => {}
     }
 }
 

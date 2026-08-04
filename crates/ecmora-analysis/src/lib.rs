@@ -12,13 +12,18 @@ use ecmora_ir::{
 use ecmora_value::{BinaryOperator as SemBinary, UnaryOperator as SemUnary, Value};
 use std::collections::{HashMap, HashSet};
 
+mod async_normalize;
 mod specialization;
 mod support;
 
+use async_normalize::normalize_async_function;
 use specialization::*;
 use support::*;
 
 pub fn analyze(hir: &HirProgram) -> Result<Program> {
+    if !hir.promise_subclasses.is_empty() {
+        bail!("Promise subclass/@@species requires compatibility constructor objects")
+    }
     let mut lowerer = Lowerer {
         blocks: vec![PendingBlock {
             name: "entry".to_owned(),
@@ -114,6 +119,12 @@ struct PromiseSettlement {
     value: (ValueId, ValueType, Option<Value>),
 }
 
+#[derive(Debug, Clone)]
+enum PromiseHandlerOutcome {
+    Return((ValueId, ValueType, Option<Value>)),
+    Throw((ValueId, ValueType, Option<Value>)),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromiseChainKind {
     Then,
@@ -165,6 +176,7 @@ struct Lowerer {
     promise_chains: HashMap<ValueId, PromiseChain>,
     promise_order: Vec<ValueId>,
     promise_resolution_stack: HashSet<ValueId>,
+    thenable_resolution_stack: HashSet<ValueId>,
     last_callable: Option<ValueId>,
     used_bindings: Vec<HashSet<String>>,
 }
@@ -1228,6 +1240,9 @@ impl Lowerer {
             ExpressionKind::Number(value) => Ok(self.emit_value(Value::Number(*value))),
             ExpressionKind::Bool(value) => Ok(self.emit_value(Value::Bool(*value))),
             ExpressionKind::Null => Ok(self.emit_value(Value::Null)),
+            ExpressionKind::This => bail!(
+                "`this` requires runtime receiver ABI; route this function to compatibility backend"
+            ),
             ExpressionKind::Global(name) => self.lookup(name),
             ExpressionKind::Member { object, property } => self.lower_object_get(object, property),
             ExpressionKind::Object(properties) => {
@@ -1238,24 +1253,33 @@ impl Lowerer {
                     match entry {
                         ObjectEntry::Property(property) => {
                             let key = self.lower_property_key(&property.key)?;
-                            if let ExpressionKind::Global(name) = &property.value.kind {
-                                let callable = if let Some(closure) =
-                                    self.closure_callables.get(name).cloned()
-                                {
-                                    Some(closure)
-                                } else if let Some(function) = self.function_defs.get(name).cloned()
-                                {
-                                    let captures = self.capture_environment_for(&function);
-
-                                    Some(ClosureBinding { function, captures })
-                                } else {
-                                    None
-                                };
-                                if let Some(callable) = callable {
-                                    self.static_object_callables
-                                        .insert((object_id, key), callable);
-                                    continue;
+                            let callable = match &property.value.kind {
+                                ExpressionKind::Function(function) => {
+                                    let captures = self.capture_environment_for(function);
+                                    Some(ClosureBinding {
+                                        function: function.clone(),
+                                        captures,
+                                    })
                                 }
+                                ExpressionKind::Global(name) => {
+                                    if let Some(closure) = self.closure_callables.get(name).cloned()
+                                    {
+                                        Some(closure)
+                                    } else if let Some(function) =
+                                        self.function_defs.get(name).cloned()
+                                    {
+                                        let captures = self.capture_environment_for(&function);
+                                        Some(ClosureBinding { function, captures })
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some(callable) = callable {
+                                self.static_object_callables
+                                    .insert((object_id, key), callable);
+                                continue;
                             }
                             let value = self.lower_expression(&property.value)?;
                             self.emit(Instruction::ObjectSet {
@@ -2585,6 +2609,8 @@ impl Lowerer {
         arguments: &[Expression],
         captures: Option<&[CapturedBinding]>,
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        let normalized_function = normalize_async_function(function)?;
+        let function = &normalized_function;
         if let Some(error) = &function.lowering_error {
             bail!("async function `{name}` reachable nhưng frontend không hạ được: {error}")
         }
@@ -3234,6 +3260,71 @@ impl Lowerer {
 
         captures
     }
+    fn resolve_static_thenable(
+        &mut self,
+        object: ValueId,
+        then: &ClosureBinding,
+    ) -> Result<Option<PromiseSettlement>> {
+        if !self.thenable_resolution_stack.insert(object) {
+            bail!("cyclic static thenable resolution tại %v{}", object.0)
+        }
+        let result = (|| {
+            let resolve_name = then.function.parameters.first().cloned();
+            let reject_name = then.function.parameters.get(1).cloned();
+
+            for statement in &then.function.body {
+                if let StatementKind::Throw(reason) = &statement.kind {
+                    return Ok(Some(PromiseSettlement {
+                        state: PromiseState::Rejected,
+                        value: self.lower_expression(reason)?,
+                    }));
+                }
+
+                let expression = match &statement.kind {
+                    StatementKind::Expression(expression)
+                    | StatementKind::Return(Some(expression)) => expression,
+                    StatementKind::Return(None) => return Ok(None),
+                    StatementKind::FunctionDeclaration(_)
+                    | StatementKind::VariableDeclaration { .. } => continue,
+                    _ => {
+                        bail!(
+                            "dynamic control flow trong thenable `then` dùng compatibility backend"
+                        )
+                    }
+                };
+                let ExpressionKind::Call { callee, arguments } = &expression.kind else {
+                    self.lower_expression(expression)?;
+                    continue;
+                };
+                let ExpressionKind::Global(name) = &callee.kind else {
+                    bail!("dynamic thenable callee dùng compatibility backend")
+                };
+                let state = if resolve_name.as_deref() == Some(name.as_str()) {
+                    Some(PromiseState::Fulfilled)
+                } else if reject_name.as_deref() == Some(name.as_str()) {
+                    Some(PromiseState::Rejected)
+                } else {
+                    None
+                };
+                let Some(state) = state else {
+                    self.lower_expression(expression)?;
+                    continue;
+                };
+                let value = match arguments.first() {
+                    Some(argument) => self.lower_expression(argument)?,
+                    None => self.emit_value(Value::Undefined),
+                };
+                for extra in arguments.iter().skip(1) {
+                    self.lower_expression(extra)?;
+                }
+                return Ok(Some(PromiseSettlement { state, value }));
+            }
+            Ok(None)
+        })();
+        self.thenable_resolution_stack.remove(&object);
+        result
+    }
+
     fn create_pending_promise(&mut self) -> (ValueId, ValueType, Option<Value>) {
         let result = self.new_value();
         self.emit(Instruction::PromisePending { result });
@@ -3246,6 +3337,30 @@ impl Lowerer {
         state: PromiseState,
         value: (ValueId, ValueType, Option<Value>),
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        if state == PromiseState::Fulfilled && value.1 == ValueType::Object {
+            if self
+                .static_accessors
+                .contains_key(&(value.0, "then".to_owned()))
+            {
+                bail!("observable then accessor requires compatibility Promise resolution")
+            }
+            if let Some(then) = self
+                .static_object_callables
+                .get(&(value.0, "then".to_owned()))
+                .cloned()
+            {
+                return match self.resolve_static_thenable(value.0, &then)? {
+                    Some(settlement) => {
+                        self.create_settled_promise(settlement.state, settlement.value)
+                    }
+                    None => Ok(self.create_pending_promise()),
+                };
+            }
+            if value.2.is_none() {
+                bail!("unknown Object may be a thenable; use compatibility Promise resolution")
+            }
+        }
+
         /*
          * Resolving a distinct promise with a native promise adopts it. Keep a
          * distinct capability token; Promise.resolve(x) performs its identity
@@ -3361,12 +3476,17 @@ impl Lowerer {
         label: &str,
         handler: &ClosureBinding,
         argument: Option<&(ValueId, ValueType, Option<Value>)>,
-    ) -> Result<(ValueId, ValueType, Option<Value>)> {
-        if !handler.function.r#async && function_contains_direct_throw(&handler.function) {
-            bail!(
-                "throw trong Promise handler `{label}` cần non-fatal completion ABI; \
-                 compiler từ chối thay vì biến throw thành return hoặc abort sai"
-            )
+    ) -> Result<PromiseHandlerOutcome> {
+        if !handler.function.r#async {
+            if let Some(reason) = unconditional_function_throw(&handler.function) {
+                let reason = self.lower_expression(reason)?;
+                return Ok(PromiseHandlerOutcome::Throw(reason));
+            }
+            if function_contains_direct_throw(&handler.function) {
+                bail!(
+                    "conditional throw trong Promise handler `{label}` dùng completion-aware                      compatibility backend"
+                )
+            }
         }
 
         let temporary = argument.map(|argument| {
@@ -3413,7 +3533,7 @@ impl Lowerer {
         if let Some(temporary) = temporary {
             self.scopes.last_mut().unwrap().remove(&temporary);
         }
-        Ok(value)
+        Ok(PromiseHandlerOutcome::Return(value))
     }
 
     fn settlement_from_handler_value(
@@ -3440,7 +3560,15 @@ impl Lowerer {
                 return Ok(parent);
             };
             let callback = self.invoke_promise_handler("promise.finally", handler, None)?;
-            let callback = self.settlement_from_handler_value(callback)?;
+            let callback = match callback {
+                PromiseHandlerOutcome::Return(value) => {
+                    self.settlement_from_handler_value(value)?
+                }
+                PromiseHandlerOutcome::Throw(reason) => PromiseSettlement {
+                    state: PromiseState::Rejected,
+                    value: reason,
+                },
+            };
             return if callback.state == PromiseState::Rejected {
                 Ok(callback)
             } else {
@@ -3465,7 +3593,13 @@ impl Lowerer {
             handler,
             Some(&parent.value),
         )?;
-        self.settlement_from_handler_value(callback)
+        match callback {
+            PromiseHandlerOutcome::Return(value) => self.settlement_from_handler_value(value),
+            PromiseHandlerOutcome::Throw(reason) => Ok(PromiseSettlement {
+                state: PromiseState::Rejected,
+                value: reason,
+            }),
+        }
     }
 
     fn drain_promise_jobs(&mut self) -> Result<()> {
@@ -3701,6 +3835,7 @@ mod throw_lowering_tests {
             imports: Vec::new(),
             exports: Vec::new(),
             export_all: Vec::new(),
+            promise_subclasses: Vec::new(),
         }
     }
 

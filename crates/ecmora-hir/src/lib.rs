@@ -17,6 +17,17 @@ pub struct Program {
     pub imports: Vec<ImportDeclaration>,
     pub exports: Vec<ExportBinding>,
     pub export_all: Vec<String>,
+    /// Promise-focused class metadata retained without forcing the general
+    /// JavaScript class object model into every native compilation.
+    pub promise_subclasses: Vec<PromiseSubclass>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PromiseSubclass {
+    pub name: String,
+    pub parent: String,
+    /// Static `@@species`; `None` means the constructor itself.
+    pub species: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -137,6 +148,8 @@ pub enum ExpressionKind {
     Number(f64),
     Bool(bool),
     Null,
+    /// ECMAScript receiver of the current callable invocation.
+    This,
     Global(String),
     Member {
         object: Box<Expression>,

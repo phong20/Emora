@@ -22,8 +22,12 @@ pub fn lower_program(program: &Program<'_>) -> Result<HirProgram> {
     let mut imports = Vec::new();
     let mut exports = Vec::new();
     let mut export_all = Vec::new();
+    let mut promise_subclasses = Vec::new();
     for statement in &program.body {
         match statement {
+            Statement::ClassDeclaration(class) => {
+                promise_subclasses.push(lower_promise_subclass(class)?);
+            }
             Statement::ImportDeclaration(declaration) => {
                 let specifiers = declaration
                     .specifiers
@@ -147,6 +151,7 @@ pub fn lower_program(program: &Program<'_>) -> Result<HirProgram> {
         imports,
         exports,
         export_all,
+        promise_subclasses,
     })
 }
 
@@ -490,6 +495,86 @@ fn sanitize_binding_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn lower_promise_subclass(class: &oxc_ast::ast::Class<'_>) -> Result<ecmora_hir::PromiseSubclass> {
+    use oxc_ast::ast::{ClassElement, MethodDefinitionKind};
+
+    let name = class
+        .id
+        .as_ref()
+        .ok_or_else(|| anyhow!("Promise subclass declaration phải có tên"))?
+        .name
+        .to_string();
+
+    let parent = match class.super_class.as_ref() {
+        Some(Expression::Identifier(identifier)) => identifier.name.to_string(),
+        Some(_) => bail!("Promise subclass extends expression phải là identifier tĩnh"),
+        None => bail!("class `{name}` không extends Promise/subclass"),
+    };
+
+    let mut species = None;
+    for element in &class.body.body {
+        let ClassElement::MethodDefinition(method) = element else {
+            bail!(
+                "Promise subclass `{name}` chỉ hỗ trợ method constructor và static @@species getter"
+            )
+        };
+
+        if method.kind == MethodDefinitionKind::Constructor {
+            // Default/trivial forwarding constructors are semantically
+            // equivalent for the Promise-focused model. A non-empty custom
+            // constructor needs the full class/super object model.
+            let non_empty = method
+                .value
+                .body
+                .as_ref()
+                .is_some_and(|body| !body.statements.is_empty());
+            if non_empty {
+                bail!(
+                    "custom Promise subclass constructor `{name}` cần general class/super lowering"
+                )
+            }
+            continue;
+        }
+
+        let is_species = method.r#static
+            && method.kind == MethodDefinitionKind::Get
+            && method.computed
+            && method.key.as_expression().is_some_and(|key| {
+                matches!(
+                    key,
+                    Expression::StaticMemberExpression(member)
+                        if matches!(
+                            &member.object,
+                            Expression::Identifier(identifier)
+                                if identifier.name == "Symbol"
+                        ) && member.property.name == "species"
+                )
+            });
+        if !is_species {
+            bail!("Promise subclass `{name}` có class element ngoài static get [Symbol.species]")
+        }
+
+        let body = method
+            .value
+            .body
+            .as_ref()
+            .ok_or_else(|| anyhow!("@@species getter thiếu body"))?;
+        let [Statement::ReturnStatement(statement)] = body.statements.as_slice() else {
+            bail!("@@species getter phải chỉ chứa `return Constructor`")
+        };
+        let Some(Expression::Identifier(identifier)) = statement.argument.as_ref() else {
+            bail!("@@species getter phải return identifier constructor")
+        };
+        species = Some(identifier.name.to_string());
+    }
+
+    Ok(ecmora_hir::PromiseSubclass {
+        name,
+        parent,
+        species,
+    })
 }
 
 fn lower_declaration(declaration: &Declaration<'_>) -> Result<HirStatement> {
@@ -881,6 +966,7 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
         }
         Expression::BooleanLiteral(literal) => (ExpressionKind::Bool(literal.value), literal.span),
         Expression::NullLiteral(literal) => (ExpressionKind::Null, literal.span),
+        Expression::ThisExpression(expression) => (ExpressionKind::This, expression.span),
         Expression::Identifier(identifier) => (
             ExpressionKind::Global(identifier.name.to_string()),
             identifier.span,
@@ -941,9 +1027,9 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
                     properties.push(ObjectEntry::Accessor { key, get, set });
                     continue;
                 }
-                if property.method {
-                    bail!("object method chưa được hỗ trợ")
-                }
+                // OXC represents object methods with a function-valued
+                // property expression. Retaining that function is required by
+                // the Promise resolution procedure for arbitrary thenables.
                 properties.push(ObjectEntry::Property(ObjectProperty {
                     key,
                     value: lower_expression(&property.value)?,
