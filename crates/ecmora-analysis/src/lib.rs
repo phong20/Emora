@@ -31,7 +31,11 @@ pub fn analyze(hir: &HirProgram) -> Result<Program> {
         ..Default::default()
     };
     lowerer.lower_scope(&hir.statements)?;
-    lowerer.drain_promise_jobs()?;
+    // An abrupt top-level completion must not execute queued work that appears
+    // after the throw. The ThrowValue terminator goes straight to LLVM.
+    if lowerer.blocks[lowerer.current].terminator.is_none() {
+        lowerer.drain_promise_jobs()?;
+    }
     if lowerer.blocks[lowerer.current].terminator.is_none() {
         lowerer.blocks[lowerer.current].terminator = Some(Terminator::ReturnI32(0));
     }
@@ -307,12 +311,10 @@ impl Lowerer {
                 Ok(())
             }
             StatementKind::Throw(expression) => {
-                if !self.function_mode {
-                    bail!("throw ngoài function cần exception ABI")
-                }
                 let value = self.lower_expression(expression)?;
-                self.return_types.push(value.1);
-                self.set_terminator(Terminator::ReturnValue {
+                // ECMAScript ThrowCompletion is not a ReturnCompletion. Keep
+                // the operand typed, but do not add it to normal return types.
+                self.set_terminator(Terminator::ThrowValue {
                     value: value.0,
                     value_type: value.1,
                 });
@@ -2339,7 +2341,12 @@ impl Lowerer {
                 (&object.kind, property)
             {
                 if object_name == "Promise" && !self.has_binding(object_name) {
-                    if method == "resolve" || method == "reject" {
+                    if method == "reject" {
+                        bail!(
+                            "Promise.reject cần rejection completion ABI; native lowering từ chối thay vì biến rejection thành fulfillment"
+                        )
+                    }
+                    if method == "resolve" {
                         if arguments.len() > 1 {
                             bail!("Promise.resolve nhận tối đa một argument")
                         }
@@ -2399,6 +2406,11 @@ impl Lowerer {
                     }
                     _ => bail!("Promise callback phải là function"),
                 };
+                if function_contains_direct_throw(&callback.function) {
+                    bail!(
+                        "throw trong Promise callback cần rejection completion ABI; native lowering từ chối thay vì trả về thrown value"
+                    )
+                }
                 let result = self.new_value();
                 self.emit(Instruction::PromisePending { result });
                 let priority = self
@@ -2584,6 +2596,9 @@ impl Lowerer {
         function: &HirFunction,
         arguments: &[Expression],
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        if function_contains_direct_throw(function) {
+            bail!("throw trong async function `{name}` cần Promise rejection completion ABI")
+        }
         if arguments.len() != function.parameters.len() {
             bail!("async function `{name}` sai arity")
         }
@@ -3419,5 +3434,52 @@ impl Lowerer {
             }
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod throw_lowering_tests {
+    use super::*;
+
+    fn span() -> Span {
+        Span::new(0, 0)
+    }
+
+    fn program(statements: Vec<Statement>) -> HirProgram {
+        HirProgram {
+            statements,
+            strict: false,
+            imports: Vec::new(),
+            exports: Vec::new(),
+            export_all: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn top_level_throw_is_an_abrupt_terminator() {
+        let hir = program(vec![
+            Statement {
+                kind: StatementKind::Throw(Expression {
+                    kind: ExpressionKind::String("boom".to_owned()),
+                    span: span(),
+                }),
+                span: span(),
+            },
+            Statement {
+                kind: StatementKind::Expression(Expression {
+                    kind: ExpressionKind::Number(99.0),
+                    span: span(),
+                }),
+                span: span(),
+            },
+        ]);
+        let ir = analyze(&hir).unwrap();
+        assert!(matches!(
+            &ir.functions[0].blocks[0].terminator,
+            Terminator::ThrowValue {
+                value_type: ValueType::String,
+                ..
+            }
+        ));
     }
 }

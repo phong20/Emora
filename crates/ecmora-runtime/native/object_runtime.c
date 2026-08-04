@@ -325,18 +325,38 @@ bool ecmora_dynamic_to_bool(uint8_t tag, uint64_t payload) {
     return true;
 }
 
-void ecmora_print_dynamic(uint8_t tag, uint64_t payload) {
+static void ecmora_fprint_dynamic(FILE *stream, uint8_t tag, uint64_t payload) {
     switch (tag) {
-        case 0: fputs("undefined", stdout); break;
-        case 1: fputs("null", stdout); break;
-        case 2: { double number; memcpy(&number, &payload, sizeof(number)); printf("%.15g", number); break; }
-        case 3: fputs(payload ? "true" : "false", stdout); break;
-        case 4: fputs(payload ? (const char *)((uintptr_t)payload) : "", stdout); break;
-        case 5: fputs("[object Object]", stdout); break;
-        case 6: fputs("function () { [native code] }", stdout); break;
-        case 7: fputs("[object Promise]", stdout); break;
-        default: fputs("undefined", stdout); break;
+        case ECMORA_UNDEFINED: fputs("undefined", stream); break;
+        case ECMORA_NULL: fputs("null", stream); break;
+        case ECMORA_NUMBER: {
+            double number;
+            memcpy(&number, &payload, sizeof(number));
+            fprintf(stream, "%.15g", number);
+            break;
+        }
+        case ECMORA_BOOL: fputs(payload ? "true" : "false", stream); break;
+        case ECMORA_STRING:
+            fputs(payload ? (const char *)((uintptr_t)payload) : "", stream);
+            break;
+        case ECMORA_OBJECT: fputs("[object Object]", stream); break;
+        case ECMORA_CALLABLE: fputs("function () { [native code] }", stream); break;
+        case ECMORA_PROMISE: fputs("[object Promise]", stream); break;
+        case ECMORA_CELL: fputs("[object Cell]", stream); break;
+        default: fputs("undefined", stream); break;
     }
+}
+
+void ecmora_print_dynamic(uint8_t tag, uint64_t payload) {
+    ecmora_fprint_dynamic(stdout, tag, payload);
+}
+
+void ecmora_throw_uncaught(uint8_t tag, uint64_t payload) {
+    fputs("Uncaught ", stderr);
+    ecmora_fprint_dynamic(stderr, tag, payload);
+    fputc('\n', stderr);
+    fflush(stderr);
+    abort();
 }
 
 #if defined(_MSC_VER)

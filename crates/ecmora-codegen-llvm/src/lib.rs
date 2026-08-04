@@ -93,6 +93,13 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
             .fn_type(&[i8_type.into(), i64_type.into()], false),
         None,
     );
+    let throw_uncaught = module.add_function(
+        "ecmora_throw_uncaught",
+        context
+            .void_type()
+            .fn_type(&[i8_type.into(), i64_type.into()], false),
+        None,
+    );
     let recursion_enter = module.add_function(
         "ecmora_recursion_enter",
         context
@@ -1361,6 +1368,35 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         .into_pointer_value();
                     builder.build_store(out, dynamic)?;
                     builder.build_return(None)?;
+                }
+                Terminator::ThrowValue { value, value_type } => {
+                    let value = values
+                        .get(value)
+                        .copied()
+                        .context("thiếu thrown SSA value")?;
+                    let dynamic = to_dynamic(
+                        &builder,
+                        value,
+                        *value_type,
+                        i8_type,
+                        i64_type,
+                        dynamic_type,
+                    )?;
+                    let tag = builder
+                        .build_extract_value(dynamic, 0, "throw.tag")?
+                        .into_int_value();
+                    let payload = builder
+                        .build_extract_value(dynamic, 1, "throw.payload")?
+                        .into_int_value();
+                    // Direct LLVM lowering of an uncaught ECMAScript abrupt
+                    // completion. The runtime boundary is noreturn in practice;
+                    // LLVM receives an explicit unreachable terminator.
+                    builder.build_call(
+                        throw_uncaught,
+                        &[tag.into(), payload.into()],
+                        "throw.uncaught",
+                    )?;
+                    builder.build_unreachable()?;
                 }
                 Terminator::TailCallDirect {
                     function,

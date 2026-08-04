@@ -564,19 +564,18 @@ fn collect_return_type_hints(
                 }
             },
 
-            StatementKind::Throw(expression) => {
-                // Hiện native lowering vẫn xử lý throw như ReturnValue.
-                // Khi có exception ABI, phần này sẽ được tách riêng.
-                if let Some(value_type) =
-                    infer_expression_type_hint(expression, bindings, recursive_name)
-                {
-                    hints.known.push(value_type);
-                } else {
-                    hints.has_unknown = true;
-                }
+            StatementKind::Throw(_) => {
+                // Throw is an abrupt completion, not a normal return. Its type
+                // must not widen or seed the function's return specialization.
             }
 
             StatementKind::Break | StatementKind::Continue => {}
+        }
+
+        // Return/throw make later statements in this lexical sequence
+        // unreachable. Ignoring them avoids false return-type pollution.
+        if statement_always_terminates(statement) {
+            break;
         }
     }
 }
@@ -617,19 +616,80 @@ fn statement_always_terminates(statement: &Statement) -> bool {
             ..
         } => statement_always_terminates(consequent) && statement_always_terminates(alternate),
 
-        // Bảo thủ với loop/switch: giả định vẫn có thể fallthrough.
+        // A do/while executes its body at least once. A literal-true while or
+        // for(;;) cannot fall through when its body itself completes abruptly.
+        StatementKind::DoWhile { body, .. } => statement_always_terminates(body),
+        StatementKind::While { test, body } => {
+            expression_is_literal_true(test) && statement_always_terminates(body)
+        }
+        StatementKind::For {
+            test: None, body, ..
+        } => statement_always_terminates(body),
+
+        // Each switch clause may be entered directly; require a default and
+        // every clause to terminate on its own. This is conservative around
+        // case fallthrough but never marks a fallthrough switch as terminal.
+        StatementKind::Switch { cases, .. } => {
+            cases.iter().any(|case| case.test.is_none())
+                && !cases.is_empty()
+                && cases
+                    .iter()
+                    .all(|case| statements_always_terminate(&case.consequent))
+        }
+
         StatementKind::Expression(_)
         | StatementKind::VariableDeclaration { .. }
         | StatementKind::If {
             alternate: None, ..
         }
         | StatementKind::While { .. }
-        | StatementKind::DoWhile { .. }
         | StatementKind::For { .. }
         | StatementKind::ForIn { .. }
         | StatementKind::ForOf { .. }
-        | StatementKind::Switch { .. }
         | StatementKind::FunctionDeclaration(_)
+        | StatementKind::Break
+        | StatementKind::Continue => false,
+    }
+}
+
+fn expression_is_literal_true(expression: &Expression) -> bool {
+    matches!(&expression.kind, ExpressionKind::Bool(true))
+}
+
+/// Detect a throw owned by this function body. Nested functions are skipped:
+/// they have an independent completion boundary and are analyzed separately.
+pub(super) fn function_contains_direct_throw(function: &HirFunction) -> bool {
+    function.body.iter().any(statement_contains_direct_throw)
+}
+
+fn statement_contains_direct_throw(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Throw(_) => true,
+        StatementKind::Block(body) => body.iter().any(statement_contains_direct_throw),
+        StatementKind::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            statement_contains_direct_throw(consequent)
+                || alternate
+                    .as_deref()
+                    .is_some_and(statement_contains_direct_throw)
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::For { body, .. }
+        | StatementKind::ForIn { body, .. }
+        | StatementKind::ForOf { body, .. } => statement_contains_direct_throw(body),
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .flat_map(|case| &case.consequent)
+            .any(statement_contains_direct_throw),
+        // Nested function throws belong to the nested function.
+        StatementKind::FunctionDeclaration(_)
+        | StatementKind::Expression(_)
+        | StatementKind::VariableDeclaration { .. }
+        | StatementKind::Return(_)
         | StatementKind::Break
         | StatementKind::Continue => false,
     }
@@ -1215,5 +1275,130 @@ pub(super) fn is_pure_expression_known(
         | ExpressionKind::Call { .. }
         | ExpressionKind::New { .. }
         | ExpressionKind::Await(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod throw_inference_tests {
+    use super::*;
+
+    fn span() -> Span {
+        Span::new(0, 0)
+    }
+
+    fn number(value: f64) -> Expression {
+        Expression {
+            kind: ExpressionKind::Number(value),
+            span: span(),
+        }
+    }
+
+    fn string(value: &str) -> Expression {
+        Expression {
+            kind: ExpressionKind::String(value.to_owned()),
+            span: span(),
+        }
+    }
+
+    fn function(body: Vec<Statement>) -> HirFunction {
+        HirFunction {
+            name: Some("f".to_owned()),
+            parameters: Vec::new(),
+            body,
+            r#async: false,
+            arrow: false,
+            lowering_error: None,
+        }
+    }
+
+    #[test]
+    fn throw_does_not_poison_normal_return_type() {
+        let body = vec![Statement {
+            kind: StatementKind::If {
+                test: Expression {
+                    kind: ExpressionKind::Bool(true),
+                    span: span(),
+                },
+                consequent: Box::new(Statement {
+                    kind: StatementKind::Throw(string("boom")),
+                    span: span(),
+                }),
+                alternate: Some(Box::new(Statement {
+                    kind: StatementKind::Return(Some(number(42.0))),
+                    span: span(),
+                })),
+            },
+            span: span(),
+        }];
+        let captures = Vec::<CapturedBinding>::new();
+        assert_eq!(
+            infer_function_return_type(&function(body), &HashMap::new(), &captures),
+            ValueType::Number
+        );
+    }
+
+    #[test]
+    fn unreachable_return_after_throw_is_ignored() {
+        let body = vec![
+            Statement {
+                kind: StatementKind::Throw(string("boom")),
+                span: span(),
+            },
+            Statement {
+                kind: StatementKind::Return(Some(number(1.0))),
+                span: span(),
+            },
+        ];
+        let captures = Vec::<CapturedBinding>::new();
+        assert_eq!(
+            infer_function_return_type(&function(body), &HashMap::new(), &captures),
+            ValueType::Undefined
+        );
+    }
+
+    #[test]
+    fn exhaustive_switch_can_seed_normal_return_type() {
+        let body = vec![Statement {
+            kind: StatementKind::Switch {
+                discriminant: number(0.0),
+                cases: vec![
+                    ecmora_hir::SwitchCase {
+                        test: Some(number(0.0)),
+                        consequent: vec![Statement {
+                            kind: StatementKind::Throw(string("zero")),
+                            span: span(),
+                        }],
+                        span: span(),
+                    },
+                    ecmora_hir::SwitchCase {
+                        test: None,
+                        consequent: vec![Statement {
+                            kind: StatementKind::Return(Some(number(7.0))),
+                            span: span(),
+                        }],
+                        span: span(),
+                    },
+                ],
+            },
+            span: span(),
+        }];
+        let captures = Vec::<CapturedBinding>::new();
+        assert_eq!(
+            infer_function_return_type(&function(body), &HashMap::new(), &captures),
+            ValueType::Number
+        );
+    }
+
+    #[test]
+    fn direct_throw_scan_skips_nested_functions() {
+        let nested = function(vec![Statement {
+            kind: StatementKind::Throw(string("nested")),
+            span: span(),
+        }]);
+        let outer = function(vec![Statement {
+            kind: StatementKind::FunctionDeclaration(nested),
+            span: span(),
+        }]);
+        assert!(!function_contains_direct_throw(&outer));
     }
 }

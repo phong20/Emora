@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow, bail};
 use ecmora_hir::{
-    ArrayElement, AssignmentOperator, AssignmentTarget, BinaryOperator,
-    ExportBinding, Expression as HirExpression, ExpressionKind, ForInit, Function as HirFunction,
+    ArrayElement, AssignmentOperator, AssignmentTarget, BinaryOperator, ExportBinding,
+    Expression as HirExpression, ExpressionKind, ForInit, Function as HirFunction,
     ImportDeclaration as HirImportDeclaration, ImportSpecifier as HirImportSpecifier,
     LogicalOperator, MemberProperty, ObjectEntry, ObjectProperty, Program as HirProgram, Span,
     Statement as HirStatement, StatementKind, SwitchCase, UnaryOperator, UpdateOperator,
@@ -12,9 +12,8 @@ use oxc_ast::ast::{
     BinaryOperator as OxcBinaryOperator, BindingPattern, Declaration, ExportDefaultDeclarationKind,
     Expression, ForStatementInit, ForStatementLeft, Function as OxcFunction,
     ImportDeclarationSpecifier, LogicalOperator as OxcLogicalOperator, ObjectPropertyKind, Program,
-    SimpleAssignmentTarget, Statement,
-    UnaryOperator as OxcUnaryOperator, UpdateOperator as OxcUpdateOperator, VariableDeclaration,
-    VariableDeclarationKind,
+    SimpleAssignmentTarget, Statement, UnaryOperator as OxcUnaryOperator,
+    UpdateOperator as OxcUpdateOperator, VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_span::Span as OxcSpan;
 
@@ -70,7 +69,10 @@ pub fn lower_program(program: &Program<'_>) -> Result<HirProgram> {
                     exports.push(ExportBinding {
                         local: specifier.local.name().to_string(),
                         exported: specifier.exported.name().to_string(),
-                        source: declaration.source.as_ref().map(|source| source.value.to_string()),
+                        source: declaration
+                            .source
+                            .as_ref()
+                            .map(|source| source.value.to_string()),
                     });
                 }
                 if let Some(source) = &declaration.source {
@@ -282,8 +284,7 @@ fn collect_static_modules_statement(
         constants: &std::collections::HashMap<String, String>,
     ) {
         match &expression.kind {
-            ExpressionKind::Call { callee, arguments }
-                if matches!(&callee.kind, ExpressionKind::Global(name) if name == "require" || name == "__ecmora_dynamic_import") =>
+            ExpressionKind::Call { callee, arguments } if matches!(&callee.kind, ExpressionKind::Global(name) if name == "require" || name == "__ecmora_dynamic_import") =>
             {
                 if let [argument] = arguments.as_slice() {
                     match &argument.kind {
@@ -309,11 +310,17 @@ fn collect_static_modules_statement(
             ExpressionKind::Object(entries) => {
                 for entry in entries {
                     match entry {
-                        ObjectEntry::Property(property) => walk_expression(&property.value, imports, constants),
+                        ObjectEntry::Property(property) => {
+                            walk_expression(&property.value, imports, constants)
+                        }
                         ObjectEntry::Spread(value) => walk_expression(value, imports, constants),
                         ObjectEntry::Accessor { get, set, .. } => {
-                            if let Some(get) = get { walk_expression(get, imports, constants); }
-                            if let Some(set) = set { walk_expression(set, imports, constants); }
+                            if let Some(get) = get {
+                                walk_expression(get, imports, constants);
+                            }
+                            if let Some(set) = set {
+                                walk_expression(set, imports, constants);
+                            }
                         }
                     }
                 }
@@ -321,22 +328,38 @@ fn collect_static_modules_statement(
             ExpressionKind::Array(elements) => {
                 for element in elements {
                     match element {
-                        ArrayElement::Expression(value) | ArrayElement::Spread(value) => walk_expression(value, imports, constants),
+                        ArrayElement::Expression(value) | ArrayElement::Spread(value) => {
+                            walk_expression(value, imports, constants)
+                        }
                         ArrayElement::Hole => {}
                     }
                 }
             }
-            ExpressionKind::Conditional { test, consequent, alternate } => {
-                walk_expression(test, imports, constants); walk_expression(consequent, imports, constants); walk_expression(alternate, imports, constants);
+            ExpressionKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                walk_expression(test, imports, constants);
+                walk_expression(consequent, imports, constants);
+                walk_expression(alternate, imports, constants);
             }
-            ExpressionKind::Unary { argument, .. } | ExpressionKind::Await(argument) => walk_expression(argument, imports, constants),
-            ExpressionKind::Binary { left, right, .. } | ExpressionKind::Logical { left, right, .. } => {
-                walk_expression(left, imports, constants); walk_expression(right, imports, constants);
+            ExpressionKind::Unary { argument, .. } | ExpressionKind::Await(argument) => {
+                walk_expression(argument, imports, constants)
+            }
+            ExpressionKind::Binary { left, right, .. }
+            | ExpressionKind::Logical { left, right, .. } => {
+                walk_expression(left, imports, constants);
+                walk_expression(right, imports, constants);
             }
             ExpressionKind::Assignment { value, .. } => walk_expression(value, imports, constants),
             ExpressionKind::Update { .. } => {}
-            ExpressionKind::Call { callee, arguments } | ExpressionKind::New { callee, arguments } => {
-                walk_expression(callee, imports, constants); for argument in arguments { walk_expression(argument, imports, constants); }
+            ExpressionKind::Call { callee, arguments }
+            | ExpressionKind::New { callee, arguments } => {
+                walk_expression(callee, imports, constants);
+                for argument in arguments {
+                    walk_expression(argument, imports, constants);
+                }
             }
             // Do not resolve modules from every function body here: a dead
             // function may intentionally contain a dynamic import of a file
@@ -347,18 +370,92 @@ fn collect_static_modules_statement(
             _ => {}
         }
     }
-    fn statement_walk(statement: &HirStatement, imports: &mut Vec<HirImportDeclaration>, constants: &std::collections::HashMap<String, String>) {
+    fn statement_walk(
+        statement: &HirStatement,
+        imports: &mut Vec<HirImportDeclaration>,
+        constants: &std::collections::HashMap<String, String>,
+    ) {
         match &statement.kind {
-            StatementKind::Expression(value) | StatementKind::Throw(value) => walk_expression(value, imports, constants),
-            StatementKind::VariableDeclaration { declarations, .. } => for declaration in declarations { if let Some(value) = &declaration.init { walk_expression(value, imports, constants); } },
-            StatementKind::Block(body) => for statement in body { statement_walk(statement, imports, constants); },
-            StatementKind::If { test, consequent, alternate } => { walk_expression(test, imports, constants); statement_walk(consequent, imports, constants); if let Some(alternate) = alternate { statement_walk(alternate, imports, constants); } },
-            StatementKind::While { test, body } | StatementKind::DoWhile { body, test } => { walk_expression(test, imports, constants); statement_walk(body, imports, constants); },
-            StatementKind::For { init, test, update, body } => { if let Some(init) = init { match init { ForInit::VariableDeclaration { declarations, .. } => for declaration in declarations { if let Some(value) = &declaration.init { walk_expression(value, imports, constants); } }, ForInit::Expression(value) => walk_expression(value, imports, constants) } } if let Some(test) = test { walk_expression(test, imports, constants); } if let Some(update) = update { walk_expression(update, imports, constants); } statement_walk(body, imports, constants); },
-            StatementKind::ForIn { right, body, .. } | StatementKind::ForOf { right, body, .. } => { walk_expression(right, imports, constants); statement_walk(body, imports, constants); },
-            StatementKind::Switch { discriminant, cases } => { walk_expression(discriminant, imports, constants); for case in cases { if let Some(test) = &case.test { walk_expression(test, imports, constants); } for statement in &case.consequent { statement_walk(statement, imports, constants); } } },
-            StatementKind::FunctionDeclaration(_) => {},
-            StatementKind::Return(value) => if let Some(value) = value { walk_expression(value, imports, constants); },
+            StatementKind::Expression(value) | StatementKind::Throw(value) => {
+                walk_expression(value, imports, constants)
+            }
+            StatementKind::VariableDeclaration { declarations, .. } => {
+                for declaration in declarations {
+                    if let Some(value) = &declaration.init {
+                        walk_expression(value, imports, constants);
+                    }
+                }
+            }
+            StatementKind::Block(body) => {
+                for statement in body {
+                    statement_walk(statement, imports, constants);
+                }
+            }
+            StatementKind::If {
+                test,
+                consequent,
+                alternate,
+            } => {
+                walk_expression(test, imports, constants);
+                statement_walk(consequent, imports, constants);
+                if let Some(alternate) = alternate {
+                    statement_walk(alternate, imports, constants);
+                }
+            }
+            StatementKind::While { test, body } | StatementKind::DoWhile { body, test } => {
+                walk_expression(test, imports, constants);
+                statement_walk(body, imports, constants);
+            }
+            StatementKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    match init {
+                        ForInit::VariableDeclaration { declarations, .. } => {
+                            for declaration in declarations {
+                                if let Some(value) = &declaration.init {
+                                    walk_expression(value, imports, constants);
+                                }
+                            }
+                        }
+                        ForInit::Expression(value) => walk_expression(value, imports, constants),
+                    }
+                }
+                if let Some(test) = test {
+                    walk_expression(test, imports, constants);
+                }
+                if let Some(update) = update {
+                    walk_expression(update, imports, constants);
+                }
+                statement_walk(body, imports, constants);
+            }
+            StatementKind::ForIn { right, body, .. } | StatementKind::ForOf { right, body, .. } => {
+                walk_expression(right, imports, constants);
+                statement_walk(body, imports, constants);
+            }
+            StatementKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                walk_expression(discriminant, imports, constants);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        walk_expression(test, imports, constants);
+                    }
+                    for statement in &case.consequent {
+                        statement_walk(statement, imports, constants);
+                    }
+                }
+            }
+            StatementKind::FunctionDeclaration(_) => {}
+            StatementKind::Return(value) => {
+                if let Some(value) = value {
+                    walk_expression(value, imports, constants);
+                }
+            }
             StatementKind::Break | StatementKind::Continue => {}
         }
     }
@@ -373,10 +470,12 @@ fn static_require_source(expression: &HirExpression) -> Option<String> {
         return None;
     }
     match arguments.as_slice() {
-        [HirExpression {
-            kind: ExpressionKind::String(source),
-            ..
-        }] => Some(source.clone()),
+        [
+            HirExpression {
+                kind: ExpressionKind::String(source),
+                ..
+            },
+        ] => Some(source.clone()),
         _ => None,
     }
 }
@@ -412,9 +511,10 @@ fn lower_declaration(declaration: &Declaration<'_>) -> Result<HirStatement> {
 
 fn declared_names(statement: &HirStatement) -> Vec<String> {
     match &statement.kind {
-        StatementKind::VariableDeclaration { declarations, .. } => {
-            declarations.iter().map(|value| value.name.clone()).collect()
-        }
+        StatementKind::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .map(|value| value.name.clone())
+            .collect(),
         StatementKind::FunctionDeclaration(function) => function.name.iter().cloned().collect(),
         _ => Vec::new(),
     }
@@ -1039,7 +1139,12 @@ fn lower_arrow_function(function: &ArrowFunctionExpression<'_>) -> Result<HirFun
         .as_ref()
         .err()
         .map(|error| format!("{error:#}"))
-        .or_else(|| lowered_body.as_ref().err().map(|error| format!("{error:#}")));
+        .or_else(|| {
+            lowered_body
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:#}"))
+        });
     let parameters = parameters.unwrap_or_default();
     let mut body = lowered_body.unwrap_or_default();
     if lowering_error.is_none() && function.expression {

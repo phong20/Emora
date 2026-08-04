@@ -7,7 +7,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use ecmora_hir::{
     ArrayElement, AssignmentTarget, ExportBinding, Expression, ExpressionKind, ForInit,
-    ImportSpecifier, MemberProperty, ObjectEntry, ObjectProperty, Program, Statement, StatementKind,
+    ImportSpecifier, MemberProperty, ObjectEntry, ObjectProperty, Program, Statement,
+    StatementKind,
 };
 
 pub(super) fn load_program(entry: &Path) -> Result<Program> {
@@ -82,10 +83,8 @@ impl ModuleLoader {
         }
         self.predeclared
             .insert(path.to_owned(), provisional_exports.clone());
-        self.pending.insert(
-            path.to_owned(),
-            PendingModule { hir, rename },
-        );
+        self.pending
+            .insert(path.to_owned(), PendingModule { hir, rename });
         let (imports, export_all) = {
             let pending = self.pending.get(path).unwrap();
             (pending.hir.imports.clone(), pending.hir.export_all.clone())
@@ -109,10 +108,7 @@ impl ModuleLoader {
                 match specifier {
                     ImportSpecifier::Named { imported, local } => {
                         let target = dependency.get(imported).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "module `{}` không export `{imported}`",
-                                import.source
-                            )
+                            anyhow::anyhow!("module `{}` không export `{imported}`", import.source)
                         })?;
                         rename.insert(local.clone(), target.clone());
                     }
@@ -165,7 +161,9 @@ impl ModuleLoader {
                 .ok_or_else(|| anyhow::anyhow!("thiếu dependency `{source}`"))?;
             for (name, target) in dependency {
                 if name != "default" {
-                    exports.entry(name.clone()).or_insert_with(|| target.clone());
+                    exports
+                        .entry(name.clone())
+                        .or_insert_with(|| target.clone());
                 }
             }
         }
@@ -209,7 +207,9 @@ fn resolve_specifier(importer: &Path, specifier: &str) -> Result<PathBuf> {
     candidates
         .into_iter()
         .find(|candidate| candidate.is_file())
-        .ok_or_else(|| anyhow::anyhow!("không resolve được `{specifier}` từ {}", importer.display()))
+        .ok_or_else(|| {
+            anyhow::anyhow!("không resolve được `{specifier}` từ {}", importer.display())
+        })
 }
 
 fn resolve_package_entry(package: &Path) -> Option<PathBuf> {
@@ -251,7 +251,11 @@ fn top_level_names(statements: &[Statement]) -> HashSet<String> {
     for statement in statements {
         match &statement.kind {
             StatementKind::VariableDeclaration { declarations, .. } => {
-                names.extend(declarations.iter().map(|declaration| declaration.name.clone()));
+                names.extend(
+                    declarations
+                        .iter()
+                        .map(|declaration| declaration.name.clone()),
+                );
             }
             StatementKind::FunctionDeclaration(function) => {
                 if let Some(name) = &function.name {
@@ -334,7 +338,9 @@ fn rename_statement(
                             }
                         }
                     }
-                    ForInit::Expression(value) => rename_expression(value, rename, namespaces, shadowed),
+                    ForInit::Expression(value) => {
+                        rename_expression(value, rename, namespaces, shadowed)
+                    }
                 }
             }
             if let Some(test) = test {
@@ -345,8 +351,7 @@ fn rename_statement(
             }
             rename_statement(body, rename, namespaces, false, shadowed);
         }
-        StatementKind::ForIn { right, body, .. }
-        | StatementKind::ForOf { right, body, .. } => {
+        StatementKind::ForIn { right, body, .. } | StatementKind::ForOf { right, body, .. } => {
             rename_expression(right, rename, namespaces, shadowed);
             rename_statement(body, rename, namespaces, false, shadowed);
         }
@@ -372,7 +377,13 @@ fn rename_statement(
             }
             let mut function_shadowed = shadowed.clone();
             function_shadowed.extend(function.parameters.iter().cloned());
-            rename_scope(&mut function.body, rename, namespaces, false, &function_shadowed);
+            rename_scope(
+                &mut function.body,
+                rename,
+                namespaces,
+                false,
+                &function_shadowed,
+            );
         }
         StatementKind::Return(value) => {
             if let Some(value) = value {
@@ -395,13 +406,15 @@ fn rename_expression(
                 expression.kind = ExpressionKind::Object(
                     exports
                         .iter()
-                        .map(|(key, target)| ObjectEntry::Property(ObjectProperty {
-                            key: MemberProperty::Static(key.clone()),
-                            value: Expression {
-                                kind: ExpressionKind::Global(target.clone()),
-                                span: expression.span,
-                            },
-                        }))
+                        .map(|(key, target)| {
+                            ObjectEntry::Property(ObjectProperty {
+                                key: MemberProperty::Static(key.clone()),
+                                value: Expression {
+                                    kind: ExpressionKind::Global(target.clone()),
+                                    span: expression.span,
+                                },
+                            })
+                        })
                         .collect(),
                 );
                 return;
@@ -438,7 +451,9 @@ fn rename_expression(
                         }
                         rename_expression(&mut property.value, rename, namespaces, shadowed);
                     }
-                    ObjectEntry::Spread(value) => rename_expression(value, rename, namespaces, shadowed),
+                    ObjectEntry::Spread(value) => {
+                        rename_expression(value, rename, namespaces, shadowed)
+                    }
                     ObjectEntry::Accessor { get, set, .. } => {
                         if let Some(get) = get {
                             rename_expression(get, rename, namespaces, shadowed);
@@ -481,9 +496,10 @@ fn rename_expression(
             rename_target(target, rename, namespaces, shadowed);
             rename_expression(value, rename, namespaces, shadowed);
         }
-        ExpressionKind::Update { target, .. } => rename_target(target, rename, namespaces, shadowed),
-        ExpressionKind::Call { callee, arguments }
-        | ExpressionKind::New { callee, arguments } => {
+        ExpressionKind::Update { target, .. } => {
+            rename_target(target, rename, namespaces, shadowed)
+        }
+        ExpressionKind::Call { callee, arguments } | ExpressionKind::New { callee, arguments } => {
             rename_expression(callee, rename, namespaces, shadowed);
             for argument in arguments {
                 rename_expression(argument, rename, namespaces, shadowed);
@@ -492,7 +508,13 @@ fn rename_expression(
         ExpressionKind::Function(function) => {
             let mut function_shadowed = shadowed.clone();
             function_shadowed.extend(function.parameters.iter().cloned());
-            rename_scope(&mut function.body, rename, namespaces, false, &function_shadowed);
+            rename_scope(
+                &mut function.body,
+                rename,
+                namespaces,
+                false,
+                &function_shadowed,
+            );
         }
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)

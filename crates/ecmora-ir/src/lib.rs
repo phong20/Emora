@@ -274,6 +274,12 @@ pub enum Terminator {
         value: ValueId,
         value_type: ValueType,
     },
+    /// ECMAScript abrupt completion. This is deliberately distinct from a
+    /// normal return: it never writes the function's normal result slot.
+    ThrowValue {
+        value: ValueId,
+        value_type: ValueType,
+    },
     TailCallDirect {
         function: String,
         arguments: Vec<ValueId>,
@@ -524,6 +530,11 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                         bail!("return type không khớp function `{}`", function.name)
                     }
                 }
+                Terminator::ThrowValue { value, value_type } => {
+                    // A thrown value is not a normal function result and must
+                    // never participate in return-type validation.
+                    require_type(&types, *value, *value_type)?;
+                }
                 Terminator::TailCallDirect {
                     function: callee,
                     arguments,
@@ -677,6 +688,7 @@ fn verify_cfg(function: &Function) -> Result<()> {
             } => vec![*then_block, *else_block],
             Terminator::ReturnI32(_)
             | Terminator::ReturnValue { .. }
+            | Terminator::ThrowValue { .. }
             | Terminator::TailCallDirect { .. }
             | Terminator::Unreachable => Vec::new(),
         };
@@ -1101,6 +1113,9 @@ pub fn dump_program(program: &Program) -> String {
                 Terminator::ReturnValue { value, value_type } => {
                     writeln!(&mut output, "    ret {:?} %v{}", value_type, value.0).unwrap()
                 }
+                Terminator::ThrowValue { value, value_type } => {
+                    writeln!(&mut output, "    throw {:?} %v{}", value_type, value.0).unwrap()
+                }
                 Terminator::TailCallDirect {
                     function,
                     arguments,
@@ -1119,4 +1134,58 @@ pub fn dump_program(program: &Program) -> String {
         writeln!(&mut output, "}}\n").unwrap();
     }
     output
+}
+
+#[cfg(test)]
+mod throw_tests {
+    use super::*;
+
+    fn function_with(terminator: Terminator, instruction: Instruction) -> Program {
+        Program {
+            functions: vec![Function {
+                name: "js.test.0".to_owned(),
+                parameters: Vec::new(),
+                captures: Vec::new(),
+                return_type: Some(ValueType::Number),
+                blocks: vec![BasicBlock {
+                    name: "entry".to_owned(),
+                    instructions: vec![instruction],
+                    terminator,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn thrown_type_does_not_have_to_match_normal_return_type() {
+        let value = ValueId(0);
+        let program = function_with(
+            Terminator::ThrowValue {
+                value,
+                value_type: ValueType::String,
+            },
+            Instruction::ConstString {
+                result: value,
+                value: "boom".to_owned(),
+            },
+        );
+        verify_program(&program).unwrap();
+    }
+
+    #[test]
+    fn throw_operand_is_still_strongly_typed() {
+        let value = ValueId(0);
+        let program = function_with(
+            Terminator::ThrowValue {
+                value,
+                value_type: ValueType::Number,
+            },
+            Instruction::ConstString {
+                result: value,
+                value: "boom".to_owned(),
+            },
+        );
+        let error = verify_program(&program).unwrap_err().to_string();
+        assert!(error.contains("cần Number"), "{error}");
+    }
 }
