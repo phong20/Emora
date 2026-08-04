@@ -102,12 +102,30 @@ struct StaticAccessor {
     setter: Option<ClosureBinding>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromiseState {
+    Fulfilled,
+    Rejected,
+}
+
+#[derive(Debug, Clone)]
+struct PromiseSettlement {
+    state: PromiseState,
+    value: (ValueId, ValueType, Option<Value>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromiseChainKind {
+    Then,
+    Finally,
+}
+
 #[derive(Debug, Clone)]
 struct PromiseChain {
     parent: ValueId,
-    callback: ClosureBinding,
-    preserve_parent: bool,
-    priority: bool,
+    on_fulfilled: Option<ClosureBinding>,
+    on_rejected: Option<ClosureBinding>,
+    kind: PromiseChainKind,
 }
 
 #[derive(Debug)]
@@ -143,9 +161,10 @@ struct Lowerer {
     function_arity: Option<usize>,
     static_accessors: HashMap<(ValueId, String), StaticAccessor>,
     static_object_callables: HashMap<(ValueId, String), ClosureBinding>,
-    promise_payloads: HashMap<ValueId, (ValueId, ValueType, Option<Value>)>,
+    promise_settlements: HashMap<ValueId, PromiseSettlement>,
     promise_chains: HashMap<ValueId, PromiseChain>,
     promise_order: Vec<ValueId>,
+    promise_resolution_stack: HashSet<ValueId>,
     last_callable: Option<ValueId>,
     used_bindings: Vec<HashSet<String>>,
 }
@@ -1722,35 +1741,7 @@ impl Lowerer {
                 let ExpressionKind::Function(executor) = &arguments[0].kind else {
                     bail!("Promise executor phải là function")
                 };
-                let Some(statement) = executor.body.first() else {
-                    bail!("Promise executor rỗng")
-                };
-                let executor_expression = match &statement.kind {
-                    StatementKind::Expression(expression)
-                    | StatementKind::Return(Some(expression)) => expression,
-                    _ => {
-                        bail!("Promise executor native cần gọi resolve/reject trực tiếp")
-                    }
-                };
-                let ExpressionKind::Call { callee, arguments } = &executor_expression.kind else {
-                    bail!("Promise executor native cần gọi resolve/reject trực tiếp")
-                };
-                let ExpressionKind::Global(settle) = &callee.kind else {
-                    bail!("Promise executor settle function không hợp lệ")
-                };
-                if settle != "resolve" || arguments.len() != 1 {
-                    bail!("Promise reject/resolve dynamic chưa hỗ trợ")
-                }
-                let value = self.lower_expression(&arguments[0])?;
-                let result = self.new_value();
-                self.emit(Instruction::PromiseResolved {
-                    result,
-                    value: value.0,
-                    value_type: value.1,
-                });
-                self.promise_payloads.insert(result, value);
-                self.promise_order.push(result);
-                Ok((result, ValueType::Promise, None))
+                self.lower_promise_constructor(executor)
             }
             ExpressionKind::Function(_) => {
                 bail!("function value cần closure lowering")
@@ -2234,15 +2225,7 @@ impl Lowerer {
                     bail!("dynamic import source chưa chứng minh được là string")
                 }
                 let value = self.emit_value(Value::Undefined);
-                let result = self.new_value();
-                self.emit(Instruction::PromiseResolved {
-                    result,
-                    value: value.0,
-                    value_type: value.1,
-                });
-                self.promise_payloads.insert(result, value);
-                self.promise_order.push(result);
-                return Ok((result, ValueType::Promise, None));
+                return self.create_settled_promise(PromiseState::Fulfilled, value);
             }
             if name == "require" {
                 if arguments.len() != 1 {
@@ -2268,7 +2251,12 @@ impl Lowerer {
         if let ExpressionKind::Global(name) = &callee.kind {
             if let Some(callback) = self.inline_callables.get(name).cloned() {
                 if callback.function.r#async {
-                    return self.lower_async_call(name, &callback.function, arguments);
+                    return self.lower_async_call(
+                        name,
+                        &callback.function,
+                        arguments,
+                        Some(&callback.captures),
+                    );
                 }
 
                 return self.lower_inline_call(
@@ -2281,7 +2269,8 @@ impl Lowerer {
 
             if let Some(function) = self.function_defs.get(name).cloned() {
                 if function.r#async {
-                    return self.lower_async_call(name, &function, arguments);
+                    let captures = self.capture_environment_for(&function);
+                    return self.lower_async_call(name, &function, arguments, Some(&captures));
                 }
 
                 let captures = self.capture_environment_for(&function);
@@ -2346,33 +2335,41 @@ impl Lowerer {
                 (&object.kind, property)
             {
                 if object_name == "Promise" && !self.has_binding(object_name) {
-                    if method == "reject" {
-                        bail!(
-                            "Promise.reject cần rejection completion ABI; native lowering từ chối thay vì biến rejection thành fulfillment"
-                        )
-                    }
-                    if method == "resolve" {
-                        if arguments.len() > 1 {
-                            bail!("Promise.resolve nhận tối đa một argument")
+                    match method.as_str() {
+                        "resolve" => {
+                            let value = match arguments.first() {
+                                Some(argument) => self.lower_expression(argument)?,
+                                None => self.emit_value(Value::Undefined),
+                            };
+                            for extra in arguments.iter().skip(1) {
+                                self.lower_expression(extra)?;
+                            }
+                            if value.1 == ValueType::Promise {
+                                // Built-in Promise.resolve identity fast path.
+                                return Ok(value);
+                            }
+                            return self.create_settled_promise(PromiseState::Fulfilled, value);
                         }
-                        let value = match arguments.first() {
-                            Some(argument) => self.lower_expression(argument)?,
-                            None => self.emit_value(Value::Undefined),
-                        };
-                        let result = self.new_value();
-                        self.emit(Instruction::PromiseResolved {
-                            result,
-                            value: value.0,
-                            value_type: value.1,
-                        });
-                        self.promise_payloads.insert(result, value);
-                        self.promise_order.push(result);
-                        return Ok((result, ValueType::Promise, None));
+                        "reject" => {
+                            let reason = match arguments.first() {
+                                Some(argument) => self.lower_expression(argument)?,
+                                None => self.emit_value(Value::Undefined),
+                            };
+                            for extra in arguments.iter().skip(1) {
+                                self.lower_expression(extra)?;
+                            }
+                            return self.create_settled_promise(PromiseState::Rejected, reason);
+                        }
+                        _ => {}
                     }
                 }
             }
-            let promise_object = if matches!(&object.kind, ExpressionKind::Global(name) if name == "Promise" || name == "Object" || name == "console")
-            {
+
+            let promise_object = if matches!(
+                &object.kind,
+                ExpressionKind::Global(name)
+                    if name == "Promise" || name == "Object" || name == "console"
+            ) {
                 None
             } else {
                 Some(self.lower_expression(object)?)
@@ -2383,56 +2380,42 @@ impl Lowerer {
                 let MemberProperty::Static(method) = property else {
                     bail!("computed Promise method chưa hỗ trợ")
                 };
-                if !matches!(method.as_str(), "then" | "catch" | "finally") {
-                    bail!("Promise method `{method}` chưa hỗ trợ")
-                }
-                let callback = arguments
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("Promise.{method} cần callback"))?;
-                let callback = match &callback.kind {
-                    ExpressionKind::Function(function) => {
-                        let captures = self.capture_environment_for(function);
-
-                        ClosureBinding {
-                            function: function.clone(),
-                            captures,
-                        }
-                    }
-                    ExpressionKind::Global(name) => {
-                        if let Some(closure) = self.closure_callables.get(name).cloned() {
-                            closure
-                        } else if let Some(function) = self.function_defs.get(name).cloned() {
-                            let captures = self.capture_environment_for(&function);
-
-                            ClosureBinding { function, captures }
-                        } else {
-                            bail!("Promise callback `{name}` không phải function tĩnh")
-                        }
-                    }
-                    _ => bail!("Promise callback phải là function"),
+                let (on_fulfilled, on_rejected, kind, consumed) = match method.as_str() {
+                    "then" => (
+                        self.promise_handler_from_argument(arguments.first())?,
+                        self.promise_handler_from_argument(arguments.get(1))?,
+                        PromiseChainKind::Then,
+                        2,
+                    ),
+                    "catch" => (
+                        None,
+                        self.promise_handler_from_argument(arguments.first())?,
+                        PromiseChainKind::Then,
+                        1,
+                    ),
+                    "finally" => (
+                        self.promise_handler_from_argument(arguments.first())?,
+                        None,
+                        PromiseChainKind::Finally,
+                        1,
+                    ),
+                    _ => bail!("Promise method `{method}` chưa hỗ trợ"),
                 };
-                if function_contains_direct_throw(&callback.function) {
-                    bail!(
-                        "throw trong Promise callback cần rejection completion ABI; native lowering từ chối thay vì trả về thrown value"
-                    )
+                for extra in arguments.iter().skip(consumed) {
+                    self.lower_expression(extra)?;
                 }
-                let result = self.new_value();
-                self.emit(Instruction::PromisePending { result });
-                let priority = self
-                    .promise_chains
-                    .get(&promise_object.0)
-                    .is_some_and(|chain| chain.priority);
+
+                let result = self.create_pending_promise();
                 self.promise_chains.insert(
-                    result,
+                    result.0,
                     PromiseChain {
                         parent: promise_object.0,
-                        callback,
-                        preserve_parent: method == "finally",
-                        priority,
+                        on_fulfilled,
+                        on_rejected,
+                        kind,
                     },
                 );
-                self.promise_order.push(result);
-                return Ok((result, ValueType::Promise, None));
+                return Ok(result);
             }
             if let (ExpressionKind::Global(object_name), MemberProperty::Static(method)) =
                 (&object.kind, property)
@@ -2600,18 +2583,37 @@ impl Lowerer {
         name: &str,
         function: &HirFunction,
         arguments: &[Expression],
+        captures: Option<&[CapturedBinding]>,
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
-        if function_contains_direct_throw(function) {
-            bail!("throw trong async function `{name}` cần Promise rejection completion ABI")
+        if let Some(error) = &function.lowering_error {
+            bail!("async function `{name}` reachable nhưng frontend không hạ được: {error}")
         }
-        if arguments.len() != function.parameters.len() {
-            bail!("async function `{name}` sai arity")
+
+        let mut values = Vec::with_capacity(function.parameters.len());
+        for index in 0..function.parameters.len() {
+            values.push(match arguments.get(index) {
+                Some(argument) => self.lower_expression(argument)?,
+                None => self.emit_value(Value::Undefined),
+            });
         }
-        let values = arguments
-            .iter()
-            .map(|argument| self.lower_expression(argument))
-            .collect::<Result<Vec<_>>>()?;
+        for extra in arguments.iter().skip(function.parameters.len()) {
+            self.lower_expression(extra)?;
+        }
+
         self.scopes.push(HashMap::new());
+        for capture in captures.unwrap_or_default() {
+            self.scopes.last_mut().unwrap().insert(
+                capture.name.clone(),
+                Binding {
+                    kind: capture.kind,
+                    initialized: true,
+                    value_id: capture.cell,
+                    value_type: capture.value_type,
+                    value: None,
+                    cell: Some(capture.cell),
+                },
+            );
+        }
         self.predeclare(&function.body)?;
         for (parameter, value) in function.parameters.iter().zip(&values) {
             self.scopes.last_mut().unwrap().insert(
@@ -2626,140 +2628,142 @@ impl Lowerer {
                 },
             );
         }
-        let mut await_index = None;
-        let mut awaited = None;
-        let mut return_await = None;
+
         for (index, statement) in function.body.iter().enumerate() {
-            if let StatementKind::VariableDeclaration { declarations, .. } = &statement.kind {
-                if declarations.len() == 1 {
-                    if let Some(Expression {
-                        kind: ExpressionKind::Await(argument),
-                        ..
-                    }) = &declarations[0].init
-                    {
-                        for previous in &function.body[..index] {
-                            self.lower_statement(previous)?;
-                        }
-                        let value = self.lower_expression(argument)?;
-                        let promise = if value.1 == ValueType::Promise {
-                            value.0
-                        } else {
-                            let promise = self.new_value();
-                            self.emit(Instruction::PromiseResolved {
-                                result: promise,
-                                value: value.0,
-                                value_type: value.1,
-                            });
-                            self.promise_payloads.insert(promise, value.clone());
-                            self.promise_order.push(promise);
-                            promise
-                        };
-                        let payload = self.resolve_promise(promise)?;
-                        let binding =
-                            self.find_binding_mut(&declarations[0].name)
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "async binding `{}` không tồn tại",
-                                        declarations[0].name
-                                    )
-                                })?;
-                        binding.initialized = true;
-                        binding.value_id = payload.0;
-                        binding.value_type = payload.1;
-                        binding.value = payload.2.clone();
-                        await_index = Some(index);
-                        awaited = Some(promise);
-                        break;
+            let await_declaration = match &statement.kind {
+                StatementKind::VariableDeclaration { declarations, .. }
+                    if declarations.len() == 1 =>
+                {
+                    match &declarations[0].init {
+                        Some(Expression {
+                            kind: ExpressionKind::Await(argument),
+                            ..
+                        }) => Some((&declarations[0].name, argument.as_ref())),
+                        _ => None,
                     }
                 }
-            }
-            let await_argument = match &statement.kind {
+                _ => None,
+            };
+            let await_expression = match &statement.kind {
                 StatementKind::Expression(Expression {
                     kind: ExpressionKind::Await(argument),
                     ..
                 }) => Some(argument.as_ref()),
+                _ => None,
+            };
+            let return_await = match &statement.kind {
                 StatementKind::Return(Some(Expression {
                     kind: ExpressionKind::Await(argument),
                     ..
                 })) => Some(argument.as_ref()),
                 _ => None,
             };
-            if let Some(argument) = await_argument {
-                for previous in &function.body[..index] {
-                    self.lower_statement(previous)?;
-                }
-                let value = self.lower_expression(argument)?;
-                let promise = if value.1 == ValueType::Promise {
-                    value.0
-                } else {
-                    let promise = self.new_value();
-                    self.emit(Instruction::PromiseResolved {
-                        result: promise,
-                        value: value.0,
-                        value_type: value.1,
-                    });
-                    self.promise_payloads.insert(promise, value.clone());
-                    self.promise_order.push(promise);
-                    promise
-                };
-                let payload = self.resolve_promise(promise)?;
-                await_index = Some(index);
-                awaited = Some(promise);
-                if matches!(
+
+            let is_boundary = await_declaration.is_some()
+                || await_expression.is_some()
+                || return_await.is_some()
+                || matches!(
                     &statement.kind,
-                    StatementKind::Return(Some(Expression {
-                        kind: ExpressionKind::Await(_),
-                        ..
-                    }))
-                ) {
-                    return_await = Some(payload);
+                    StatementKind::Return(_) | StatementKind::Throw(_)
+                );
+            if !is_boundary {
+                continue;
+            }
+
+            for previous in &function.body[..index] {
+                self.lower_statement(previous)?;
+                if self.blocks[self.current].terminator.is_some() {
+                    self.scopes.pop();
+                    bail!("async control-flow trước await cần general completion CFG lowering")
                 }
-                break;
+            }
+
+            if let StatementKind::Throw(reason) = &statement.kind {
+                let reason = self.lower_expression(reason)?;
+                self.scopes.pop();
+                return self.create_settled_promise(PromiseState::Rejected, reason);
+            }
+
+            if let StatementKind::Return(value) = &statement.kind {
+                if return_await.is_none() {
+                    let value = match value {
+                        Some(value) => self.lower_expression(value)?,
+                        None => self.emit_value(Value::Undefined),
+                    };
+                    self.scopes.pop();
+                    return self.create_settled_promise(PromiseState::Fulfilled, value);
+                }
+            }
+
+            let awaited_expression = await_declaration
+                .map(|(_, expression)| expression)
+                .or(await_expression)
+                .or(return_await)
+                .expect("await boundary");
+            let awaited_value = self.lower_expression(awaited_expression)?;
+            let awaited_promise = self.coerce_to_promise(awaited_value)?;
+            let settlement = self.resolve_promise(awaited_promise.0)?;
+
+            if return_await.is_some() {
+                self.scopes.pop();
+                return self.create_settled_promise(settlement.state, settlement.value);
+            }
+
+            if settlement.state == PromiseState::Rejected {
+                self.scopes.pop();
+                return self.create_settled_promise(PromiseState::Rejected, settlement.value);
+            }
+
+            if let Some((name, _)) = await_declaration {
+                let binding = self
+                    .find_binding_mut(name)
+                    .ok_or_else(|| anyhow::anyhow!("async binding `{name}` không tồn tại"))?;
+                binding.initialized = true;
+                binding.value_id = settlement.value.0;
+                binding.value_type = settlement.value.1;
+                binding.value = settlement.value.2.clone();
+            }
+
+            let continuation = HirFunction {
+                name: None,
+                parameters: Vec::new(),
+                body: function.body[index + 1..].to_vec(),
+                // Recursive continuation lowering supports more than one await.
+                r#async: true,
+                arrow: true,
+                lowering_error: function.lowering_error.clone(),
+            };
+            let continuation_captures = self.capture_environment_for(&continuation);
+            self.scopes.pop();
+
+            let result = self.create_pending_promise();
+            self.promise_chains.insert(
+                result.0,
+                PromiseChain {
+                    parent: awaited_promise.0,
+                    on_fulfilled: Some(ClosureBinding {
+                        function: continuation,
+                        captures: continuation_captures,
+                    }),
+                    on_rejected: None,
+                    kind: PromiseChainKind::Then,
+                },
+            );
+            return Ok(result);
+        }
+
+        // No top-level await/return/throw boundary: execute synchronously and
+        // fulfill with undefined.
+        for statement in &function.body {
+            self.lower_statement(statement)?;
+            if self.blocks[self.current].terminator.is_some() {
+                self.scopes.pop();
+                bail!("nested async return/throw cần general completion CFG lowering")
             }
         }
-        let Some(await_index) = await_index else {
-            self.scopes.pop();
-            bail!("async function `{name}` cần ít nhất một await native")
-        };
-        if let Some(payload) = return_await {
-            self.scopes.pop();
-            let result = self.new_value();
-            self.emit(Instruction::PromiseResolved {
-                result,
-                value: payload.0,
-                value_type: payload.1,
-            });
-            self.promise_payloads.insert(result, payload);
-            self.promise_order.push(result);
-            return Ok((result, ValueType::Promise, None));
-        }
-        let continuation = HirFunction {
-            name: None,
-            parameters: Vec::new(),
-            body: function.body[await_index + 1..].to_vec(),
-            r#async: false,
-            arrow: true,
-            lowering_error: function.lowering_error.clone(),
-        };
-
-        let captures = self.capture_environment_for(&continuation);
         self.scopes.pop();
-        let result = self.new_value();
-        self.emit(Instruction::PromisePending { result });
-        self.promise_chains.insert(
-            result,
-            PromiseChain {
-                parent: awaited.unwrap(),
-                callback: ClosureBinding {
-                    function: continuation,
-                    captures,
-                },
-                preserve_parent: false,
-                priority: true,
-            },
-        );
-        self.promise_order.push(result);
-        Ok((result, ValueType::Promise, None))
+        let undefined = self.emit_value(Value::Undefined);
+        self.create_settled_promise(PromiseState::Fulfilled, undefined)
     }
 
     fn emit_specialization_call(
@@ -2843,8 +2847,8 @@ impl Lowerer {
         if let Some(error) = &function.lowering_error {
             bail!("function `{name}` reachable nhưng native frontend không hạ được body: {error}")
         }
-        if function.r#async || arguments.len() != function.parameters.len() {
-            bail!("function `{name}` cần async/variadic ABI")
+        if function.r#async {
+            bail!("async function `{name}` phải đi qua async lowering")
         }
 
         // A call-site specialization keeps concrete ECMAScript types in the
@@ -2854,16 +2858,28 @@ impl Lowerer {
         let mut parameters = Vec::new();
         let mut callbacks = HashMap::new();
         let mut parameter_type_hints = HashMap::new();
-        for (parameter, argument) in function.parameters.iter().zip(arguments) {
-            if let Some(callback) = self.resolve_callback_argument(argument) {
-                parameter_type_hints.insert(parameter.clone(), ValueType::Callable);
-                callbacks.insert(parameter.clone(), callback);
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            if let Some(argument) = arguments.get(index) {
+                if let Some(callback) = self.resolve_callback_argument(argument) {
+                    parameter_type_hints.insert(parameter.clone(), ValueType::Callable);
+                    callbacks.insert(parameter.clone(), callback);
+                } else {
+                    let value = self.lower_expression(argument)?;
+                    parameter_type_hints.insert(parameter.clone(), value.1);
+                    parameters.push((parameter.clone(), value.1));
+                    call_arguments.push(value);
+                }
             } else {
-                let value = self.lower_expression(argument)?;
-                parameter_type_hints.insert(parameter.clone(), value.1);
-                parameters.push((parameter.clone(), value.1));
+                let value = self.emit_value(Value::Undefined);
+                parameter_type_hints.insert(parameter.clone(), ValueType::Undefined);
+                parameters.push((parameter.clone(), ValueType::Undefined));
                 call_arguments.push(value);
             }
+        }
+        // JavaScript ignores extra arguments unless arguments/rest is observed,
+        // but their expressions are still evaluated left-to-right.
+        for argument in arguments.iter().skip(function.parameters.len()) {
+            self.lower_expression(argument)?;
         }
 
         let captures = captures.unwrap_or_default();
@@ -3218,164 +3234,392 @@ impl Lowerer {
 
         captures
     }
-    fn drain_promise_jobs(&mut self) -> Result<()> {
-        let chained = self
-            .promise_chains
-            .keys()
-            .copied()
-            .collect::<std::collections::HashSet<_>>();
-        let mut queue = self
-            .promise_order
-            .iter()
-            .copied()
-            .filter(|token| !chained.contains(token))
-            .collect::<Vec<_>>();
-        let mut index = 0;
-        while index < queue.len() {
-            let token = queue[index];
-            index += 1;
-            if self.promise_payloads.contains_key(&token) {
-                let children = self
-                    .promise_chains
-                    .iter()
-                    .filter_map(|(child, chain)| {
-                        (chain.parent == token).then_some((*child, chain.priority))
-                    })
-                    .collect::<Vec<_>>();
-                let (priority, normal): (Vec<_>, Vec<_>) =
-                    children.into_iter().partition(|(_, priority)| *priority);
-                queue.splice(index..index, priority.into_iter().map(|(child, _)| child));
-                queue.extend(normal.into_iter().map(|(child, _)| child));
-                continue;
-            }
-            let Some(chain) = self.promise_chains.get(&token).cloned() else {
-                continue;
-            };
-            let Some(parent) = self.promise_payloads.get(&chain.parent).cloned() else {
-                queue.push(token);
-                continue;
-            };
-            let result = if chain.preserve_parent {
-                let temporary = format!("@promise.finally.arg.{}", self.next_value);
-                self.scopes.last_mut().unwrap().insert(
-                    temporary.clone(),
-                    Binding {
-                        kind: VariableKind::Let,
-                        initialized: true,
-                        value_id: parent.0,
-                        value_type: parent.1,
-                        value: parent.2.clone(),
-                        cell: None,
-                    },
-                );
-                let argument = Expression {
-                    kind: ExpressionKind::Global(temporary.clone()),
-                    span: Span::new(0, 0),
-                };
-                let args = if chain.callback.function.parameters.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![argument]
-                };
-                let _ = self.lower_inline_call(
-                    "promise.finally",
-                    &chain.callback.function,
-                    &args,
-                    Some(&chain.callback.captures),
-                )?;
-                self.scopes.last_mut().unwrap().remove(&temporary);
-                parent
-            } else {
-                let temporary = format!("@promise.arg.{}", self.next_value);
-                self.scopes.last_mut().unwrap().insert(
-                    temporary.clone(),
-                    Binding {
-                        kind: VariableKind::Let,
-                        initialized: true,
-                        value_id: parent.0,
-                        value_type: parent.1,
-                        value: parent.2.clone(),
-                        cell: None,
-                    },
-                );
-                let argument = Expression {
-                    kind: ExpressionKind::Global(temporary.clone()),
-                    span: Span::new(0, 0),
-                };
-                let args = if chain.callback.function.parameters.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![argument]
-                };
-                let value = self.lower_inline_call(
-                    "promise.callback",
-                    &chain.callback.function,
-                    &args,
-                    Some(&chain.callback.captures),
-                )?;
-                self.scopes.last_mut().unwrap().remove(&temporary);
-                value
-            };
-            self.promise_payloads.insert(token, result);
-            let children = self
-                .promise_chains
-                .iter()
-                .filter_map(|(child, chain)| {
-                    (chain.parent == token).then_some((*child, chain.priority))
-                })
-                .collect::<Vec<_>>();
-            let (priority, normal): (Vec<_>, Vec<_>) =
-                children.into_iter().partition(|(_, priority)| *priority);
-            queue.splice(index..index, priority.into_iter().map(|(child, _)| child));
-            queue.extend(normal.into_iter().map(|(child, _)| child));
-        }
-        Ok(())
+    fn create_pending_promise(&mut self) -> (ValueId, ValueType, Option<Value>) {
+        let result = self.new_value();
+        self.emit(Instruction::PromisePending { result });
+        self.promise_order.push(result);
+        (result, ValueType::Promise, None)
     }
 
-    fn resolve_promise(&mut self, token: ValueId) -> Result<(ValueId, ValueType, Option<Value>)> {
-        if let Some(value) = self.promise_payloads.get(&token).cloned() {
-            return Ok(value);
+    fn create_settled_promise(
+        &mut self,
+        state: PromiseState,
+        value: (ValueId, ValueType, Option<Value>),
+    ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        /*
+         * Resolving a distinct promise with a native promise adopts it. Keep a
+         * distinct capability token; Promise.resolve(x) performs its identity
+         * fast path before entering this helper.
+         */
+        if state == PromiseState::Fulfilled && value.1 == ValueType::Promise {
+            let result = self.create_pending_promise();
+            self.promise_chains.insert(
+                result.0,
+                PromiseChain {
+                    parent: value.0,
+                    on_fulfilled: None,
+                    on_rejected: None,
+                    kind: PromiseChainKind::Then,
+                },
+            );
+            return Ok(result);
         }
-        let chain = self
-            .promise_chains
-            .get(&token)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Promise token chưa có resolution"))?;
-        let parent = self.resolve_promise(chain.parent)?;
-        let result = if chain.preserve_parent {
-            parent
+
+        let result = self.new_value();
+        match state {
+            PromiseState::Fulfilled => self.emit(Instruction::PromiseResolved {
+                result,
+                value: value.0,
+                value_type: value.1,
+            }),
+            PromiseState::Rejected => self.emit(Instruction::PromiseRejected {
+                result,
+                reason: value.0,
+                reason_type: value.1,
+            }),
+        }
+        self.promise_settlements
+            .insert(result, PromiseSettlement { state, value });
+        self.promise_order.push(result);
+        Ok((result, ValueType::Promise, None))
+    }
+
+    fn settle_existing_promise(
+        &mut self,
+        token: ValueId,
+        settlement: PromiseSettlement,
+    ) -> Result<PromiseSettlement> {
+        if let Some(existing) = self.promise_settlements.get(&token) {
+            return Ok(existing.clone());
+        }
+        self.emit(Instruction::PromiseSettle {
+            promise: token,
+            value: settlement.value.0,
+            value_type: settlement.value.1,
+            rejected: settlement.state == PromiseState::Rejected,
+        });
+        self.promise_settlements.insert(token, settlement.clone());
+        Ok(settlement)
+    }
+
+    fn coerce_to_promise(
+        &mut self,
+        value: (ValueId, ValueType, Option<Value>),
+    ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        if value.1 == ValueType::Promise {
+            Ok(value)
         } else {
-            let temporary = format!("@promise.arg.{}", self.next_value);
+            self.create_settled_promise(PromiseState::Fulfilled, value)
+        }
+    }
+
+    fn promise_handler_from_argument(
+        &mut self,
+        argument: Option<&Expression>,
+    ) -> Result<Option<ClosureBinding>> {
+        let Some(argument) = argument else {
+            return Ok(None);
+        };
+        match &argument.kind {
+            ExpressionKind::Function(function) => {
+                let captures = self.capture_environment_for(function);
+                Ok(Some(ClosureBinding {
+                    function: function.clone(),
+                    captures,
+                }))
+            }
+            ExpressionKind::Global(name) if name == "undefined" => Ok(None),
+            ExpressionKind::Global(name) => {
+                if let Some(handler) = self.inline_callables.get(name).cloned() {
+                    return Ok(Some(handler));
+                }
+                if let Some(handler) = self.closure_callables.get(name).cloned() {
+                    return Ok(Some(handler));
+                }
+                if let Some(function) = self.function_defs.get(name).cloned() {
+                    let captures = self.capture_environment_for(&function);
+                    return Ok(Some(ClosureBinding { function, captures }));
+                }
+                let value = self.lower_expression(argument)?;
+                if value.1 == ValueType::Callable {
+                    bail!("Promise handler `{name}` là callable động; cần runtime completion ABI")
+                }
+                Ok(None)
+            }
+            _ => {
+                let value = self.lower_expression(argument)?;
+                if value.1 == ValueType::Callable {
+                    bail!("Promise handler động cần runtime completion ABI")
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    fn invoke_promise_handler(
+        &mut self,
+        label: &str,
+        handler: &ClosureBinding,
+        argument: Option<&(ValueId, ValueType, Option<Value>)>,
+    ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        if !handler.function.r#async && function_contains_direct_throw(&handler.function) {
+            bail!(
+                "throw trong Promise handler `{label}` cần non-fatal completion ABI; \
+                 compiler từ chối thay vì biến throw thành return hoặc abort sai"
+            )
+        }
+
+        let temporary = argument.map(|argument| {
+            let temporary = format!("@promise.handler.arg.{}", self.next_value);
             self.scopes.last_mut().unwrap().insert(
                 temporary.clone(),
                 Binding {
                     kind: VariableKind::Let,
                     initialized: true,
-                    value_id: parent.0,
-                    value_type: parent.1,
-                    value: parent.2.clone(),
+                    value_id: argument.0,
+                    value_type: argument.1,
+                    value: argument.2.clone(),
                     cell: None,
                 },
             );
-            let argument = Expression {
-                kind: ExpressionKind::Global(temporary.clone()),
-                span: Span::new(0, 0),
-            };
-            let value = self.lower_inline_call(
-                "promise.callback",
-                &chain.callback.function,
-                if chain.callback.function.parameters.is_empty() {
-                    &[]
-                } else {
-                    std::slice::from_ref(&argument)
-                },
-                Some(&chain.callback.captures),
-            )?;
-            self.scopes.last_mut().unwrap().remove(&temporary);
-            value
+            temporary
+        });
+        let arguments = temporary
+            .as_ref()
+            .map(|temporary| {
+                vec![Expression {
+                    kind: ExpressionKind::Global(temporary.clone()),
+                    span: Span::new(0, 0),
+                }]
+            })
+            .unwrap_or_default();
+
+        let value = if handler.function.r#async {
+            self.lower_async_call(
+                label,
+                &handler.function,
+                &arguments,
+                Some(&handler.captures),
+            )?
+        } else {
+            self.lower_inline_call(
+                label,
+                &handler.function,
+                &arguments,
+                Some(&handler.captures),
+            )?
         };
-        self.promise_payloads.insert(token, result.clone());
-        Ok(result)
+
+        if let Some(temporary) = temporary {
+            self.scopes.last_mut().unwrap().remove(&temporary);
+        }
+        Ok(value)
+    }
+
+    fn settlement_from_handler_value(
+        &mut self,
+        value: (ValueId, ValueType, Option<Value>),
+    ) -> Result<PromiseSettlement> {
+        if value.1 == ValueType::Promise {
+            self.resolve_promise(value.0)
+        } else {
+            Ok(PromiseSettlement {
+                state: PromiseState::Fulfilled,
+                value,
+            })
+        }
+    }
+
+    fn apply_promise_chain(
+        &mut self,
+        chain: &PromiseChain,
+        parent: PromiseSettlement,
+    ) -> Result<PromiseSettlement> {
+        if chain.kind == PromiseChainKind::Finally {
+            let Some(handler) = &chain.on_fulfilled else {
+                return Ok(parent);
+            };
+            let callback = self.invoke_promise_handler("promise.finally", handler, None)?;
+            let callback = self.settlement_from_handler_value(callback)?;
+            return if callback.state == PromiseState::Rejected {
+                Ok(callback)
+            } else {
+                Ok(parent)
+            };
+        }
+
+        let handler = match parent.state {
+            PromiseState::Fulfilled => chain.on_fulfilled.as_ref(),
+            PromiseState::Rejected => chain.on_rejected.as_ref(),
+        };
+        let Some(handler) = handler else {
+            // ECMAScript's default identity/thrower handlers.
+            return Ok(parent);
+        };
+
+        let callback = self.invoke_promise_handler(
+            match parent.state {
+                PromiseState::Fulfilled => "promise.then.fulfilled",
+                PromiseState::Rejected => "promise.then.rejected",
+            },
+            handler,
+            Some(&parent.value),
+        )?;
+        self.settlement_from_handler_value(callback)
+    }
+
+    fn drain_promise_jobs(&mut self) -> Result<()> {
+        /*
+         * promise_order is registration order. Repeated passes allow a reaction
+         * whose parent settles later to become runnable without reordering
+         * independent reactions that were already runnable.
+         */
+        loop {
+            let mut progress = false;
+            let order = self.promise_order.clone();
+            for token in order {
+                if self.promise_settlements.contains_key(&token) {
+                    continue;
+                }
+                let Some(chain) = self.promise_chains.get(&token).cloned() else {
+                    // A genuinely pending, unused executor is legal.
+                    continue;
+                };
+                if !self.promise_settlements.contains_key(&chain.parent) {
+                    continue;
+                }
+                let parent = self
+                    .promise_settlements
+                    .get(&chain.parent)
+                    .cloned()
+                    .expect("checked parent settlement");
+                let settlement = self.apply_promise_chain(&chain, parent)?;
+                self.settle_existing_promise(token, settlement)?;
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_promise(&mut self, token: ValueId) -> Result<PromiseSettlement> {
+        if let Some(value) = self.promise_settlements.get(&token).cloned() {
+            return Ok(value);
+        }
+        if !self.promise_resolution_stack.insert(token) {
+            bail!("cyclic native Promise resolution tại %v{}", token.0)
+        }
+
+        let result = (|| {
+            let chain = self.promise_chains.get(&token).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Promise %v{} vẫn pending hoặc không có static resolution",
+                    token.0
+                )
+            })?;
+            let parent = self.resolve_promise(chain.parent)?;
+            let settlement = self.apply_promise_chain(&chain, parent)?;
+            self.settle_existing_promise(token, settlement)
+        })();
+
+        self.promise_resolution_stack.remove(&token);
+        result
+    }
+
+    fn lower_promise_constructor(
+        &mut self,
+        executor: &HirFunction,
+    ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        let resolve_name = executor.parameters.first().cloned();
+        let reject_name = executor.parameters.get(1).cloned();
+
+        self.scopes.push(HashMap::new());
+        self.predeclare(&executor.body)?;
+        let result = (|| {
+            let mut first_settlement: Option<(PromiseState, (ValueId, ValueType, Option<Value>))> =
+                None;
+
+            for statement in &executor.body {
+                if let StatementKind::Throw(reason) = &statement.kind {
+                    let reason = self.lower_expression(reason)?;
+                    if first_settlement.is_none() {
+                        first_settlement = Some((PromiseState::Rejected, reason));
+                    }
+                    // The executor's abrupt completion stops later statements.
+                    // If it was already resolved, the implicit reject call is
+                    // ignored by the shared AlreadyResolved cell.
+                    break;
+                }
+
+                let (expression, returns) = match &statement.kind {
+                    StatementKind::Expression(expression) => (Some(expression), false),
+                    StatementKind::Return(Some(expression)) => (Some(expression), true),
+                    StatementKind::Return(None) => break,
+                    StatementKind::FunctionDeclaration(_) => continue,
+                    _ => {
+                        self.lower_statement(statement)?;
+                        if self.blocks[self.current].terminator.is_some() {
+                            bail!(
+                                "Promise executor control-flow completion cần general completion ABI"
+                            )
+                        }
+                        continue;
+                    }
+                };
+
+                let expression = expression.expect("expression statement");
+                let direct_settlement = match &expression.kind {
+                    ExpressionKind::Call { callee, arguments } => {
+                        if let ExpressionKind::Global(settle) = &callee.kind {
+                            let state = if resolve_name.as_deref() == Some(settle.as_str()) {
+                                Some(PromiseState::Fulfilled)
+                            } else if reject_name.as_deref() == Some(settle.as_str()) {
+                                Some(PromiseState::Rejected)
+                            } else {
+                                None
+                            };
+                            state.map(|state| (state, arguments))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+
+                if let Some((state, arguments)) = direct_settlement {
+                    /*
+                     * Call arguments are evaluated even after another resolving
+                     * function already won. Only the settlement write is
+                     * suppressed by AlreadyResolved.
+                     */
+                    let value = match arguments.first() {
+                        Some(argument) => self.lower_expression(argument)?,
+                        None => self.emit_value(Value::Undefined),
+                    };
+                    for extra in arguments.iter().skip(1) {
+                        self.lower_expression(extra)?;
+                    }
+                    if first_settlement.is_none() {
+                        first_settlement = Some((state, value));
+                    }
+                } else {
+                    self.lower_expression(expression)?;
+                }
+
+                if returns {
+                    break;
+                }
+            }
+
+            match first_settlement {
+                Some((state, value)) => self.create_settled_promise(state, value),
+                None => Ok(self.create_pending_promise()),
+            }
+        })();
+        self.scopes.pop();
+        result
     }
 
     fn lookup(&mut self, name: &str) -> Result<(ValueId, ValueType, Option<Value>)> {

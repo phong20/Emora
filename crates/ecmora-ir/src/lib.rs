@@ -80,18 +80,34 @@ pub enum Instruction {
         value: ValueId,
         value_type: ValueType,
     },
+    /// Create a promise fulfilled through the built-in Promise resolution
+    /// procedure. A Promise-typed value is adopted, not boxed as fulfillment.
     PromiseResolved {
         result: ValueId,
         value: ValueId,
         value_type: ValueType,
     },
+    PromiseRejected {
+        result: ValueId,
+        reason: ValueId,
+        reason_type: ValueType,
+    },
     PromisePending {
         result: ValueId,
+    },
+    /// Settle an existing capability promise. Fulfillment uses the Promise
+    /// resolution procedure and therefore adopts a Promise-typed value.
+    PromiseSettle {
+        promise: ValueId,
+        value: ValueId,
+        value_type: ValueType,
+        rejected: bool,
     },
     PromiseThen {
         result: ValueId,
         promise: ValueId,
-        callback: ValueId,
+        on_fulfilled: Option<ValueId>,
+        on_rejected: Option<ValueId>,
     },
     MicrotaskDrain,
     ConstUndefined {
@@ -357,11 +373,33 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                     Instruction::PromiseResolved {
                         value, value_type, ..
                     } => require_type(&types, *value, *value_type)?,
-                    Instruction::PromiseThen {
-                        promise, callback, ..
+                    Instruction::PromiseRejected {
+                        reason,
+                        reason_type,
+                        ..
+                    } => require_type(&types, *reason, *reason_type)?,
+                    Instruction::PromiseSettle {
+                        promise,
+                        value,
+                        value_type,
+                        ..
                     } => {
                         require_type(&types, *promise, ValueType::Promise)?;
-                        require_type(&types, *callback, ValueType::Callable)?;
+                        require_type(&types, *value, *value_type)?;
+                    }
+                    Instruction::PromiseThen {
+                        promise,
+                        on_fulfilled,
+                        on_rejected,
+                        ..
+                    } => {
+                        require_type(&types, *promise, ValueType::Promise)?;
+                        if let Some(on_fulfilled) = on_fulfilled {
+                            require_type(&types, *on_fulfilled, ValueType::Callable)?;
+                        }
+                        if let Some(on_rejected) = on_rejected {
+                            require_type(&types, *on_rejected, ValueType::Callable)?;
+                        }
                     }
                     Instruction::ObjectGet { object, .. } => {
                         require_type(&types, *object, ValueType::Object)?
@@ -626,8 +664,10 @@ fn declared_result(instruction: &Instruction) -> Option<(ValueId, ValueType)> {
         Instruction::CallBuiltin { .. } => return None,
         Instruction::ObjectSet { .. } => return None,
         Instruction::CellSet { .. } => return None,
-        Instruction::PromiseResolved { result, .. } => (*result, ValueType::Promise),
+        Instruction::PromiseResolved { result, .. }
+        | Instruction::PromiseRejected { result, .. } => (*result, ValueType::Promise),
         Instruction::PromisePending { result } => (*result, ValueType::Promise),
+        Instruction::PromiseSettle { .. } => return None,
         Instruction::PromiseThen { result, .. } => (*result, ValueType::Promise),
         Instruction::MicrotaskDrain => return None,
     })
@@ -839,20 +879,42 @@ pub fn dump_program(program: &Program) -> String {
                         result.0, value_type, value.0
                     )
                     .unwrap(),
+                    Instruction::PromiseRejected {
+                        result,
+                        reason,
+                        reason_type,
+                    } => writeln!(
+                        &mut output,
+                        "    %v{} = promise_rejected {:?} %v{}",
+                        result.0, reason_type, reason.0
+                    )
+                    .unwrap(),
                     Instruction::PromisePending { result } => writeln!(
                         &mut output,
                         "    %v{} = promise_pending",
                         result.0
                     )
                     .unwrap(),
+                    Instruction::PromiseSettle {
+                        promise,
+                        value,
+                        value_type,
+                        rejected,
+                    } => writeln!(
+                        &mut output,
+                        "    promise_settle %v{}, {:?} %v{}, rejected={}",
+                        promise.0, value_type, value.0, rejected
+                    )
+                    .unwrap(),
                     Instruction::PromiseThen {
                         result,
                         promise,
-                        callback,
+                        on_fulfilled,
+                        on_rejected,
                     } => writeln!(
                         &mut output,
-                        "    %v{} = promise_then %v{}, %v{}",
-                        result.0, promise.0, callback.0
+                        "    %v{} = promise_then %v{}, {:?}, {:?}",
+                        result.0, promise.0, on_fulfilled, on_rejected
                     )
                     .unwrap(),
                     Instruction::MicrotaskDrain => {

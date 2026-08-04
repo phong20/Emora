@@ -254,11 +254,23 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         ptr_type.fn_type(&[ptr_type.into()], false),
         None,
     );
+    let promise_rejected = module.add_function(
+        "ecmora_promise_rejected",
+        ptr_type.fn_type(&[ptr_type.into()], false),
+        None,
+    );
     let promise_pending =
         module.add_function("ecmora_promise_pending", ptr_type.fn_type(&[], false), None);
+    let promise_settle = module.add_function(
+        "ecmora_promise_settle",
+        context
+            .void_type()
+            .fn_type(&[ptr_type.into(), bool_type.into(), ptr_type.into()], false),
+        None,
+    );
     let promise_then = module.add_function(
         "ecmora_promise_then",
-        ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        ptr_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
         None,
     );
     let microtask_drain = module.add_function(
@@ -528,6 +540,37 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                                 .context("promise_resolved không trả pointer")?,
                         );
                     }
+                    Instruction::PromiseRejected {
+                        result,
+                        reason,
+                        reason_type,
+                    } => {
+                        let reason = values
+                            .get(reason)
+                            .copied()
+                            .context("thiếu Promise rejection reason")?;
+                        let dynamic = to_dynamic(
+                            &builder,
+                            reason,
+                            *reason_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                        )?;
+                        let dynamic_ptr = builder.build_alloca(dynamic_type, "promise.reason")?;
+                        builder.build_store(dynamic_ptr, dynamic)?;
+                        let call = builder.build_call(
+                            promise_rejected,
+                            &[dynamic_ptr.into()],
+                            "promise.rejected",
+                        )?;
+                        values.insert(
+                            *result,
+                            call.try_as_basic_value()
+                                .basic()
+                                .context("promise_rejected không trả pointer")?,
+                        );
+                    }
                     Instruction::PromisePending { result } => {
                         let call = builder.build_call(promise_pending, &[], "promise.pending")?;
                         values.insert(
@@ -537,24 +580,76 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                                 .context("promise_pending không trả pointer")?,
                         );
                     }
+                    Instruction::PromiseSettle {
+                        promise,
+                        value,
+                        value_type,
+                        rejected,
+                    } => {
+                        let promise = values
+                            .get(promise)
+                            .copied()
+                            .context("thiếu Promise capability SSA")?
+                            .into_pointer_value();
+                        let value = values
+                            .get(value)
+                            .copied()
+                            .context("thiếu Promise settlement value")?;
+                        let dynamic = to_dynamic(
+                            &builder,
+                            value,
+                            *value_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                        )?;
+                        let dynamic_ptr =
+                            builder.build_alloca(dynamic_type, "promise.settlement")?;
+                        builder.build_store(dynamic_ptr, dynamic)?;
+                        builder.build_call(
+                            promise_settle,
+                            &[
+                                promise.into(),
+                                bool_type.const_int(*rejected as u64, false).into(),
+                                dynamic_ptr.into(),
+                            ],
+                            "promise.settle",
+                        )?;
+                    }
                     Instruction::PromiseThen {
                         result,
                         promise,
-                        callback,
+                        on_fulfilled,
+                        on_rejected,
                     } => {
                         let promise = values
                             .get(promise)
                             .copied()
                             .context("thiếu Promise SSA")?
                             .into_pointer_value();
-                        let callback = values
-                            .get(callback)
-                            .copied()
-                            .context("thiếu Promise callback SSA")?
-                            .into_pointer_value();
+                        let on_fulfilled = on_fulfilled
+                            .map(|handler| {
+                                values
+                                    .get(&handler)
+                                    .copied()
+                                    .context("thiếu Promise fulfillment handler")
+                                    .map(BasicValueEnum::into_pointer_value)
+                            })
+                            .transpose()?
+                            .unwrap_or_else(|| ptr_type.const_null());
+                        let on_rejected = on_rejected
+                            .map(|handler| {
+                                values
+                                    .get(&handler)
+                                    .copied()
+                                    .context("thiếu Promise rejection handler")
+                                    .map(BasicValueEnum::into_pointer_value)
+                            })
+                            .transpose()?
+                            .unwrap_or_else(|| ptr_type.const_null());
                         let call = builder.build_call(
                             promise_then,
-                            &[promise.into(), callback.into()],
+                            &[promise.into(), on_fulfilled.into(), on_rejected.into()],
                             "promise.then",
                         )?;
                         values.insert(
