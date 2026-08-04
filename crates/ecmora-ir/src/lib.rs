@@ -157,6 +157,12 @@ pub enum Instruction {
         operand: ValueId,
         operand_type: ValueType,
     },
+    /// ECMAScript `typeof` for a value whose concrete tag is only known at
+    /// runtime. Statically typed operands are folded in analysis instead.
+    TypeOfDynamic {
+        result: ValueId,
+        operand: ValueId,
+    },
     UnaryNumber {
         result: ValueId,
         operator: UnaryNumberOperator,
@@ -239,6 +245,7 @@ pub enum BinaryNumberOperator {
     Multiply,
     Divide,
     Remainder,
+    Exponential,
     ShiftLeft,
     ShiftRight,
     ShiftRightZeroFill,
@@ -410,6 +417,9 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                         if !types.contains_key(operand) {
                             bail!("unknown SSA value %v{}", operand.0)
                         }
+                    }
+                    Instruction::TypeOfDynamic { operand, .. } => {
+                        require_type(&types, *operand, ValueType::Dynamic)?
                     }
                     Instruction::UnaryNumber { operand, .. } => {
                         require_type(&types, *operand, ValueType::Number)?
@@ -592,6 +602,7 @@ fn declared_result(instruction: &Instruction) -> Option<(ValueId, ValueType)> {
         Instruction::ObjectSetPrototype { .. } => return None,
         Instruction::ObjectDefineAccessor { .. } => return None,
         Instruction::ToBoolean { result, .. } => (*result, ValueType::Bool),
+        Instruction::TypeOfDynamic { result, .. } => (*result, ValueType::String),
         Instruction::UnaryNumber { result, .. } => (*result, ValueType::Number),
         Instruction::UnaryBool { result, .. } => (*result, ValueType::Bool),
         Instruction::BinaryNumber { result, .. } => (*result, ValueType::Number),
@@ -902,6 +913,12 @@ pub fn dump_program(program: &Program) -> String {
                         &mut output,
                         "    %v{} = to_boolean {:?} %v{}",
                         result.0, operand_type, operand.0
+                    )
+                    .unwrap(),
+                    Instruction::TypeOfDynamic { result, operand } => writeln!(
+                        &mut output,
+                        "    %v{} = typeof_dynamic %v{}",
+                        result.0, operand.0
                     )
                     .unwrap(),
                     Instruction::UnaryNumber {

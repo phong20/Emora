@@ -4,7 +4,7 @@ use ecmora_ir::{
     UnaryBoolOperator, UnaryNumberOperator, ValueId, ValueType,
 };
 use inkwell::{
-    AddressSpace, FloatPredicate, OptimizationLevel,
+    AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
     context::Context as LlvmContext,
     module::Module,
     targets::{CodeModel, FileType, InitializationConfig, RelocMode, Target, TargetMachine},
@@ -75,6 +75,11 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
     let f64_type = context.f64_type();
     let ptr_type = context.ptr_type(AddressSpace::default());
     let dynamic_type = context.struct_type(&[i8_type.into(), i64_type.into()], false);
+    let pow_f64 = module.add_function(
+        "llvm.pow.f64",
+        f64_type.fn_type(&[f64_type.into(), f64_type.into()], false),
+        None,
+    );
     let printf = module.add_function("printf", i32_type.fn_type(&[ptr_type.into()], true), None);
     let strcmp = module.add_function(
         "strcmp",
@@ -832,6 +837,15 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         };
                         values.insert(*result, boolean.into());
                     }
+                    Instruction::TypeOfDynamic { result, operand } => {
+                        let dynamic = values
+                            .get(operand)
+                            .copied()
+                            .context("thiếu dynamic typeof operand")?
+                            .into_struct_value();
+                        let text = build_dynamic_typeof(&builder, dynamic, *result, i8_type)?;
+                        values.insert(*result, text.into());
+                    }
                     Instruction::UnaryNumber {
                         result,
                         operator,
@@ -889,6 +903,9 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             BinaryNumberOperator::Remainder => {
                                 builder.build_float_rem(left, right, "rem")?
                             }
+                            BinaryNumberOperator::Exponential => build_ecmascript_exponentiation(
+                                &builder, pow_f64, left, right, f64_type,
+                            )?,
                             BinaryNumberOperator::ShiftLeft
                             | BinaryNumberOperator::ShiftRight
                             | BinaryNumberOperator::ShiftRightZeroFill
@@ -1503,6 +1520,140 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         .verify()
         .map_err(|error| anyhow!("LLVM module không hợp lệ: {error}"))?;
     Ok(module)
+}
+
+fn build_ecmascript_exponentiation<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    pow_f64: inkwell::values::FunctionValue<'ctx>,
+    base: FloatValue<'ctx>,
+    exponent: FloatValue<'ctx>,
+    f64_type: inkwell::types::FloatType<'ctx>,
+) -> Result<FloatValue<'ctx>> {
+    // LLVM's pow intrinsic covers the normal IEEE-754 path and lets LLVM
+    // optimize constant/integer exponents. ECMAScript differs for a few
+    // ordered special cases, which are corrected with pure SSA selects:
+    //
+    // - x ** +/-0 is 1, including NaN ** 0.
+    // - exponent NaN is NaN, including 1 ** NaN.
+    // - abs(base) == 1 with an infinite exponent is NaN.
+    let call = builder.build_call(pow_f64, &[base.into(), exponent.into()], "number.pow")?;
+    let raw = call
+        .try_as_basic_value()
+        .basic()
+        .context("llvm.pow.f64 không trả f64")?
+        .into_float_value();
+
+    let zero = f64_type.const_zero();
+    let one = f64_type.const_float(1.0);
+    let minus_one = f64_type.const_float(-1.0);
+    let positive_infinity = f64_type.const_float(f64::INFINITY);
+    let negative_infinity = f64_type.const_float(f64::NEG_INFINITY);
+    let nan = f64_type.const_float(f64::NAN);
+
+    let exponent_is_nan =
+        builder.build_float_compare(FloatPredicate::UNO, exponent, exponent, "pow.exponent.nan")?;
+    let exponent_is_zero =
+        builder.build_float_compare(FloatPredicate::OEQ, exponent, zero, "pow.exponent.zero")?;
+
+    let exponent_is_positive_infinity = builder.build_float_compare(
+        FloatPredicate::OEQ,
+        exponent,
+        positive_infinity,
+        "pow.exponent.pos_inf",
+    )?;
+    let exponent_is_negative_infinity = builder.build_float_compare(
+        FloatPredicate::OEQ,
+        exponent,
+        negative_infinity,
+        "pow.exponent.neg_inf",
+    )?;
+    let exponent_is_infinite = builder.build_or(
+        exponent_is_positive_infinity,
+        exponent_is_negative_infinity,
+        "pow.exponent.inf",
+    )?;
+
+    let base_is_one =
+        builder.build_float_compare(FloatPredicate::OEQ, base, one, "pow.base.one")?;
+    let base_is_minus_one =
+        builder.build_float_compare(FloatPredicate::OEQ, base, minus_one, "pow.base.minus_one")?;
+    let absolute_base_is_one =
+        builder.build_or(base_is_one, base_is_minus_one, "pow.base.abs_one")?;
+    let infinite_unit_power = builder.build_and(
+        exponent_is_infinite,
+        absolute_base_is_one,
+        "pow.unit_to_inf",
+    )?;
+    let must_be_nan = builder.build_or(exponent_is_nan, infinite_unit_power, "pow.must_nan")?;
+
+    let corrected_nan = builder
+        .build_select(must_be_nan, nan, raw, "pow.correct.nan")?
+        .into_float_value();
+
+    Ok(builder
+        .build_select(exponent_is_zero, one, corrected_nan, "pow.correct.zero")?
+        .into_float_value())
+}
+
+fn build_dynamic_typeof<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    dynamic: StructValue<'ctx>,
+    result: ValueId,
+    i8_type: inkwell::types::IntType<'ctx>,
+) -> Result<inkwell::values::PointerValue<'ctx>> {
+    let tag = builder
+        .build_extract_value(dynamic, 0, "typeof.dynamic.tag")?
+        .into_int_value();
+
+    let undefined = builder
+        .build_global_string_ptr("undefined", &format!(".typeof.undefined.{}", result.0))?
+        .as_pointer_value();
+    let object = builder
+        .build_global_string_ptr("object", &format!(".typeof.object.{}", result.0))?
+        .as_pointer_value();
+    let number = builder
+        .build_global_string_ptr("number", &format!(".typeof.number.{}", result.0))?
+        .as_pointer_value();
+    let boolean = builder
+        .build_global_string_ptr("boolean", &format!(".typeof.boolean.{}", result.0))?
+        .as_pointer_value();
+    let string = builder
+        .build_global_string_ptr("string", &format!(".typeof.string.{}", result.0))?
+        .as_pointer_value();
+    let function = builder
+        .build_global_string_ptr("function", &format!(".typeof.function.{}", result.0))?
+        .as_pointer_value();
+
+    // Unknown/internal tags conservatively produce "undefined". Every
+    // currently representable ECMAScript runtime tag is selected explicitly.
+    let mut text = undefined;
+    for (runtime_tag, candidate, suffix) in [
+        (1_u64, object, "null"),
+        (2_u64, number, "number"),
+        (3_u64, boolean, "boolean"),
+        (4_u64, string, "string"),
+        (5_u64, object, "object"),
+        (6_u64, function, "callable"),
+        (7_u64, object, "promise"),
+        (8_u64, object, "cell"),
+    ] {
+        let matches = builder.build_int_compare(
+            IntPredicate::EQ,
+            tag,
+            i8_type.const_int(runtime_tag, false),
+            &format!("typeof.is.{suffix}.{}", result.0),
+        )?;
+        text = builder
+            .build_select(
+                matches,
+                candidate,
+                text,
+                &format!("typeof.select.{suffix}.{}", result.0),
+            )?
+            .into_pointer_value();
+    }
+
+    Ok(text)
 }
 
 fn llvm_type<'ctx>(

@@ -1452,7 +1452,12 @@ impl Lowerer {
                         ValueType::Number => "number",
                         ValueType::String => "string",
                         ValueType::Dynamic => {
-                            return Ok(self.emit_value(Value::String("undefined".to_owned())));
+                            let result = self.new_value();
+                            self.emit(Instruction::TypeOfDynamic {
+                                result,
+                                operand: operand.0,
+                            });
+                            return Ok((result, ValueType::String, None));
                         }
                     };
                     return Ok(self.emit_value(Value::String(value.to_owned())));
