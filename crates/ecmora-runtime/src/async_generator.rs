@@ -217,6 +217,7 @@ fn expression_contains_yield(expression: &Expression) -> bool {
         ExpressionKind::Function(_)
         | ExpressionKind::String(_)
         | ExpressionKind::Number(_)
+        | ExpressionKind::BigInt(_)
         | ExpressionKind::Bool(_)
         | ExpressionKind::Null
         | ExpressionKind::This

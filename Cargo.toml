@@ -43,3 +43,5 @@ inkwell = {
 }
 
 ryu-js = "1.0.3"
+num-bigint = "0.4"
+num-traits = "0.2"

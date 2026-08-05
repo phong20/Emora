@@ -370,6 +370,7 @@ fn contains_await_expression(expression: &Expression) -> bool {
         ExpressionKind::Function(_) => false,
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)
+        | ExpressionKind::BigInt(_)
         | ExpressionKind::Bool(_)
         | ExpressionKind::Null
         | ExpressionKind::This

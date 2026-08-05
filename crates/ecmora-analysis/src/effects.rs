@@ -362,6 +362,7 @@ fn visit_expression(expression: &Expression, summary: &mut SemanticSummary) {
         }
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)
+        | ExpressionKind::BigInt(_)
         | ExpressionKind::Bool(_)
         | ExpressionKind::Null
         | ExpressionKind::This => {}

@@ -91,6 +91,11 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         bool_type.fn_type(&[i8_type.into(), i64_type.into()], false),
         None,
     );
+    let primitive_to_number = module.add_function(
+        "ecmora_primitive_to_number",
+        f64_type.fn_type(&[i8_type.into(), i64_type.into()], false),
+        None,
+    );
     let dynamic_print = module.add_function(
         "ecmora_print_dynamic",
         context
@@ -936,6 +941,41 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             }
                         };
                         values.insert(*result, boolean.into());
+                    }
+                    Instruction::ToNumber {
+                        result,
+                        operand,
+                        operand_type,
+                    } => {
+                        let value = values
+                            .get(operand)
+                            .copied()
+                            .context("thiếu ToNumber operand")?;
+                        let dynamic = to_dynamic(
+                            &builder,
+                            value,
+                            *operand_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                        )?;
+                        let tag = builder
+                            .build_extract_value(dynamic, 0, "to.number.tag")?
+                            .into_int_value();
+                        let payload = builder
+                            .build_extract_value(dynamic, 1, "to.number.payload")?
+                            .into_int_value();
+                        let call = builder.build_call(
+                            primitive_to_number,
+                            &[tag.into(), payload.into()],
+                            "primitive.to.number",
+                        )?;
+                        values.insert(
+                            *result,
+                            call.try_as_basic_value()
+                                .basic()
+                                .context("primitive ToNumber không trả f64")?,
+                        );
                     }
                     Instruction::TypeOfDynamic { result, operand } => {
                         let dynamic = values

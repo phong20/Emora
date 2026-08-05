@@ -168,6 +168,8 @@ pub struct Expression {
 pub enum ExpressionKind {
     String(String),
     Number(f64),
+    /// Canonical decimal digits without the source `n` suffix.
+    BigInt(String),
     Bool(bool),
     Null,
     /// ECMAScript receiver of the current callable invocation.

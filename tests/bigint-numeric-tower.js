@@ -1,0 +1,13 @@
+console.log(9007199254740993n + 7n);
+console.log(12n * 11n);
+console.log(2n ** 16n);
+console.log(17n / 5n);
+console.log(17n % 5n);
+console.log(-9n);
+console.log(~0n);
+console.log(1n << 8n);
+console.log(256n >> 4n);
+console.log(10n == 10);
+console.log(10n === 10);
+console.log(BigInt("0xff"));
+console.log(Number(9007199254740993n));

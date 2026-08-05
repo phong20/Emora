@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 mod abstract_value;
 mod async_normalize;
 pub mod effects;
+mod numeric;
 mod specialization;
 mod support;
 
@@ -184,6 +185,7 @@ struct Lowerer {
     thenable_resolution_stack: HashSet<ValueId>,
     last_callable: Option<ValueId>,
     used_bindings: Vec<HashSet<String>>,
+    abstract_values: HashMap<ValueId, AbstractValue>,
 }
 
 impl Lowerer {
@@ -194,6 +196,7 @@ impl Lowerer {
     }
 
     fn emit(&mut self, instruction: Instruction) {
+        self.record_abstract_instruction(&instruction);
         self.blocks[self.current].instructions.push(instruction);
     }
 
@@ -1188,22 +1191,19 @@ impl Lowerer {
     }
 
     fn expression_type_hint(&self, expression: &Expression) -> Option<ValueType> {
-        let mut abstract_bindings = HashMap::new();
-        let mut simple_bindings = HashMap::new();
-        for scope in &self.scopes {
-            for (name, binding) in scope {
-                if binding.initialized {
-                    abstract_bindings.insert(
-                        name.clone(),
-                        AbstractValue::from_type(binding.value_type, binding.value.clone()),
-                    );
-                    simple_bindings.insert(name.clone(), binding.value_type);
-                }
-            }
-        }
-        abstract_value::evaluate(expression, &abstract_bindings)
+        self.abstract_value_for_expression(expression)
             .single_type()
-            .or_else(|| infer_expression_type_hint(expression, &simple_bindings, None))
+            .or_else(|| {
+                let mut bindings = HashMap::new();
+                for scope in &self.scopes {
+                    for (name, binding) in scope {
+                        if binding.initialized {
+                            bindings.insert(name.clone(), binding.value_type);
+                        }
+                    }
+                }
+                infer_expression_type_hint(expression, &bindings, None)
+            })
     }
 
     fn take_direct_tail_call(&mut self, result: ValueId) -> Option<Terminator> {
@@ -1251,6 +1251,9 @@ impl Lowerer {
         match &expression.kind {
             ExpressionKind::String(value) => Ok(self.emit_value(Value::String(value.clone()))),
             ExpressionKind::Number(value) => Ok(self.emit_value(Value::Number(*value))),
+            ExpressionKind::BigInt(_) => {
+                bail!("BigInt uses compatibility arbitrary-precision numeric tower")
+            }
             ExpressionKind::Bool(value) => Ok(self.emit_value(Value::Bool(*value))),
             ExpressionKind::Null => Ok(self.emit_value(Value::Null)),
             ExpressionKind::This => bail!(
@@ -1498,6 +1501,12 @@ impl Lowerer {
                         }
                     }
                 }
+                if matches!(
+                    operator,
+                    UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitwiseNot
+                ) {
+                    return self.lower_number_unary(*operator, argument);
+                }
                 let operand = self.lower_expression(argument)?;
                 if *operator == UnaryOperator::Void {
                     let _ = operand;
@@ -1576,6 +1585,17 @@ impl Lowerer {
                         | BinaryOperator::BitwiseXor
                         | BinaryOperator::BitwiseAnd
                 );
+                if (numeric_context || *operator == BinaryOperator::Add)
+                    && self.can_lower_number_arithmetic(left, *operator, right)
+                {
+                    return self.lower_number_arithmetic(left, *operator, right);
+                }
+                if numeric_context
+                    && (self.abstract_value_for_expression(left).may_be_bigint()
+                        || self.abstract_value_for_expression(right).may_be_bigint())
+                {
+                    bail!("BigInt arithmetic uses compatibility numeric tower")
+                }
                 let right_hint = self.expression_type_hint(right);
                 let left_hint = if numeric_context
                     || (*operator == BinaryOperator::Add && right_hint == Some(ValueType::Number))
@@ -2191,10 +2211,24 @@ impl Lowerer {
                     (Some(left), Some(right)) => Some(ecmora_value::binary(binary, left, right)?),
                     _ => None,
                 };
-                if old.1 == ValueType::Number && rhs.1 == ValueType::Number {
+                let old_expression = Expression {
+                    kind: ExpressionKind::Global(name.to_owned()),
+                    span: expression.span,
+                };
+                let old_abstract = self.abstract_value_for_expression(&old_expression);
+                let rhs_abstract = self.abstract_value_for_expression(expression);
+                let number_safe = old_abstract.numeric_coercion_safe()
+                    && rhs_abstract.numeric_coercion_safe()
+                    && !old_abstract.may_be_bigint()
+                    && !rhs_abstract.may_be_bigint()
+                    && (!matches!(binary, SemBinary::Add)
+                        || (!old_abstract.may_be_string() && !rhs_abstract.may_be_string()));
+                if number_safe {
                     let native_operator = number_operator_for_sem(binary).ok_or_else(|| {
                         anyhow::anyhow!("compound operator động chưa được hỗ trợ")
                     })?;
+                    let old = self.coerce_to_number(&old_expression, old)?;
+                    let rhs = self.coerce_to_number(expression, rhs)?;
                     let result = self.new_value();
                     self.emit(Instruction::BinaryNumber {
                         result,
@@ -2204,9 +2238,14 @@ impl Lowerer {
                     });
                     (result, ValueType::Number, known)
                 } else if let Some(value) = known {
+                    if matches!(&value, Value::BigInt(_)) {
+                        bail!("BigInt compound assignment uses compatibility runtime")
+                    }
                     self.emit_value(value)
                 } else {
-                    bail!("compound coercion động chưa được hỗ trợ")
+                    bail!(
+                        "compound coercion may observe String/Object/BigInt;                          use compatibility runtime"
+                    )
                 }
             }
         };
@@ -2342,38 +2381,50 @@ impl Lowerer {
             }
         }
         if let ExpressionKind::Global(name) = &callee.kind {
-            if matches!(name.as_str(), "Number" | "String" | "Boolean") && !self.has_binding(name) {
+            if matches!(name.as_str(), "Number" | "String" | "Boolean" | "BigInt")
+                && !self.has_binding(name)
+            {
                 if arguments.len() > 1 {
                     bail!("{name}(...) chỉ nhận tối đa một argument");
                 }
-                let value = match name.as_str() {
-                    "Number" => match arguments.first() {
-                        Some(argument) => Value::Number(ecmora_value::to_number(
-                            self.lower_expression(argument)?.2.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("Number(dynamic) chưa được hỗ trợ")
-                            })?,
-                        )),
-                        None => Value::Number(0.0),
-                    },
-                    "String" => match arguments.first() {
-                        Some(argument) => Value::String(ecmora_value::to_string(
-                            self.lower_expression(argument)?.2.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("String(dynamic) chưa được hỗ trợ")
-                            })?,
-                        )),
-                        None => Value::String(String::new()),
-                    },
-                    "Boolean" => match arguments.first() {
-                        Some(argument) => Value::Bool(ecmora_value::to_boolean(
-                            self.lower_expression(argument)?.2.as_ref().ok_or_else(|| {
-                                anyhow::anyhow!("Boolean(dynamic) chưa được hỗ trợ")
-                            })?,
-                        )),
-                        None => Value::Bool(false),
-                    },
+                match name.as_str() {
+                    "Number" => {
+                        return match arguments.first() {
+                            Some(argument) => {
+                                let value = self.lower_expression(argument)?;
+                                self.coerce_to_number(argument, value)
+                            }
+                            None => Ok(self.emit_value(Value::Number(0.0))),
+                        };
+                    }
+                    "Boolean" => {
+                        let value = match arguments.first() {
+                            Some(argument) => {
+                                let value = self.lower_expression(argument)?;
+                                self.to_boolean(value)?
+                            }
+                            None => self.emit_value(Value::Bool(false)).0,
+                        };
+                        return Ok((value, ValueType::Bool, None));
+                    }
+                    "String" => {
+                        let value = match arguments.first() {
+                            Some(argument) => {
+                                let value = self.lower_expression(argument)?;
+                                let known = value.2.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!("String(dynamic) may observe ToPrimitive")
+                                })?;
+                                Value::String(ecmora_value::to_string(known))
+                            }
+                            None => Value::String(String::new()),
+                        };
+                        return Ok(self.emit_value(value));
+                    }
+                    "BigInt" => {
+                        bail!("BigInt constructor uses compatibility numeric tower")
+                    }
                     _ => unreachable!(),
-                };
-                return Ok(self.emit_value(value));
+                }
             }
         }
         if let ExpressionKind::Member { object, property } = &callee.kind {
@@ -3854,6 +3905,9 @@ impl Lowerer {
             Value::Undefined => Instruction::ConstUndefined { result },
             Value::Null => Instruction::ConstNull { result },
             Value::Number(value) => Instruction::ConstNumber { result, value },
+            Value::BigInt(_) => {
+                panic!("BigInt constant must route to compatibility backend")
+            }
             Value::Bool(value) => Instruction::ConstBool { result, value },
             Value::String(value) => Instruction::ConstString { result, value },
             Value::Object(_) => panic!("object constant chưa có native representation"),

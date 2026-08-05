@@ -564,6 +564,7 @@ fn rename_expression(
         }
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)
+        | ExpressionKind::BigInt(_)
         | ExpressionKind::Bool(_)
         | ExpressionKind::Null
         | ExpressionKind::This => {}

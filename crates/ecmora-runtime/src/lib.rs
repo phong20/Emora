@@ -68,6 +68,7 @@ enum RuntimeValue {
     Console,
     ConsoleLog,
     NumberConstructor,
+    BigIntConstructor,
     StringConstructor,
     BooleanConstructor,
     ObjectConstructor,
@@ -764,6 +765,188 @@ impl Machine {
         self.settle(request.capability, PromiseState::Fulfilled(result));
         self.async_generators[id as usize] = Some(generator);
         Ok(())
+    }
+
+    fn is_primitive_value(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Undefined
+                | Value::Null
+                | Value::Number(_)
+                | Value::BigInt(_)
+                | Value::Bool(_)
+                | Value::String(_)
+        )
+    }
+
+    fn call_coercion_method(
+        &mut self,
+        receiver: &Value,
+        method: Value,
+        arguments: Vec<Value>,
+        strict: bool,
+    ) -> Result<Option<Value>> {
+        let Value::Function(method) = method else {
+            return Ok(None);
+        };
+        match self.call_function_with_this(method, receiver.clone(), arguments, strict)? {
+            CallOutcome::Value(value) if Self::is_primitive_value(&value) => Ok(Some(value)),
+            CallOutcome::Value(_) => Ok(None),
+            CallOutcome::Throw(reason) => {
+                bail!(
+                    "primitive coercion threw {}",
+                    ecmora_value::to_string(&reason)
+                )
+            }
+        }
+    }
+
+    fn to_primitive_value(&mut self, value: Value, hint: &str, strict: bool) -> Result<Value> {
+        if Self::is_primitive_value(&value) {
+            return Ok(value);
+        }
+
+        let exotic = self.get_property_value(&value, "@@toPrimitive", value.clone(), strict)?;
+        if !matches!(exotic, Value::Undefined) {
+            let Some(result) = self.call_coercion_method(
+                &value,
+                exotic,
+                vec![Value::String(hint.to_owned())],
+                strict,
+            )?
+            else {
+                bail!("@@toPrimitive phải callable và trả primitive")
+            };
+            return Ok(result);
+        }
+
+        let order = if hint == "string" {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        let mut attempted_callable = false;
+        for method in order {
+            let method_value = self.get_property_value(&value, method, value.clone(), strict)?;
+            attempted_callable |= matches!(&method_value, Value::Function(_));
+            if let Some(result) =
+                self.call_coercion_method(&value, method_value, Vec::new(), strict)?
+            {
+                return Ok(result);
+            }
+        }
+        if attempted_callable {
+            bail!("không thể convert object sang primitive")
+        }
+
+        if matches!(&value, Value::Array(_)) {
+            return Ok(Value::String(ecmora_value::to_string(&value)));
+        }
+        if matches!(&value, Value::Object(_)) {
+            return Ok(Value::String("[object Object]".to_owned()));
+        }
+        if matches!(&value, Value::Function(_)) {
+            return Ok(Value::String("function () { [native code] }".to_owned()));
+        }
+        if matches!(&value, Value::Promise(_)) {
+            return Ok(Value::String("[object Promise]".to_owned()));
+        }
+        Ok(value)
+    }
+
+    fn to_number_value(&mut self, value: Value, strict: bool) -> Result<f64> {
+        let primitive = self.to_primitive_value(value, "number", strict)?;
+        ecmora_value::to_number_checked(&primitive)
+    }
+
+    fn explicit_number_value(&mut self, value: Value, strict: bool) -> Result<f64> {
+        let primitive = self.to_primitive_value(value, "number", strict)?;
+        ecmora_value::explicit_number(&primitive)
+    }
+
+    fn to_numeric_value(&mut self, value: Value, strict: bool) -> Result<Value> {
+        let primitive = self.to_primitive_value(value, "number", strict)?;
+        Ok(match ecmora_value::to_numeric_primitive(&primitive)? {
+            ecmora_value::Numeric::Number(value) => Value::Number(value),
+            ecmora_value::Numeric::BigInt(value) => Value::BigInt(value),
+        })
+    }
+
+    fn to_string_value(&mut self, value: Value, strict: bool) -> Result<String> {
+        let primitive = self.to_primitive_value(value, "string", strict)?;
+        Ok(ecmora_value::to_string(&primitive))
+    }
+
+    fn bigint_value(&mut self, value: Value, strict: bool) -> Result<Value> {
+        let primitive = self.to_primitive_value(value, "number", strict)?;
+        Ok(Value::BigInt(ecmora_value::bigint_from_primitive(
+            &primitive,
+        )?))
+    }
+
+    fn unary_value(
+        &mut self,
+        operator: UnaryOperator,
+        value: Value,
+        strict: bool,
+    ) -> Result<Value> {
+        if operator == UnaryOperator::Not {
+            return Ok(Value::Bool(!ecmora_value::to_boolean(&value)));
+        }
+        let numeric = self.to_numeric_value(value, strict)?;
+        ecmora_value::unary_checked(to_sem_unary(operator), numeric)
+    }
+
+    fn binary_value(
+        &mut self,
+        operator: BinaryOperator,
+        left: Value,
+        right: Value,
+        strict: bool,
+    ) -> Result<Value> {
+        use BinaryOperator as Op;
+
+        if matches!(
+            operator,
+            Op::StrictEqual | Op::StrictNotEqual | Op::In | Op::InstanceOf
+        ) {
+            return ecmora_value::binary(to_sem_binary(operator), left, right);
+        }
+
+        if matches!(operator, Op::Equal | Op::NotEqual) {
+            let left_object = !Self::is_primitive_value(&left);
+            let right_object = !Self::is_primitive_value(&right);
+            let left = if left_object && !right_object {
+                self.to_primitive_value(left, "default", strict)?
+            } else {
+                left
+            };
+            let right = if right_object && !left_object {
+                self.to_primitive_value(right, "default", strict)?
+            } else {
+                right
+            };
+            return ecmora_value::binary(to_sem_binary(operator), left, right);
+        }
+
+        if matches!(
+            operator,
+            Op::LessThan | Op::LessEqual | Op::GreaterThan | Op::GreaterEqual
+        ) {
+            let left = self.to_primitive_value(left, "number", strict)?;
+            let right = self.to_primitive_value(right, "number", strict)?;
+            return ecmora_value::binary(to_sem_binary(operator), left, right);
+        }
+
+        if operator == Op::Add {
+            let left = self.to_primitive_value(left, "default", strict)?;
+            let right = self.to_primitive_value(right, "default", strict)?;
+            return ecmora_value::binary(to_sem_binary(operator), left, right);
+        }
+
+        let left = self.to_numeric_value(left, strict)?;
+        let right = self.to_numeric_value(right, strict)?;
+        ecmora_value::binary(to_sem_binary(operator), left, right)
     }
 
     fn proxy_trap(&mut self, handler: &Value, name: &str, strict: bool) -> Result<Option<u64>> {
@@ -1994,6 +2177,9 @@ fn evaluate_expression(
     match &expression.kind {
         ExpressionKind::String(value) => Ok(Value::String(value.clone())),
         ExpressionKind::Number(value) => Ok(Value::Number(*value)),
+        ExpressionKind::BigInt(value) => {
+            Ok(Value::BigInt(ecmora_value::parse_bigint_literal(value)?))
+        }
         ExpressionKind::Bool(value) => Ok(Value::Bool(*value)),
         ExpressionKind::Null => Ok(Value::Null),
         ExpressionKind::This => {
@@ -2145,6 +2331,7 @@ fn evaluate_expression(
                     Value::Null => "object",
                     Value::Bool(_) => "boolean",
                     Value::Number(_) => "number",
+                    Value::BigInt(_) => "bigint",
                     Value::String(_) => "string",
                     Value::Object(_) if class_constructor => "function",
                     Value::Object(_) | Value::Array(_) | Value::Promise(_) => "object",
@@ -2170,10 +2357,10 @@ fn evaluate_expression(
                     Ok(Value::Bool(true))
                 }
             },
-            _ => Ok(ecmora_value::unary(
-                to_sem_unary(*operator),
-                evaluate_expression(argument, scopes, strict, machine)?,
-            )),
+            _ => {
+                let value = evaluate_expression(argument, scopes, strict, machine)?;
+                machine.unary_value(*operator, value, strict)
+            }
         },
         ExpressionKind::Binary {
             left,
@@ -2251,11 +2438,9 @@ fn evaluate_expression(
                     }
                 }
             }
-            Ok(ecmora_value::binary(
-                to_sem_binary(*operator),
-                evaluate_expression(left, scopes, strict, machine)?,
-                evaluate_expression(right, scopes, strict, machine)?,
-            )?)
+            let left = evaluate_expression(left, scopes, strict, machine)?;
+            let right = evaluate_expression(right, scopes, strict, machine)?;
+            machine.binary_value(*operator, left, right, strict)
         }
         ExpressionKind::Logical {
             left,
@@ -2278,14 +2463,19 @@ fn evaluate_expression(
             prefix,
         } => {
             let old = read_target(target, scopes, strict, machine)?;
-            let delta = Value::Number(1.0);
+            let numeric = machine.to_numeric_value(old.clone(), strict)?;
+            let delta = if matches!(&numeric, Value::BigInt(_)) {
+                Value::BigInt(ecmora_value::parse_bigint_literal("1")?)
+            } else {
+                Value::Number(1.0)
+            };
             let new = ecmora_value::binary(
                 if *operator == UpdateOperator::Increment {
                     SemBinary::Add
                 } else {
                     SemBinary::Subtract
                 },
-                Value::Number(ecmora_value::to_number(&old)),
+                numeric,
                 delta,
             )?;
             write_target(target, new.clone(), scopes, strict, machine)?;
@@ -2374,23 +2564,25 @@ fn evaluate_expression(
                     if arguments.len() > 1 {
                         bail!("Number nhận tối đa một argument")
                     }
-                    Ok(Value::Number(
-                        arguments
-                            .first()
-                            .map(ecmora_value::to_number)
-                            .unwrap_or(0.0),
-                    ))
+                    Ok(Value::Number(match arguments.into_iter().next() {
+                        Some(value) => machine.explicit_number_value(value, strict)?,
+                        None => 0.0,
+                    }))
+                }
+                RuntimeValue::BigIntConstructor => {
+                    if arguments.len() != 1 {
+                        bail!("BigInt cần đúng một argument")
+                    }
+                    machine.bigint_value(arguments.into_iter().next().unwrap(), strict)
                 }
                 RuntimeValue::StringConstructor => {
                     if arguments.len() > 1 {
                         bail!("String nhận tối đa một argument")
                     }
-                    Ok(Value::String(
-                        arguments
-                            .first()
-                            .map(ecmora_value::to_string)
-                            .unwrap_or_default(),
-                    ))
+                    Ok(Value::String(match arguments.into_iter().next() {
+                        Some(value) => machine.to_string_value(value, strict)?,
+                        None => String::new(),
+                    }))
                 }
                 RuntimeValue::Function(id) => machine.call_as_expression(id, arguments, strict),
                 RuntimeValue::FunctionWithThis(id, receiver) => {
@@ -2516,9 +2708,10 @@ fn property_key(
 ) -> Result<String> {
     match property {
         MemberProperty::Static(key) => Ok(key.clone()),
-        MemberProperty::Computed(expression) => Ok(ecmora_value::to_string(&evaluate_expression(
-            expression, scopes, strict, machine,
-        )?)),
+        MemberProperty::Computed(expression) => {
+            let value = evaluate_expression(expression, scopes, strict, machine)?;
+            machine.to_string_value(value, strict)
+        }
     }
 }
 
@@ -2533,6 +2726,7 @@ fn evaluate_runtime_expression(
             return Ok(match name.as_str() {
                 "console" => RuntimeValue::Console,
                 "Number" => RuntimeValue::NumberConstructor,
+                "BigInt" => RuntimeValue::BigIntConstructor,
                 "String" => RuntimeValue::StringConstructor,
                 "Boolean" => RuntimeValue::BooleanConstructor,
                 "Object" => RuntimeValue::ObjectConstructor,
@@ -2680,7 +2874,7 @@ fn evaluate_assignment(
     }
     let rhs = evaluate_expression(expression, scopes, strict, machine)?;
     let value = match assignment_binary(operator) {
-        Some(operator) => ecmora_value::binary(operator, old, rhs)?,
+        Some(operator) => machine.binary_value(from_sem_binary(operator), old, rhs, strict)?,
         None => rhs,
     };
     write_target(target, value, scopes, strict, machine)
@@ -2829,6 +3023,33 @@ fn to_sem_binary(operator: BinaryOperator) -> SemBinary {
         BinaryOperator::InstanceOf => SemBinary::InstanceOf,
     }
 }
+fn from_sem_binary(operator: SemBinary) -> BinaryOperator {
+    match operator {
+        SemBinary::Add => BinaryOperator::Add,
+        SemBinary::Subtract => BinaryOperator::Subtract,
+        SemBinary::Multiply => BinaryOperator::Multiply,
+        SemBinary::Divide => BinaryOperator::Divide,
+        SemBinary::Remainder => BinaryOperator::Remainder,
+        SemBinary::Exponential => BinaryOperator::Exponential,
+        SemBinary::Equal => BinaryOperator::Equal,
+        SemBinary::NotEqual => BinaryOperator::NotEqual,
+        SemBinary::StrictEqual => BinaryOperator::StrictEqual,
+        SemBinary::StrictNotEqual => BinaryOperator::StrictNotEqual,
+        SemBinary::LessThan => BinaryOperator::LessThan,
+        SemBinary::LessEqual => BinaryOperator::LessEqual,
+        SemBinary::GreaterThan => BinaryOperator::GreaterThan,
+        SemBinary::GreaterEqual => BinaryOperator::GreaterEqual,
+        SemBinary::ShiftLeft => BinaryOperator::ShiftLeft,
+        SemBinary::ShiftRight => BinaryOperator::ShiftRight,
+        SemBinary::ShiftRightZeroFill => BinaryOperator::ShiftRightZeroFill,
+        SemBinary::BitwiseOr => BinaryOperator::BitwiseOr,
+        SemBinary::BitwiseXor => BinaryOperator::BitwiseXor,
+        SemBinary::BitwiseAnd => BinaryOperator::BitwiseAnd,
+        SemBinary::In => BinaryOperator::In,
+        SemBinary::InstanceOf => BinaryOperator::InstanceOf,
+    }
+}
+
 fn to_sem_logical(operator: LogicalOperator) -> ecmora_value::LogicalOperator {
     match operator {
         LogicalOperator::Or => ecmora_value::LogicalOperator::Or,

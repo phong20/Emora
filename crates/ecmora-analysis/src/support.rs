@@ -327,6 +327,7 @@ impl FreeVariableCollector {
 
             ExpressionKind::String(_)
             | ExpressionKind::Number(_)
+            | ExpressionKind::BigInt(_)
             | ExpressionKind::Bool(_)
             | ExpressionKind::Null
             | ExpressionKind::This => {}
@@ -718,6 +719,7 @@ pub(super) fn infer_expression_type_hint(
     match &expression.kind {
         ExpressionKind::String(_) => Some(ValueType::String),
         ExpressionKind::Number(_) => Some(ValueType::Number),
+        ExpressionKind::BigInt(_) => None,
         ExpressionKind::Bool(_) => Some(ValueType::Bool),
         ExpressionKind::Null => Some(ValueType::Null),
         // `this` depends on the call receiver and therefore has no stable
@@ -901,6 +903,7 @@ pub(super) fn type_of(value: &Value) -> ValueType {
         Value::Undefined => ValueType::Undefined,
         Value::Null => ValueType::Null,
         Value::Number(_) => ValueType::Number,
+        Value::BigInt(_) => ValueType::Dynamic,
         Value::Bool(_) => ValueType::Bool,
         Value::String(_) => ValueType::String,
         Value::Object(_) => ValueType::Object,
@@ -1097,6 +1100,7 @@ pub(super) fn collect_used_names(statements: &[Statement]) -> HashSet<String> {
             ExpressionKind::Function(_) => {}
             ExpressionKind::String(_)
             | ExpressionKind::Number(_)
+            | ExpressionKind::BigInt(_)
             | ExpressionKind::Bool(_)
             | ExpressionKind::Null
             | ExpressionKind::This => {}
@@ -1253,6 +1257,7 @@ pub(super) fn is_pure_expression_known(
     match &expression.kind {
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)
+        | ExpressionKind::BigInt(_)
         | ExpressionKind::Bool(_)
         | ExpressionKind::Null
         | ExpressionKind::This

@@ -173,6 +173,13 @@ pub enum Instruction {
         operand: ValueId,
         operand_type: ValueType,
     },
+    /// ECMAScript ToNumber after analysis proves the dynamic value cannot be
+    /// Object, Proxy, Callable, Promise, Cell or BigInt.
+    ToNumber {
+        result: ValueId,
+        operand: ValueId,
+        operand_type: ValueType,
+    },
     /// ECMAScript `typeof` for a value whose concrete tag is only known at
     /// runtime. Statically typed operands are folded in analysis instead.
     TypeOfDynamic {
@@ -456,6 +463,22 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                             bail!("unknown SSA value %v{}", operand.0)
                         }
                     }
+                    Instruction::ToNumber {
+                        operand,
+                        operand_type,
+                        ..
+                    } => {
+                        require_type(&types, *operand, *operand_type)?;
+                        if matches!(
+                            operand_type,
+                            ValueType::Object
+                                | ValueType::Callable
+                                | ValueType::Cell
+                                | ValueType::Promise
+                        ) {
+                            bail!("native ToNumber cannot observe object coercion")
+                        }
+                    }
                     Instruction::TypeOfDynamic { operand, .. } => {
                         require_type(&types, *operand, ValueType::Dynamic)?
                     }
@@ -640,6 +663,7 @@ fn declared_result(instruction: &Instruction) -> Option<(ValueId, ValueType)> {
         Instruction::ObjectSetPrototype { .. } => return None,
         Instruction::ObjectDefineAccessor { .. } => return None,
         Instruction::ToBoolean { result, .. } => (*result, ValueType::Bool),
+        Instruction::ToNumber { result, .. } => (*result, ValueType::Number),
         Instruction::TypeOfDynamic { result, .. } => (*result, ValueType::String),
         Instruction::UnaryNumber { result, .. } => (*result, ValueType::Number),
         Instruction::UnaryBool { result, .. } => (*result, ValueType::Bool),
@@ -974,6 +998,16 @@ pub fn dump_program(program: &Program) -> String {
                     } => writeln!(
                         &mut output,
                         "    %v{} = to_boolean {:?} %v{}",
+                        result.0, operand_type, operand.0
+                    )
+                    .unwrap(),
+                    Instruction::ToNumber {
+                        result,
+                        operand,
+                        operand_type,
+                    } => writeln!(
+                        &mut output,
+                        "    %v{} = to_number {:?} %v{}",
                         result.0, operand_type, operand.0
                     )
                     .unwrap(),

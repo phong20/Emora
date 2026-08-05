@@ -993,6 +993,10 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
         Expression::NumericLiteral(literal) => {
             (ExpressionKind::Number(literal.value), literal.span)
         }
+        Expression::BigIntLiteral(literal) => (
+            ExpressionKind::BigInt(literal.value.as_str().to_owned()),
+            literal.span,
+        ),
         Expression::BooleanLiteral(literal) => (ExpressionKind::Bool(literal.value), literal.span),
         Expression::NullLiteral(literal) => (ExpressionKind::Null, literal.span),
         Expression::ThisExpression(expression) => (ExpressionKind::This, expression.span),

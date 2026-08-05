@@ -20,7 +20,10 @@ impl AbstractValue {
     const OBJECT: u16 = 1 << 5;
     const CALLABLE: u16 = 1 << 6;
     const PROMISE: u16 = 1 << 7;
-    const ALL: u16 = (1 << 8) - 1;
+    const BIGINT: u16 = 1 << 8;
+    const ALL: u16 = (1 << 9) - 1;
+    const NUMBER_COERCIBLE_PRIMITIVES: u16 =
+        Self::UNDEFINED | Self::NULL | Self::BOOL | Self::NUMBER | Self::STRING;
 
     pub(super) fn dynamic() -> Self {
         Self {
@@ -44,6 +47,36 @@ impl AbstractValue {
         Self { mask, constant }
     }
 
+    pub(super) fn from_value(value: Value) -> Self {
+        let mask = match &value {
+            Value::Undefined => Self::UNDEFINED,
+            Value::Null => Self::NULL,
+            Value::Bool(_) => Self::BOOL,
+            Value::Number(_) => Self::NUMBER,
+            Value::BigInt(_) => Self::BIGINT,
+            Value::String(_) => Self::STRING,
+            Value::Object(_) | Value::Array(_) => Self::OBJECT,
+            Value::Function(_) => Self::CALLABLE,
+            Value::Promise(_) => Self::PROMISE,
+        };
+        Self {
+            mask,
+            constant: Some(value),
+        }
+    }
+
+    pub(super) fn join(self, other: Self) -> Self {
+        let constant = if self.constant == other.constant {
+            self.constant
+        } else {
+            None
+        };
+        Self {
+            mask: self.mask | other.mask,
+            constant,
+        }
+    }
+
     pub(super) fn single_type(&self) -> Option<ValueType> {
         Some(match self.mask {
             Self::UNDEFINED => ValueType::Undefined,
@@ -54,34 +87,25 @@ impl AbstractValue {
             Self::OBJECT => ValueType::Object,
             Self::CALLABLE => ValueType::Callable,
             Self::PROMISE => ValueType::Promise,
+            Self::BIGINT => return None,
             _ => return None,
         })
     }
 
-    fn from_value(value: Value) -> Self {
-        let value_type = match &value {
-            Value::Undefined => ValueType::Undefined,
-            Value::Null => ValueType::Null,
-            Value::Bool(_) => ValueType::Bool,
-            Value::Number(_) => ValueType::Number,
-            Value::String(_) => ValueType::String,
-            Value::Object(_) | Value::Array(_) => ValueType::Object,
-            Value::Function(_) => ValueType::Callable,
-            Value::Promise(_) => ValueType::Promise,
-        };
-        Self::from_type(value_type, Some(value))
+    pub(super) fn constant(&self) -> Option<&Value> {
+        self.constant.as_ref()
     }
 
-    fn join(self, other: Self) -> Self {
-        let constant = if self.constant == other.constant {
-            self.constant
-        } else {
-            None
-        };
-        Self {
-            mask: self.mask | other.mask,
-            constant,
-        }
+    pub(super) fn numeric_coercion_safe(&self) -> bool {
+        self.mask != 0 && self.mask & !Self::NUMBER_COERCIBLE_PRIMITIVES == 0
+    }
+
+    pub(super) fn may_be_string(&self) -> bool {
+        self.mask & Self::STRING != 0
+    }
+
+    pub(super) fn may_be_bigint(&self) -> bool {
+        self.mask & Self::BIGINT != 0
     }
 
     fn truthiness(&self) -> Option<bool> {
@@ -96,6 +120,13 @@ pub(super) fn evaluate(
     match &expression.kind {
         ExpressionKind::String(value) => AbstractValue::from_value(Value::String(value.clone())),
         ExpressionKind::Number(value) => AbstractValue::from_value(Value::Number(*value)),
+        ExpressionKind::BigInt(value) => match ecmora_value::parse_bigint_literal(value) {
+            Ok(value) => AbstractValue::from_value(Value::BigInt(value)),
+            Err(_) => AbstractValue {
+                mask: AbstractValue::BIGINT,
+                constant: None,
+            },
+        },
         ExpressionKind::Bool(value) => AbstractValue::from_value(Value::Bool(*value)),
         ExpressionKind::Null => AbstractValue::from_value(Value::Null),
         ExpressionKind::Global(name) => {
@@ -124,12 +155,12 @@ pub(super) fn evaluate(
         },
         ExpressionKind::Unary { operator, argument } => {
             let argument = evaluate(argument, bindings);
-            if let Some(value) = argument.constant {
+            if let Some(value) = argument.constant.clone() {
                 let folded = match operator {
                     UnaryOperator::Plus
                     | UnaryOperator::Minus
                     | UnaryOperator::Not
-                    | UnaryOperator::BitwiseNot => ecmora_value::unary(
+                    | UnaryOperator::BitwiseNot => ecmora_value::unary_checked(
                         match operator {
                             UnaryOperator::Plus => ecmora_value::UnaryOperator::Plus,
                             UnaryOperator::Minus => ecmora_value::UnaryOperator::Minus,
@@ -138,35 +169,44 @@ pub(super) fn evaluate(
                             _ => unreachable!(),
                         },
                         value,
-                    ),
-                    UnaryOperator::Typeof => Value::String(
+                    )
+                    .ok(),
+                    UnaryOperator::Typeof => Some(Value::String(
                         match value {
                             Value::Undefined => "undefined",
                             Value::Null => "object",
                             Value::Bool(_) => "boolean",
                             Value::Number(_) => "number",
+                            Value::BigInt(_) => "bigint",
                             Value::String(_) => "string",
                             Value::Function(_) => "function",
                             Value::Object(_) | Value::Array(_) | Value::Promise(_) => "object",
                         }
                         .to_owned(),
-                    ),
-                    UnaryOperator::Void => Value::Undefined,
-                    UnaryOperator::Delete => Value::Bool(true),
+                    )),
+                    UnaryOperator::Void => Some(Value::Undefined),
+                    UnaryOperator::Delete => Some(Value::Bool(true)),
                 };
-                return AbstractValue::from_value(folded);
+                if let Some(folded) = folded {
+                    return AbstractValue::from_value(folded);
+                }
             }
-            AbstractValue::from_type(
-                match operator {
-                    UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitwiseNot => {
-                        ValueType::Number
+            match operator {
+                UnaryOperator::Minus | UnaryOperator::BitwiseNot if argument.may_be_bigint() => {
+                    AbstractValue {
+                        mask: AbstractValue::NUMBER | AbstractValue::BIGINT,
+                        constant: None,
                     }
-                    UnaryOperator::Not | UnaryOperator::Delete => ValueType::Bool,
-                    UnaryOperator::Typeof => ValueType::String,
-                    UnaryOperator::Void => ValueType::Undefined,
-                },
-                None,
-            )
+                }
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitwiseNot => {
+                    AbstractValue::from_type(ValueType::Number, None)
+                }
+                UnaryOperator::Not | UnaryOperator::Delete => {
+                    AbstractValue::from_type(ValueType::Bool, None)
+                }
+                UnaryOperator::Typeof => AbstractValue::from_type(ValueType::String, None),
+                UnaryOperator::Void => AbstractValue::from_type(ValueType::Undefined, None),
+            }
         }
         ExpressionKind::Binary {
             left,
@@ -180,9 +220,9 @@ pub(super) fn evaluate(
                     return AbstractValue::from_value(value);
                 }
             }
-            AbstractValue::from_type(
-                match operator {
-                    BinaryOperator::Equal
+            if matches!(
+                operator,
+                BinaryOperator::Equal
                     | BinaryOperator::NotEqual
                     | BinaryOperator::StrictEqual
                     | BinaryOperator::StrictNotEqual
@@ -191,23 +231,23 @@ pub(super) fn evaluate(
                     | BinaryOperator::GreaterThan
                     | BinaryOperator::GreaterEqual
                     | BinaryOperator::In
-                    | BinaryOperator::InstanceOf => ValueType::Bool,
-                    BinaryOperator::Add => {
-                        if left.mask == AbstractValue::STRING || right.mask == AbstractValue::STRING
-                        {
-                            ValueType::String
-                        } else if left.mask == AbstractValue::NUMBER
-                            && right.mask == AbstractValue::NUMBER
-                        {
-                            ValueType::Number
-                        } else {
-                            ValueType::Dynamic
-                        }
-                    }
-                    _ => ValueType::Number,
-                },
-                None,
-            )
+                    | BinaryOperator::InstanceOf
+            ) {
+                return AbstractValue::from_type(ValueType::Bool, None);
+            }
+            if *operator == BinaryOperator::Add && (left.may_be_string() || right.may_be_string()) {
+                return AbstractValue {
+                    mask: AbstractValue::STRING | AbstractValue::NUMBER | AbstractValue::BIGINT,
+                    constant: None,
+                };
+            }
+            if left.may_be_bigint() || right.may_be_bigint() {
+                return AbstractValue {
+                    mask: AbstractValue::NUMBER | AbstractValue::BIGINT,
+                    constant: None,
+                };
+            }
+            AbstractValue::from_type(ValueType::Number, None)
         }
         ExpressionKind::Logical {
             left,
@@ -238,17 +278,21 @@ pub(super) fn evaluate(
             }
         }
         ExpressionKind::Assignment { value, .. } => evaluate(value, bindings),
-        ExpressionKind::Update { .. } => AbstractValue::from_type(ValueType::Number, None),
+        ExpressionKind::Update { target: _, .. } => AbstractValue {
+            mask: AbstractValue::NUMBER | AbstractValue::BIGINT,
+            constant: None,
+        },
         ExpressionKind::Call { callee, .. } => match &callee.kind {
-            ExpressionKind::Global(name) => AbstractValue::from_type(
-                match name.as_str() {
-                    "Number" => ValueType::Number,
-                    "String" => ValueType::String,
-                    "Boolean" => ValueType::Bool,
-                    _ => ValueType::Dynamic,
+            ExpressionKind::Global(name) => match name.as_str() {
+                "Number" => AbstractValue::from_type(ValueType::Number, None),
+                "String" => AbstractValue::from_type(ValueType::String, None),
+                "Boolean" => AbstractValue::from_type(ValueType::Bool, None),
+                "BigInt" => AbstractValue {
+                    mask: AbstractValue::BIGINT,
+                    constant: None,
                 },
-                None,
-            ),
+                _ => AbstractValue::dynamic(),
+            },
             ExpressionKind::Member {
                 object,
                 property: MemberProperty::Static(method),

@@ -1,4 +1,6 @@
 use anyhow::Result;
+use num_bigint::{BigInt as NumBigInt, Sign};
+use num_traits::{FromPrimitive, ToPrimitive};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 mod object_model;
@@ -9,6 +11,7 @@ pub enum Value {
     Undefined,
     Null,
     Number(f64),
+    BigInt(NumBigInt),
     Bool(bool),
     String(String),
     Object(ObjectRef),
@@ -423,23 +426,29 @@ pub fn to_boolean(value: &Value) -> bool {
         Value::Undefined | Value::Null => false,
         Value::Bool(value) => *value,
         Value::Number(value) => *value != 0.0 && !value.is_nan(),
+        Value::BigInt(value) => value != &NumBigInt::from(0_u8),
         Value::String(value) => !value.is_empty(),
         Value::Object(_) | Value::Array(_) | Value::Function(_) | Value::Promise(_) => true,
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Numeric {
+    Number(f64),
+    BigInt(NumBigInt),
+}
+
 pub fn to_number(value: &Value) -> f64 {
-    match value {
+    to_number_checked(value).unwrap_or(f64::NAN)
+}
+
+pub fn to_number_checked(value: &Value) -> Result<f64> {
+    Ok(match value {
         Value::Undefined => f64::NAN,
         Value::Null => 0.0,
         Value::Number(value) => *value,
-        Value::Bool(value) => {
-            if *value {
-                1.0
-            } else {
-                0.0
-            }
-        }
+        Value::BigInt(_) => anyhow::bail!("không thể implicit convert BigInt sang Number"),
+        Value::Bool(value) => u8::from(*value) as f64,
         Value::String(value) => string_to_number(value),
         Value::Object(_) => f64::NAN,
         Value::Array(array) => string_to_number(
@@ -451,7 +460,89 @@ pub fn to_number(value: &Value) -> f64 {
                 .join(","),
         ),
         Value::Function(_) | Value::Promise(_) => f64::NAN,
+    })
+}
+
+pub fn explicit_number(value: &Value) -> Result<f64> {
+    match value {
+        Value::BigInt(value) => Ok(value.to_f64().unwrap_or_else(|| {
+            if value.sign() == Sign::Minus {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }
+        })),
+        _ => to_number_checked(value),
     }
+}
+
+pub fn to_numeric_primitive(value: &Value) -> Result<Numeric> {
+    match value {
+        Value::BigInt(value) => Ok(Numeric::BigInt(value.clone())),
+        _ => Ok(Numeric::Number(to_number_checked(value)?)),
+    }
+}
+
+pub fn bigint_from_primitive(value: &Value) -> Result<NumBigInt> {
+    match value {
+        Value::BigInt(value) => Ok(value.clone()),
+        Value::Bool(value) => Ok(NumBigInt::from(u8::from(*value))),
+        Value::String(value) => parse_bigint_string(value),
+        Value::Number(value) if value.is_finite() && value.fract() == 0.0 => {
+            NumBigInt::from_f64(*value)
+                .ok_or_else(|| anyhow::anyhow!("Number không thể biểu diễn thành BigInt"))
+        }
+        Value::Number(_) => anyhow::bail!("BigInt(Number) cần Number hữu hạn nguyên"),
+        Value::Null | Value::Undefined => {
+            anyhow::bail!("không thể convert null/undefined sang BigInt")
+        }
+        Value::Object(_) | Value::Array(_) | Value::Function(_) | Value::Promise(_) => {
+            anyhow::bail!("BigInt conversion cần primitive")
+        }
+    }
+}
+
+pub fn parse_bigint_literal(value: &str) -> Result<NumBigInt> {
+    NumBigInt::parse_bytes(value.as_bytes(), 10)
+        .ok_or_else(|| anyhow::anyhow!("BigInt literal không hợp lệ: {value}"))
+}
+
+pub fn parse_bigint_string(value: &str) -> Result<NumBigInt> {
+    let value = value.trim_matches(is_ecma_whitespace);
+    if value.is_empty() {
+        return Ok(NumBigInt::from(0_u8));
+    }
+    let (negative, digits) = if let Some(value) = value.strip_prefix('-') {
+        (true, value)
+    } else if let Some(value) = value.strip_prefix('+') {
+        (false, value)
+    } else {
+        (false, value)
+    };
+    let (radix, digits) = if let Some(value) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, value)
+    } else if let Some(value) = digits
+        .strip_prefix("0o")
+        .or_else(|| digits.strip_prefix("0O"))
+    {
+        (8, value)
+    } else if let Some(value) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, value)
+    } else {
+        (10, digits)
+    };
+    let mut result = NumBigInt::parse_bytes(digits.as_bytes(), radix)
+        .ok_or_else(|| anyhow::anyhow!("BigInt string không hợp lệ"))?;
+    if negative {
+        result = -result;
+    }
+    Ok(result)
 }
 
 pub fn to_string(value: &Value) -> String {
@@ -461,6 +552,7 @@ pub fn to_string(value: &Value) -> String {
         Value::Bool(value) => value.to_string(),
         Value::String(value) => value.clone(),
         Value::Number(value) => number_to_string(*value),
+        Value::BigInt(value) => value.to_str_radix(10),
         Value::Object(_) => "[object Object]".to_owned(),
         Value::Array(array) => array
             .borrow()
@@ -491,48 +583,91 @@ pub fn number_to_string(value: f64) -> String {
 }
 
 pub fn unary(operator: UnaryOperator, value: Value) -> Value {
+    unary_checked(operator, value).unwrap_or(Value::Undefined)
+}
+
+pub fn unary_checked(operator: UnaryOperator, value: Value) -> Result<Value> {
     match operator {
-        UnaryOperator::Plus => Value::Number(to_number(&value)),
-        UnaryOperator::Minus => Value::Number(-to_number(&value)),
-        UnaryOperator::Not => Value::Bool(!to_boolean(&value)),
-        UnaryOperator::BitwiseNot => Value::Number((!to_int32(to_number(&value))) as f64),
+        UnaryOperator::Plus => match to_numeric_primitive(&value)? {
+            Numeric::Number(value) => Ok(Value::Number(value)),
+            Numeric::BigInt(_) => anyhow::bail!("unary + không hỗ trợ BigInt"),
+        },
+        UnaryOperator::Minus => match to_numeric_primitive(&value)? {
+            Numeric::Number(value) => Ok(Value::Number(-value)),
+            Numeric::BigInt(value) => Ok(Value::BigInt(-value)),
+        },
+        UnaryOperator::Not => Ok(Value::Bool(!to_boolean(&value))),
+        UnaryOperator::BitwiseNot => match to_numeric_primitive(&value)? {
+            Numeric::Number(value) => Ok(Value::Number((!to_int32(value)) as f64)),
+            Numeric::BigInt(value) => Ok(Value::BigInt(!value)),
+        },
     }
+}
+
+fn numeric_pair(left: &Value, right: &Value) -> Result<(Numeric, Numeric)> {
+    let left = to_numeric_primitive(left)?;
+    let right = to_numeric_primitive(right)?;
+    if matches!(
+        (&left, &right),
+        (Numeric::Number(_), Numeric::BigInt(_)) | (Numeric::BigInt(_), Numeric::Number(_))
+    ) {
+        anyhow::bail!("không thể trộn BigInt và Number trong arithmetic")
+    }
+    Ok((left, right))
 }
 
 pub fn binary(operator: BinaryOperator, left: Value, right: Value) -> Result<Value> {
     match operator {
         BinaryOperator::Add => {
-            if matches!(
-                left,
-                Value::String(_)
-                    | Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Function(_)
-                    | Value::Promise(_)
-            ) || matches!(
-                right,
-                Value::String(_)
-                    | Value::Object(_)
-                    | Value::Array(_)
-                    | Value::Function(_)
-                    | Value::Promise(_)
-            ) {
+            if matches!(&left, Value::String(_)) || matches!(&right, Value::String(_)) {
                 return Ok(Value::String(format!(
                     "{}{}",
                     to_string(&left),
                     to_string(&right)
                 )));
             }
-            Ok(Value::Number(to_number(&left) + to_number(&right)))
+            match numeric_pair(&left, &right)? {
+                (Numeric::Number(left), Numeric::Number(right)) => Ok(Value::Number(left + right)),
+                (Numeric::BigInt(left), Numeric::BigInt(right)) => Ok(Value::BigInt(left + right)),
+                _ => unreachable!(),
+            }
         }
-        BinaryOperator::Subtract => Ok(Value::Number(to_number(&left) - to_number(&right))),
-        BinaryOperator::Multiply => Ok(Value::Number(to_number(&left) * to_number(&right))),
-        BinaryOperator::Divide => Ok(Value::Number(to_number(&left) / to_number(&right))),
-        BinaryOperator::Remainder => Ok(Value::Number(to_number(&left) % to_number(&right))),
-        BinaryOperator::Exponential => Ok(Value::Number(exponentiate(
-            to_number(&left),
-            to_number(&right),
-        ))),
+        BinaryOperator::Subtract => numeric_binary(left, right, |a, b| a - b, |a, b| a - b),
+        BinaryOperator::Multiply => numeric_binary(left, right, |a, b| a * b, |a, b| a * b),
+        BinaryOperator::Divide => match numeric_pair(&left, &right)? {
+            (Numeric::Number(left), Numeric::Number(right)) => Ok(Value::Number(left / right)),
+            (Numeric::BigInt(_), Numeric::BigInt(right)) if right == NumBigInt::from(0_u8) => {
+                anyhow::bail!("BigInt division by zero")
+            }
+            (Numeric::BigInt(left), Numeric::BigInt(right)) => Ok(Value::BigInt(left / right)),
+            _ => unreachable!(),
+        },
+        BinaryOperator::Remainder => match numeric_pair(&left, &right)? {
+            (Numeric::Number(left), Numeric::Number(right)) => Ok(Value::Number(left % right)),
+            (Numeric::BigInt(_), Numeric::BigInt(right)) if right == NumBigInt::from(0_u8) => {
+                anyhow::bail!("BigInt remainder by zero")
+            }
+            (Numeric::BigInt(left), Numeric::BigInt(right)) => Ok(Value::BigInt(left % right)),
+            _ => unreachable!(),
+        },
+        BinaryOperator::Exponential => match numeric_pair(&left, &right)? {
+            (Numeric::Number(left), Numeric::Number(right)) => {
+                Ok(Value::Number(exponentiate(left, right)))
+            }
+            (Numeric::BigInt(_), Numeric::BigInt(right)) if right.sign() == Sign::Minus => {
+                anyhow::bail!("BigInt exponent phải không âm")
+            }
+            (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+                let exponent = right
+                    .to_u32()
+                    .ok_or_else(|| anyhow::anyhow!("BigInt exponent quá lớn"))?;
+                if exponent > 1_000_000 {
+                    anyhow::bail!("BigInt exponent vượt resource guard")
+                }
+                Ok(Value::BigInt(left.pow(exponent)))
+            }
+            _ => unreachable!(),
+        },
         BinaryOperator::Equal => Ok(Value::Bool(loose_equal(&left, &right))),
         BinaryOperator::NotEqual => Ok(Value::Bool(!loose_equal(&left, &right))),
         BinaryOperator::StrictEqual => Ok(Value::Bool(strict_equal(&left, &right))),
@@ -551,29 +686,80 @@ pub fn binary(operator: BinaryOperator, left: Value, right: Value) -> Result<Val
             &right,
             Relational::GreaterEqual,
         ))),
-        BinaryOperator::ShiftLeft => Ok(Value::Number(
-            (to_int32(to_number(&left)) << (to_uint32(to_number(&right)) & 31)) as f64,
-        )),
-        BinaryOperator::ShiftRight => Ok(Value::Number(
-            (to_int32(to_number(&left)) >> (to_uint32(to_number(&right)) & 31)) as f64,
-        )),
-        BinaryOperator::ShiftRightZeroFill => Ok(Value::Number(
-            (to_uint32(to_number(&left)) >> (to_uint32(to_number(&right)) & 31)) as f64,
-        )),
-        BinaryOperator::BitwiseOr => Ok(Value::Number(
-            (to_int32(to_number(&left)) | to_int32(to_number(&right))) as f64,
-        )),
-        BinaryOperator::BitwiseXor => Ok(Value::Number(
-            (to_int32(to_number(&left)) ^ to_int32(to_number(&right))) as f64,
-        )),
-        BinaryOperator::BitwiseAnd => Ok(Value::Number(
-            (to_int32(to_number(&left)) & to_int32(to_number(&right))) as f64,
-        )),
+        BinaryOperator::ShiftLeft => bigint_or_number_shift(left, right, true),
+        BinaryOperator::ShiftRight => bigint_or_number_shift(left, right, false),
+        BinaryOperator::ShiftRightZeroFill => match numeric_pair(&left, &right)? {
+            (Numeric::Number(left), Numeric::Number(right)) => Ok(Value::Number(
+                (to_uint32(left) >> (to_uint32(right) & 31)) as f64,
+            )),
+            (Numeric::BigInt(_), Numeric::BigInt(_)) => {
+                anyhow::bail!(">>> không hỗ trợ BigInt")
+            }
+            _ => unreachable!(),
+        },
+        BinaryOperator::BitwiseOr => numeric_bitwise(left, right, |a, b| a | b, |a, b| a | b),
+        BinaryOperator::BitwiseXor => numeric_bitwise(left, right, |a, b| a ^ b, |a, b| a ^ b),
+        BinaryOperator::BitwiseAnd => numeric_bitwise(left, right, |a, b| a & b, |a, b| a & b),
         BinaryOperator::In => Ok(Value::Bool(match right {
             Value::Object(_) | Value::Array(_) => has_property(&right, &to_string(&left)),
             _ => false,
         })),
         BinaryOperator::InstanceOf => anyhow::bail!("instanceof cần constructor/prototype runtime"),
+    }
+}
+
+fn numeric_binary(
+    left: Value,
+    right: Value,
+    number: impl FnOnce(f64, f64) -> f64,
+    bigint: impl FnOnce(NumBigInt, NumBigInt) -> NumBigInt,
+) -> Result<Value> {
+    match numeric_pair(&left, &right)? {
+        (Numeric::Number(left), Numeric::Number(right)) => Ok(Value::Number(number(left, right))),
+        (Numeric::BigInt(left), Numeric::BigInt(right)) => Ok(Value::BigInt(bigint(left, right))),
+        _ => unreachable!(),
+    }
+}
+
+fn numeric_bitwise(
+    left: Value,
+    right: Value,
+    number: impl FnOnce(i32, i32) -> i32,
+    bigint: impl FnOnce(NumBigInt, NumBigInt) -> NumBigInt,
+) -> Result<Value> {
+    match numeric_pair(&left, &right)? {
+        (Numeric::Number(left), Numeric::Number(right)) => {
+            Ok(Value::Number(number(to_int32(left), to_int32(right)) as f64))
+        }
+        (Numeric::BigInt(left), Numeric::BigInt(right)) => Ok(Value::BigInt(bigint(left, right))),
+        _ => unreachable!(),
+    }
+}
+
+fn bigint_or_number_shift(left: Value, right: Value, left_shift: bool) -> Result<Value> {
+    match numeric_pair(&left, &right)? {
+        (Numeric::Number(left), Numeric::Number(right)) => {
+            let shift = to_uint32(right) & 31;
+            Ok(Value::Number(if left_shift {
+                (to_int32(left) << shift) as f64
+            } else {
+                (to_int32(left) >> shift) as f64
+            }))
+        }
+        (Numeric::BigInt(left), Numeric::BigInt(right)) => {
+            let shift = right
+                .to_i64()
+                .ok_or_else(|| anyhow::anyhow!("BigInt shift count quá lớn"))?;
+            let magnitude = shift.unsigned_abs();
+            let magnitude = usize::try_from(magnitude)
+                .map_err(|_| anyhow::anyhow!("BigInt shift count quá lớn"))?;
+            let result = match (left_shift, shift >= 0) {
+                (true, true) | (false, false) => left << magnitude,
+                (false, true) | (true, false) => left >> magnitude,
+            };
+            Ok(Value::BigInt(result))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -607,31 +793,66 @@ enum Relational {
 }
 
 fn relational(left: &Value, right: &Value, op: Relational) -> bool {
-    let result = if matches!((left, right), (Value::String(_), Value::String(_))) {
-        let left = left_string_units(left);
-        let right = left_string_units(right);
-        left.cmp(&right)
-    } else {
-        let left = to_number(left);
-        let right = to_number(right);
-        let Some(ordering) = left.partial_cmp(&right) else {
-            return false;
-        };
-        ordering
+    let ordering = match (left, right) {
+        (Value::String(left), Value::String(right)) => {
+            left.encode_utf16().cmp(right.encode_utf16())
+        }
+        (Value::BigInt(left), Value::BigInt(right)) => left.cmp(right),
+        (Value::BigInt(left), Value::Number(right)) => {
+            let Some(ordering) = compare_bigint_number(left, *right) else {
+                return false;
+            };
+            ordering
+        }
+        (Value::Number(left), Value::BigInt(right)) => {
+            let Some(ordering) = compare_bigint_number(right, *left) else {
+                return false;
+            };
+            ordering.reverse()
+        }
+        _ => {
+            let left = to_number(left);
+            let right = to_number(right);
+            let Some(ordering) = left.partial_cmp(&right) else {
+                return false;
+            };
+            ordering
+        }
     };
     match op {
-        Relational::Less => result == std::cmp::Ordering::Less,
-        Relational::LessEqual => result != std::cmp::Ordering::Greater,
-        Relational::Greater => result == std::cmp::Ordering::Greater,
-        Relational::GreaterEqual => result != std::cmp::Ordering::Less,
+        Relational::Less => ordering == std::cmp::Ordering::Less,
+        Relational::LessEqual => ordering != std::cmp::Ordering::Greater,
+        Relational::Greater => ordering == std::cmp::Ordering::Greater,
+        Relational::GreaterEqual => ordering != std::cmp::Ordering::Less,
     }
 }
 
-fn left_string_units(value: &Value) -> Vec<u16> {
-    match value {
-        Value::String(value) => value.encode_utf16().collect(),
-        _ => unreachable!(),
+fn compare_bigint_number(bigint: &NumBigInt, number: f64) -> Option<std::cmp::Ordering> {
+    if number.is_nan() {
+        return None;
     }
+    if number == f64::INFINITY {
+        return Some(std::cmp::Ordering::Less);
+    }
+    if number == f64::NEG_INFINITY {
+        return Some(std::cmp::Ordering::Greater);
+    }
+    if number.fract() == 0.0 {
+        let number = NumBigInt::from_f64(number)?;
+        return Some(bigint.cmp(&number));
+    }
+    let truncated = NumBigInt::from_f64(number.trunc())?;
+    Some(if number.is_sign_positive() {
+        if bigint <= &truncated {
+            std::cmp::Ordering::Less
+        } else {
+            std::cmp::Ordering::Greater
+        }
+    } else if bigint < &truncated {
+        std::cmp::Ordering::Less
+    } else {
+        std::cmp::Ordering::Greater
+    })
 }
 
 fn strict_equal(left: &Value, right: &Value) -> bool {
@@ -642,6 +863,7 @@ fn strict_equal(left: &Value, right: &Value) -> bool {
         (Value::Number(left), Value::Number(right)) => {
             !left.is_nan() && !right.is_nan() && left == right
         }
+        (Value::BigInt(left), Value::BigInt(right)) => left == right,
         (Value::Object(left), Value::Object(right)) => Rc::ptr_eq(left, right),
         (Value::Array(left), Value::Array(right)) => Rc::ptr_eq(left, right),
         (Value::Function(left), Value::Function(right)) => left == right,
@@ -662,14 +884,22 @@ fn loose_equal(left: &Value, right: &Value) -> bool {
                 &Value::Number(to_number(right)),
             )
         }
+        (Value::BigInt(bigint), Value::String(string))
+        | (Value::String(string), Value::BigInt(bigint)) => {
+            parse_bigint_string(string).is_ok_and(|value| value == *bigint)
+        }
+        (Value::BigInt(bigint), Value::Number(number))
+        | (Value::Number(number), Value::BigInt(bigint)) => {
+            compare_bigint_number(bigint, *number) == Some(std::cmp::Ordering::Equal)
+        }
         (Value::Bool(_), _) => loose_equal(&Value::Number(to_number(left)), right),
         (_, Value::Bool(_)) => loose_equal(left, &Value::Number(to_number(right))),
         (
             Value::Object(_) | Value::Array(_) | Value::Function(_) | Value::Promise(_),
-            Value::String(_) | Value::Number(_),
+            Value::String(_) | Value::Number(_) | Value::BigInt(_),
         ) => loose_equal(&Value::String(to_string(left)), right),
         (
-            Value::String(_) | Value::Number(_),
+            Value::String(_) | Value::Number(_) | Value::BigInt(_),
             Value::Object(_) | Value::Array(_) | Value::Function(_) | Value::Promise(_),
         ) => loose_equal(left, &Value::String(to_string(right))),
         _ => false,
@@ -773,7 +1003,7 @@ fn is_ecma_whitespace(c: char) -> bool {
 }
 
 pub fn ensure_number(value: &Value) -> Result<f64> {
-    Ok(to_number(value))
+    to_number_checked(value)
 }
 
 fn parse_radix(value: &str, radix: u32) -> f64 {
@@ -806,7 +1036,8 @@ fn exponentiate(base: f64, exponent: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        BinaryOperator, Value, binary, number_to_string, to_boolean, to_number, to_string,
+        BinaryOperator, Value, binary, number_to_string, parse_bigint_literal, to_boolean,
+        to_number, to_string,
     };
 
     #[test]
@@ -850,6 +1081,23 @@ mod tests {
             Value::Bool(false)
         );
         assert_eq!(to_string(&Value::Number(2.5)), "2.5");
+        assert_eq!(
+            binary(
+                BinaryOperator::Exponential,
+                Value::BigInt(parse_bigint_literal("2").unwrap()),
+                Value::BigInt(parse_bigint_literal("10").unwrap()),
+            )
+            .unwrap(),
+            Value::BigInt(parse_bigint_literal("1024").unwrap()),
+        );
+        assert!(
+            binary(
+                BinaryOperator::Add,
+                Value::BigInt(parse_bigint_literal("1").unwrap()),
+                Value::Number(1.0),
+            )
+            .is_err()
+        );
         assert_eq!(
             binary(BinaryOperator::Equal, Value::Bool(false), Value::Null).unwrap(),
             Value::Bool(false)
