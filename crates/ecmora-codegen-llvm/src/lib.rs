@@ -2030,7 +2030,10 @@ fn build_dynamic_array<'ctx>(
         bail!("call argument metadata không khớp")
     }
     if arguments.is_empty() {
-        return Ok(dynamic_type.ptr_type(AddressSpace::default()).const_null());
+        return Ok(i8_type
+            .get_context()
+            .ptr_type(AddressSpace::default())
+            .const_null());
     }
     let array = builder.build_array_alloca(
         dynamic_type,

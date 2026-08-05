@@ -154,9 +154,24 @@ pub(super) fn statement_contains_yield(statement: &Statement) -> bool {
                         || case.consequent.iter().any(statement_contains_yield)
                 })
         }
+        StatementKind::Labeled { body, .. } => statement_contains_yield(body),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            statement_contains_yield(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|handler| statement_contains_yield(&handler.body))
+                || finalizer.as_deref().is_some_and(statement_contains_yield)
+        }
         StatementKind::FunctionDeclaration(_) => false,
         StatementKind::Return(value) => value.as_ref().is_some_and(expression_contains_yield),
-        StatementKind::Break | StatementKind::Continue => false,
+        StatementKind::Empty
+        | StatementKind::Debugger
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => false,
     }
 }
 

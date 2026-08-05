@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use ecmora_hir::{
-    ArrayElement, AssignmentOperator, AssignmentTarget, BinaryOperator, ExportBinding,
+    ArrayElement, AssignmentOperator, AssignmentTarget, BinaryOperator, CatchClause, ExportBinding,
     Expression as HirExpression, ExpressionKind, ForInit, Function as HirFunction,
     ImportDeclaration as HirImportDeclaration, ImportSpecifier as HirImportSpecifier,
     LogicalOperator, MemberProperty, ObjectEntry, ObjectProperty, Program as HirProgram, Span,
@@ -455,13 +455,32 @@ fn collect_static_modules_statement(
                     }
                 }
             }
+            StatementKind::Labeled { body, .. } => {
+                statement_walk(body, imports, constants);
+            }
+            StatementKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                statement_walk(block, imports, constants);
+                if let Some(handler) = handler {
+                    statement_walk(&handler.body, imports, constants);
+                }
+                if let Some(finalizer) = finalizer {
+                    statement_walk(finalizer, imports, constants);
+                }
+            }
             StatementKind::FunctionDeclaration(_) => {}
             StatementKind::Return(value) => {
                 if let Some(value) = value {
                     walk_expression(value, imports, constants);
                 }
             }
-            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::Empty
+            | StatementKind::Debugger
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_) => {}
         }
     }
     statement_walk(statement, imports, constants);
@@ -634,6 +653,8 @@ fn declared_names(statement: &HirStatement) -> Vec<String> {
 
 fn lower_statement(statement: &Statement<'_>) -> Result<HirStatement> {
     let (kind, span) = match statement {
+        Statement::EmptyStatement(statement) => (StatementKind::Empty, statement.span),
+        Statement::DebuggerStatement(statement) => (StatementKind::Debugger, statement.span),
         Statement::ExpressionStatement(statement) => (
             StatementKind::Expression(lower_expression(&statement.expression)?),
             statement.span,
@@ -749,6 +770,38 @@ fn lower_statement(statement: &Statement<'_>) -> Result<HirStatement> {
             },
             statement.span,
         ),
+        Statement::LabeledStatement(statement) => (
+            StatementKind::Labeled {
+                label: statement.label.name.to_string(),
+                body: Box::new(lower_statement(&statement.body)?),
+            },
+            statement.span,
+        ),
+        Statement::TryStatement(statement) => {
+            let block = lower_block_statement(&statement.block)?;
+            let handler = statement
+                .handler
+                .as_ref()
+                .map(|handler| lower_catch_clause(handler))
+                .transpose()?;
+            let finalizer = statement
+                .finalizer
+                .as_ref()
+                .map(|block| lower_block_statement(block))
+                .transpose()?
+                .map(Box::new);
+            if handler.is_none() && finalizer.is_none() {
+                bail!("try statement cần catch hoặc finally")
+            }
+            (
+                StatementKind::Try {
+                    block: Box::new(block),
+                    handler,
+                    finalizer,
+                },
+                statement.span,
+            )
+        }
         Statement::FunctionDeclaration(function) => {
             let span = function.span;
             let function = lower_function(function, false)?;
@@ -771,18 +824,14 @@ fn lower_statement(statement: &Statement<'_>) -> Result<HirStatement> {
             StatementKind::Throw(lower_expression(&statement.argument)?),
             statement.span,
         ),
-        Statement::BreakStatement(statement) => {
-            if statement.label.is_some() {
-                bail!("labeled break chưa được hỗ trợ")
-            }
-            (StatementKind::Break, statement.span)
-        }
-        Statement::ContinueStatement(statement) => {
-            if statement.label.is_some() {
-                bail!("labeled continue chưa được hỗ trợ")
-            }
-            (StatementKind::Continue, statement.span)
-        }
+        Statement::BreakStatement(statement) => (
+            StatementKind::Break(statement.label.as_ref().map(|label| label.name.to_string())),
+            statement.span,
+        ),
+        Statement::ContinueStatement(statement) => (
+            StatementKind::Continue(statement.label.as_ref().map(|label| label.name.to_string())),
+            statement.span,
+        ),
         Statement::VariableDeclaration(declaration) => {
             let (kind, declarations) = lower_variable_declaration(declaration)?;
             (
@@ -795,6 +844,71 @@ fn lower_statement(statement: &Statement<'_>) -> Result<HirStatement> {
     Ok(HirStatement {
         kind,
         span: convert_span(span),
+    })
+}
+
+fn lower_block_statement(block: &oxc_ast::ast::BlockStatement<'_>) -> Result<HirStatement> {
+    Ok(HirStatement {
+        kind: StatementKind::Block(
+            block
+                .body
+                .iter()
+                .map(lower_statement)
+                .collect::<Result<_>>()?,
+        ),
+        span: convert_span(block.span),
+    })
+}
+
+fn lower_catch_clause(clause: &oxc_ast::ast::CatchClause<'_>) -> Result<CatchClause> {
+    let span = convert_span(clause.span);
+    let mut body = clause
+        .body
+        .body
+        .iter()
+        .map(lower_statement)
+        .collect::<Result<Vec<_>>>()?;
+
+    let parameter = match &clause.param {
+        None => None,
+        Some(parameter) => match &parameter.pattern {
+            BindingPattern::BindingIdentifier(identifier) => Some(identifier.name.to_string()),
+            pattern => {
+                let hidden = format!("@catch.{}.{}", span.start, span.end);
+                let mut declarations = Vec::new();
+                lower_binding_pattern(
+                    pattern,
+                    HirExpression {
+                        kind: ExpressionKind::Global(hidden.clone()),
+                        span,
+                    },
+                    span,
+                    &mut declarations,
+                )?;
+                if !declarations.is_empty() {
+                    body.insert(
+                        0,
+                        HirStatement {
+                            kind: StatementKind::VariableDeclaration {
+                                kind: VariableKind::Let,
+                                declarations,
+                            },
+                            span,
+                        },
+                    );
+                }
+                Some(hidden)
+            }
+        },
+    };
+
+    Ok(CatchClause {
+        parameter,
+        body: Box::new(HirStatement {
+            kind: StatementKind::Block(body),
+            span: convert_span(clause.body.span),
+        }),
+        span,
     })
 }
 

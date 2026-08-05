@@ -185,6 +185,12 @@ fn normalize_statement(
         {
             bail!("await trong loop cần compatibility interpreter")
         }
+        StatementKind::Labeled { .. } if contains_await_statement(statement) => {
+            bail!("await crossing a labeled statement uses compatibility completion state")
+        }
+        StatementKind::Try { .. } if contains_await_statement(statement) => {
+            bail!("await in try/catch/finally uses compatibility completion state")
+        }
         _ => output.push(statement.clone()),
     }
     Ok(())
@@ -234,7 +240,7 @@ fn make_async_helper_call(
 
 fn contains_cross_boundary_abrupt(statement: &Statement) -> bool {
     match &statement.kind {
-        StatementKind::Return(_) | StatementKind::Break | StatementKind::Continue => true,
+        StatementKind::Return(_) | StatementKind::Break(_) | StatementKind::Continue(_) => true,
         StatementKind::Block(body) => body.iter().any(contains_cross_boundary_abrupt),
         StatementKind::If {
             consequent,
@@ -255,6 +261,20 @@ fn contains_cross_boundary_abrupt(statement: &Statement) -> bool {
             .iter()
             .flat_map(|case| &case.consequent)
             .any(contains_cross_boundary_abrupt),
+        StatementKind::Labeled { body, .. } => contains_cross_boundary_abrupt(body),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            contains_cross_boundary_abrupt(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|handler| contains_cross_boundary_abrupt(&handler.body))
+                || finalizer
+                    .as_deref()
+                    .is_some_and(contains_cross_boundary_abrupt)
+        }
         StatementKind::FunctionDeclaration(_) => false,
         _ => false,
     }
@@ -311,9 +331,24 @@ fn contains_await_statement(statement: &Statement) -> bool {
                         || case.consequent.iter().any(contains_await_statement)
                 })
         }
+        StatementKind::Labeled { body, .. } => contains_await_statement(body),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            contains_await_statement(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|handler| contains_await_statement(&handler.body))
+                || finalizer.as_deref().is_some_and(contains_await_statement)
+        }
         StatementKind::Return(value) => value.as_ref().is_some_and(contains_await_expression),
         StatementKind::FunctionDeclaration(_) => false,
-        StatementKind::Break | StatementKind::Continue => false,
+        StatementKind::Empty
+        | StatementKind::Debugger
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => false,
     }
 }
 

@@ -77,7 +77,16 @@ pub struct Statement {
 }
 
 #[derive(Debug, Clone)]
+pub struct CatchClause {
+    pub parameter: Option<String>,
+    pub body: Box<Statement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
 pub enum StatementKind {
+    Empty,
+    Debugger,
     Expression(Expression),
     VariableDeclaration {
         kind: VariableKind,
@@ -119,11 +128,20 @@ pub enum StatementKind {
         discriminant: Expression,
         cases: Vec<SwitchCase>,
     },
+    Labeled {
+        label: String,
+        body: Box<Statement>,
+    },
+    Try {
+        block: Box<Statement>,
+        handler: Option<CatchClause>,
+        finalizer: Option<Box<Statement>>,
+    },
     FunctionDeclaration(Function),
     Return(Option<Expression>),
     Throw(Expression),
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
 }
 
 #[derive(Debug, Clone)]

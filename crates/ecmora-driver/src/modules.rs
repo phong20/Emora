@@ -413,6 +413,32 @@ fn rename_statement(
                 }
             }
         }
+        StatementKind::Labeled { body, .. } => {
+            rename_statement(body, rename, namespaces, false, shadowed);
+        }
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            rename_statement(block, rename, namespaces, false, shadowed);
+            if let Some(handler) = handler {
+                let mut catch_shadowed = shadowed.clone();
+                if let Some(parameter) = &handler.parameter {
+                    catch_shadowed.insert(parameter.clone());
+                }
+                rename_statement(
+                    &mut handler.body,
+                    rename,
+                    namespaces,
+                    false,
+                    &catch_shadowed,
+                );
+            }
+            if let Some(finalizer) = finalizer {
+                rename_statement(finalizer, rename, namespaces, false, shadowed);
+            }
+        }
         StatementKind::FunctionDeclaration(function) => {
             if top_level {
                 if let Some(name) = &mut function.name {
@@ -436,7 +462,10 @@ fn rename_statement(
                 rename_expression(value, rename, namespaces, shadowed);
             }
         }
-        StatementKind::Break | StatementKind::Continue => {}
+        StatementKind::Empty
+        | StatementKind::Debugger
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => {}
     }
 }
 

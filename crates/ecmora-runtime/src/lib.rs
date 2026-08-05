@@ -56,10 +56,85 @@ fn default_promise_rejection_tracker(event: &PromiseRejectionEvent) -> Result<()
 #[derive(Debug, Clone, PartialEq)]
 enum Completion {
     Normal,
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
     Return(Value),
     Throw(Value),
+}
+
+thread_local! {
+    static JAVASCRIPT_THROW_VALUES: RefCell<Vec<Option<Value>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug)]
+struct JavaScriptThrow {
+    slot: usize,
+}
+
+impl std::fmt::Display for JavaScriptThrow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        JAVASCRIPT_THROW_VALUES.with(|values| {
+            let values = values.borrow();
+            match values.get(self.slot).and_then(|value| value.as_ref()) {
+                Some(value) => {
+                    write!(formatter, "{}", ecmora_value::to_string(value))
+                }
+                None => write!(formatter, "<consumed JavaScript throw>"),
+            }
+        })
+    }
+}
+
+impl std::error::Error for JavaScriptThrow {}
+
+fn javascript_throw(value: Value) -> anyhow::Error {
+    let slot = JAVASCRIPT_THROW_VALUES.with(|values| {
+        let mut values = values.borrow_mut();
+        let slot = values.len();
+        values.push(Some(value));
+        slot
+    });
+    anyhow::Error::new(JavaScriptThrow { slot })
+}
+
+fn take_javascript_throw(error: anyhow::Error) -> std::result::Result<Value, anyhow::Error> {
+    match error.downcast::<JavaScriptThrow>() {
+        Ok(thrown) => Ok(JAVASCRIPT_THROW_VALUES.with(|values| {
+            values
+                .borrow_mut()
+                .get_mut(thrown.slot)
+                .and_then(Option::take)
+                .unwrap_or(Value::Undefined)
+        })),
+        Err(error) => Err(error),
+    }
+}
+
+fn capture_completion(result: Result<Completion>) -> Result<Completion> {
+    match result {
+        Ok(completion) => Ok(completion),
+        Err(error) => match take_javascript_throw(error) {
+            Ok(value) => Ok(Completion::Throw(value)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn capture_value(result: Result<Value>) -> Result<CallOutcome> {
+    match result {
+        Ok(value) => Ok(CallOutcome::Value(value)),
+        Err(error) => match take_javascript_throw(error) {
+            Ok(value) => Ok(CallOutcome::Throw(value)),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn label_matches(target: &Option<String>, labels: &[String]) -> bool {
+    target
+        .as_ref()
+        .is_some_and(|target| labels.iter().any(|label| label == target))
 }
 
 #[derive(Debug, Clone)]
@@ -525,10 +600,7 @@ impl Machine {
         )?;
         match outcome {
             CallOutcome::Throw(reason) => {
-                bail!(
-                    "constructor `{constructor}` threw {}",
-                    ecmora_value::to_string(&reason)
-                )
+                return Err(javascript_throw(reason));
             }
             CallOutcome::Value(value) if ecmora_value::is_object_like(&value) => Ok(Some(value)),
             CallOutcome::Value(Value::Undefined)
@@ -703,12 +775,24 @@ impl Machine {
             let statement = generator.statements[index].clone();
             if let Some((argument, action)) = direct_yield(&statement)? {
                 let value = match argument {
-                    Some(argument) => evaluate_expression(
+                    Some(argument) => match capture_value(evaluate_expression(
                         &argument,
                         &mut generator.scopes,
                         generator.strict,
                         self,
-                    )?,
+                    ))? {
+                        CallOutcome::Value(value) => value,
+                        CallOutcome::Throw(reason) => {
+                            generator.completed = true;
+                            ecmora_value::set_async_generator_state(
+                                &generator.object,
+                                ecmora_value::AsyncGeneratorState::Completed,
+                            )?;
+                            self.settle(request.capability, PromiseState::Rejected(reason));
+                            self.async_generators[id as usize] = Some(generator);
+                            return Ok(());
+                        }
+                    },
                     None => Value::Undefined,
                 };
                 generator.next_statement += 1;
@@ -724,7 +808,12 @@ impl Machine {
             }
 
             generator.next_statement += 1;
-            match execute_statement(&statement, &mut generator.scopes, generator.strict, self)? {
+            match capture_completion(execute_statement(
+                &statement,
+                &mut generator.scopes,
+                generator.strict,
+                self,
+            ))? {
                 Completion::Normal => {}
                 Completion::Return(value) => {
                     generator.completed = true;
@@ -747,10 +836,18 @@ impl Machine {
                     self.async_generators[id as usize] = Some(generator);
                     return Ok(());
                 }
-                Completion::Break | Completion::Continue => {
+                Completion::Break(label) => {
                     bail!(
-                        "break/continue vượt generator top-level; \
-                         yield trong CFG cần continuation lowering"
+                        "break {:?} vượt generator top-level; \
+                         yield trong CFG cần continuation lowering",
+                        label
+                    )
+                }
+                Completion::Continue(label) => {
+                    bail!(
+                        "continue {:?} vượt generator top-level; \
+                         yield trong CFG cần continuation lowering",
+                        label
                     )
                 }
             }
@@ -792,12 +889,7 @@ impl Machine {
         match self.call_function_with_this(method, receiver.clone(), arguments, strict)? {
             CallOutcome::Value(value) if Self::is_primitive_value(&value) => Ok(Some(value)),
             CallOutcome::Value(_) => Ok(None),
-            CallOutcome::Throw(reason) => {
-                bail!(
-                    "primitive coercion threw {}",
-                    ecmora_value::to_string(&reason)
-                )
-            }
+            CallOutcome::Throw(reason) => Err(javascript_throw(reason)),
         }
     }
 
@@ -852,11 +944,6 @@ impl Machine {
             return Ok(Value::String("[object Promise]".to_owned()));
         }
         Ok(value)
-    }
-
-    fn to_number_value(&mut self, value: Value, strict: bool) -> Result<f64> {
-        let primitive = self.to_primitive_value(value, "number", strict)?;
-        ecmora_value::to_number_checked(&primitive)
     }
 
     fn explicit_number_value(&mut self, value: Value, strict: bool) -> Result<f64> {
@@ -967,9 +1054,7 @@ impl Machine {
     ) -> Result<Value> {
         match self.call_function_with_this(trap, handler, arguments, strict)? {
             CallOutcome::Value(value) => Ok(value),
-            CallOutcome::Throw(reason) => {
-                bail!("Proxy trap threw {}", ecmora_value::to_string(&reason))
-            }
+            CallOutcome::Throw(reason) => Err(javascript_throw(reason)),
         }
     }
 
@@ -1010,9 +1095,7 @@ impl Machine {
         {
             return match self.call_function_with_this(getter, receiver, Vec::new(), strict)? {
                 CallOutcome::Value(value) => Ok(value),
-                CallOutcome::Throw(value) => {
-                    bail!("getter threw {}", ecmora_value::to_string(&value))
-                }
+                CallOutcome::Throw(value) => Err(javascript_throw(value)),
             };
         }
         Ok(ecmora_value::get_property(object, key))
@@ -1078,9 +1161,7 @@ impl Machine {
         {
             return match self.call_function_with_this(setter, receiver, vec![value], strict)? {
                 CallOutcome::Value(value) => Ok(value),
-                CallOutcome::Throw(value) => {
-                    bail!("setter threw {}", ecmora_value::to_string(&value))
-                }
+                CallOutcome::Throw(value) => Err(javascript_throw(value)),
             };
         }
         ecmora_value::set_property(object, key, value)
@@ -1301,7 +1382,7 @@ impl Machine {
     ) -> Result<Value> {
         match self.call_function(id, arguments, strict)? {
             CallOutcome::Value(value) => Ok(value),
-            CallOutcome::Throw(value) => bail!("uncaught {}", ecmora_value::to_string(&value)),
+            CallOutcome::Throw(value) => Err(javascript_throw(value)),
         }
     }
 
@@ -1411,9 +1492,18 @@ impl Machine {
                     Completion::Normal => CallOutcome::Value(Value::Undefined),
                     Completion::Return(value) => CallOutcome::Value(value),
                     Completion::Throw(value) => CallOutcome::Throw(value),
-                    Completion::Break | Completion::Continue => {
-                        bail!("break/continue vượt qua function boundary")
-                    }
+                    Completion::Break(label) => match label {
+                        Some(label) => {
+                            bail!("break label `{label}` vượt qua function boundary")
+                        }
+                        None => bail!("break vượt qua function boundary"),
+                    },
+                    Completion::Continue(label) => match label {
+                        Some(label) => {
+                            bail!("continue label `{label}` vượt qua function boundary")
+                        }
+                        None => bail!("continue vượt qua function boundary"),
+                    },
                 };
                 Ok(outcome)
             }
@@ -1430,7 +1520,15 @@ impl Machine {
     ) -> Result<()> {
         for index in start..statements.len() {
             if let Some((argument, action)) = direct_await(&statements[index]) {
-                let awaited = evaluate_expression(&argument, &mut scopes, strict, self)?;
+                let awaited =
+                    match capture_value(evaluate_expression(&argument, &mut scopes, strict, self))?
+                    {
+                        CallOutcome::Value(value) => value,
+                        CallOutcome::Throw(reason) => {
+                            self.settle(promise, PromiseState::Rejected(reason));
+                            return Ok(());
+                        }
+                    };
                 let source = match awaited {
                     Value::Promise(id) => id,
                     value => {
@@ -1469,7 +1567,12 @@ impl Machine {
                 );
                 return Ok(());
             }
-            match execute_statement(&statements[index], &mut scopes, strict, self)? {
+            match capture_completion(execute_statement(
+                &statements[index],
+                &mut scopes,
+                strict,
+                self,
+            ))? {
                 Completion::Normal => {}
                 Completion::Return(value) => {
                     self.resolve_into(promise, value)?;
@@ -1479,9 +1582,18 @@ impl Machine {
                     self.settle(promise, PromiseState::Rejected(value));
                     return Ok(());
                 }
-                Completion::Break | Completion::Continue => {
-                    bail!("break/continue vượt qua async function boundary")
-                }
+                Completion::Break(label) => match label {
+                    Some(label) => {
+                        bail!("break label `{label}` vượt qua async function boundary")
+                    }
+                    None => bail!("break vượt qua async function boundary"),
+                },
+                Completion::Continue(label) => match label {
+                    Some(label) => {
+                        bail!("continue label `{label}` vượt qua async function boundary")
+                    }
+                    None => bail!("continue vượt qua async function boundary"),
+                },
             }
         }
         self.settle(promise, PromiseState::Fulfilled(Value::Undefined));
@@ -1555,10 +1667,11 @@ impl Machine {
                 match self.get_property_value(&value, "then", value.clone(), true) {
                     Ok(value) => value,
                     Err(error) => {
-                        self.settle(
-                            promise,
-                            PromiseState::Rejected(Value::String(format!("{error:#}"))),
-                        );
+                        let reason = match take_javascript_throw(error) {
+                            Ok(reason) => reason,
+                            Err(error) => Value::String(format!("{error:#}")),
+                        };
+                        self.settle(promise, PromiseState::Rejected(reason));
                         return Ok(());
                     }
                 }
@@ -1764,9 +1877,7 @@ impl Machine {
         }
         match self.promises[promise as usize].state.clone() {
             PromiseState::Fulfilled(value) => Ok(value),
-            PromiseState::Rejected(value) => {
-                bail!("await rejected: {}", ecmora_value::to_string(&value))
-            }
+            PromiseState::Rejected(value) => Err(javascript_throw(value)),
             PromiseState::Pending => bail!("await trên Promise pending chưa có continuation job"),
         }
     }
@@ -1831,7 +1942,18 @@ pub fn execute_in_realm_with_host_hooks(
         &mut machine,
     )? {
         Completion::Normal => Ok::<(), anyhow::Error>(()),
-        _ => bail!("break/continue không nằm trong loop hoặc switch"),
+        Completion::Throw(value) => {
+            bail!("uncaught {}", ecmora_value::to_string(&value))
+        }
+        Completion::Return(_) => bail!("return vượt qua script boundary"),
+        Completion::Break(label) => match label {
+            Some(label) => bail!("break label `{label}` không tồn tại"),
+            None => bail!("break ngoài loop/switch"),
+        },
+        Completion::Continue(label) => match label {
+            Some(label) => bail!("continue label `{label}` không tồn tại"),
+            None => bail!("continue ngoài loop"),
+        },
     }?;
     machine.drain_jobs()
 }
@@ -1853,7 +1975,7 @@ fn execute_predeclared_scope(
     machine: &mut Machine,
 ) -> Result<Completion> {
     for statement in statements {
-        let completion = execute_statement(statement, scopes, strict, machine)?;
+        let completion = capture_completion(execute_statement(statement, scopes, strict, machine))?;
         if completion != Completion::Normal {
             return Ok(completion);
         }
@@ -1908,7 +2030,18 @@ fn execute_statement(
     strict: bool,
     machine: &mut Machine,
 ) -> Result<Completion> {
+    execute_statement_with_labels(statement, scopes, strict, machine, &[])
+}
+
+fn execute_statement_with_labels(
+    statement: &Statement,
+    scopes: &mut Vec<Scope>,
+    strict: bool,
+    machine: &mut Machine,
+    active_labels: &[String],
+) -> Result<Completion> {
     match &statement.kind {
+        StatementKind::Empty | StatementKind::Debugger => {}
         StatementKind::Expression(expression) => {
             evaluate_expression(expression, scopes, strict, machine)?;
         }
@@ -1917,6 +2050,61 @@ fn execute_statement(
             let result = execute_scope(statements, scopes, strict, machine);
             scopes.pop();
             return result;
+        }
+        StatementKind::Labeled { label, body } => {
+            let mut labels = active_labels.to_vec();
+            if labels.iter().any(|active| active == label) {
+                bail!("duplicate active label `{label}`")
+            }
+            labels.push(label.clone());
+            let completion = capture_completion(execute_statement_with_labels(
+                body, scopes, strict, machine, &labels,
+            ))?;
+            return Ok(match completion {
+                Completion::Break(Some(target)) if labels.iter().any(|label| label == &target) => {
+                    Completion::Normal
+                }
+                completion => completion,
+            });
+        }
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            let completion = capture_completion(execute_statement(block, scopes, strict, machine))?;
+            let mut completion = match completion {
+                Completion::Throw(reason) => {
+                    if let Some(handler) = handler {
+                        scopes.push(HashMap::new());
+                        if let Some(parameter) = &handler.parameter {
+                            scopes.last_mut().unwrap().insert(
+                                parameter.clone(),
+                                binding(VariableKind::Let, true, reason),
+                            );
+                        }
+                        let handled = capture_completion(execute_statement(
+                            &handler.body,
+                            scopes,
+                            strict,
+                            machine,
+                        ));
+                        scopes.pop();
+                        handled?
+                    } else {
+                        Completion::Throw(reason)
+                    }
+                }
+                completion => completion,
+            };
+            if let Some(finalizer) = finalizer {
+                let final_completion =
+                    capture_completion(execute_statement(finalizer, scopes, strict, machine))?;
+                if final_completion != Completion::Normal {
+                    completion = final_completion;
+                }
+            }
+            return Ok(completion);
         }
         StatementKind::If {
             test,
@@ -1932,17 +2120,29 @@ fn execute_statement(
         }
         StatementKind::While { test, body } => {
             while ecmora_value::to_boolean(&evaluate_expression(test, scopes, strict, machine)?) {
-                match execute_statement(body, scopes, strict, machine)? {
-                    Completion::Break => break,
-                    Completion::Continue | Completion::Normal => {}
+                match capture_completion(execute_statement(body, scopes, strict, machine))? {
+                    Completion::Break(target)
+                        if target.is_none() || label_matches(&target, active_labels) =>
+                    {
+                        break;
+                    }
+                    Completion::Continue(target)
+                        if target.is_none() || label_matches(&target, active_labels) => {}
+                    Completion::Normal => {}
                     completion => return Ok(completion),
                 }
             }
         }
         StatementKind::DoWhile { body, test } => loop {
-            match execute_statement(body, scopes, strict, machine)? {
-                Completion::Break => break,
-                Completion::Continue | Completion::Normal => {}
+            match capture_completion(execute_statement(body, scopes, strict, machine))? {
+                Completion::Break(target)
+                    if target.is_none() || label_matches(&target, active_labels) =>
+                {
+                    break;
+                }
+                Completion::Continue(target)
+                    if target.is_none() || label_matches(&target, active_labels) => {}
+                Completion::Normal => {}
                 completion => return Ok(completion),
             }
             if !ecmora_value::to_boolean(&evaluate_expression(test, scopes, strict, machine)?) {
@@ -1995,9 +2195,15 @@ fn execute_statement(
                             break;
                         }
                     }
-                    match execute_statement(body, scopes, strict, machine)? {
-                        Completion::Break => break,
-                        Completion::Continue | Completion::Normal => {}
+                    match capture_completion(execute_statement(body, scopes, strict, machine))? {
+                        Completion::Break(target)
+                            if target.is_none() || label_matches(&target, active_labels) =>
+                        {
+                            break;
+                        }
+                        Completion::Continue(target)
+                            if target.is_none() || label_matches(&target, active_labels) => {}
+                        Completion::Normal => {}
                         completion => return Ok(completion),
                     }
                     if let Some(update) = update {
@@ -2007,7 +2213,7 @@ fn execute_statement(
                 Ok(Completion::Normal)
             })();
             scopes.pop();
-            result?;
+            return result;
         }
         StatementKind::ForIn {
             name,
@@ -2024,9 +2230,15 @@ fn execute_statement(
                 .insert(name.clone(), binding(*kind, true, Value::Undefined));
             for key in keys {
                 scopes.last().unwrap().get(name).unwrap().borrow_mut().value = Value::String(key);
-                match execute_statement(body, scopes, strict, machine)? {
-                    Completion::Break => break,
-                    Completion::Continue | Completion::Normal => {}
+                match capture_completion(execute_statement(body, scopes, strict, machine))? {
+                    Completion::Break(target)
+                        if target.is_none() || label_matches(&target, active_labels) =>
+                    {
+                        break;
+                    }
+                    Completion::Continue(target)
+                        if target.is_none() || label_matches(&target, active_labels) => {}
+                    Completion::Normal => {}
                     completion => {
                         scopes.pop();
                         return Ok(completion);
@@ -2061,9 +2273,15 @@ fn execute_statement(
                 .insert(name.clone(), binding(*kind, true, Value::Undefined));
             for value in values {
                 scopes.last().unwrap().get(name).unwrap().borrow_mut().value = value;
-                match execute_statement(body, scopes, strict, machine)? {
-                    Completion::Break => break,
-                    Completion::Continue | Completion::Normal => {}
+                match capture_completion(execute_statement(body, scopes, strict, machine))? {
+                    Completion::Break(target)
+                        if target.is_none() || label_matches(&target, active_labels) =>
+                    {
+                        break;
+                    }
+                    Completion::Continue(target)
+                        if target.is_none() || label_matches(&target, active_labels) => {}
+                    Completion::Normal => {}
                     completion => {
                         scopes.pop();
                         return Ok(completion);
@@ -2122,9 +2340,15 @@ fn execute_statement(
                     }
                     for case in &cases[start..] {
                         for statement in &case.consequent {
-                            match execute_statement(statement, scopes, strict, machine)? {
-                                Completion::Break => return Ok(Completion::Normal),
-                                Completion::Continue => return Ok(Completion::Continue),
+                            match capture_completion(execute_statement(
+                                statement, scopes, strict, machine,
+                            ))? {
+                                Completion::Break(target)
+                                    if target.is_none()
+                                        || label_matches(&target, active_labels) =>
+                                {
+                                    return Ok(Completion::Normal);
+                                }
                                 Completion::Normal => {}
                                 completion => return Ok(completion),
                             }
@@ -2136,8 +2360,12 @@ fn execute_statement(
                 return result;
             }
         }
-        StatementKind::Break => return Ok(Completion::Break),
-        StatementKind::Continue => return Ok(Completion::Continue),
+        StatementKind::Break(label) => {
+            return Ok(Completion::Break(label.clone()));
+        }
+        StatementKind::Continue(label) => {
+            return Ok(Completion::Continue(label.clone()));
+        }
         StatementKind::FunctionDeclaration(_) => {}
         StatementKind::Return(expression) => {
             let value = match expression {
@@ -2588,9 +2816,7 @@ fn evaluate_expression(
                 RuntimeValue::FunctionWithThis(id, receiver) => {
                     match machine.call_function_with_this(id, receiver, arguments, strict)? {
                         CallOutcome::Value(value) => Ok(value),
-                        CallOutcome::Throw(value) => {
-                            bail!("uncaught {}", ecmora_value::to_string(&value))
-                        }
+                        CallOutcome::Throw(value) => Err(javascript_throw(value)),
                     }
                 }
                 RuntimeValue::ClassConstructor(name) => {

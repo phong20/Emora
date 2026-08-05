@@ -92,10 +92,6 @@ impl AbstractValue {
         })
     }
 
-    pub(super) fn constant(&self) -> Option<&Value> {
-        self.constant.as_ref()
-    }
-
     pub(super) fn numeric_coercion_safe(&self) -> bool {
         self.mask != 0 && self.mask & !Self::NUMBER_COERCIBLE_PRIMITIVES == 0
     }

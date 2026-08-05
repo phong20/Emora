@@ -213,6 +213,29 @@ impl FreeVariableCollector {
                 self.scopes.pop();
             }
 
+            StatementKind::Labeled { body, .. } => {
+                self.walk_statement(body);
+            }
+
+            StatementKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                self.walk_statement(block);
+                if let Some(handler) = handler {
+                    self.scopes.push(HashSet::new());
+                    if let Some(parameter) = &handler.parameter {
+                        self.current_scope_mut().insert(parameter.clone());
+                    }
+                    self.walk_statement(&handler.body);
+                    self.scopes.pop();
+                }
+                if let Some(finalizer) = finalizer {
+                    self.walk_statement(finalizer);
+                }
+            }
+
             StatementKind::FunctionDeclaration(function) => {
                 // Function declaration là closure được tạo trong scope hiện tại.
                 // Ta phải đi vào function con để propagate captures xuyên cấp.
@@ -225,7 +248,10 @@ impl FreeVariableCollector {
                 }
             }
 
-            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::Empty
+            | StatementKind::Debugger
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_) => {}
         }
     }
 
@@ -542,6 +568,51 @@ fn collect_return_type_hints(
                 }
             }
 
+            StatementKind::Labeled { body, .. } => {
+                let mut labeled_bindings = bindings.clone();
+                collect_return_type_hint_from_statement(
+                    body,
+                    &mut labeled_bindings,
+                    recursive_name,
+                    hints,
+                );
+            }
+
+            StatementKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                let mut try_bindings = bindings.clone();
+                collect_return_type_hint_from_statement(
+                    block,
+                    &mut try_bindings,
+                    recursive_name,
+                    hints,
+                );
+                if let Some(handler) = handler {
+                    let mut catch_bindings = bindings.clone();
+                    if let Some(parameter) = &handler.parameter {
+                        catch_bindings.insert(parameter.clone(), ValueType::Dynamic);
+                    }
+                    collect_return_type_hint_from_statement(
+                        &handler.body,
+                        &mut catch_bindings,
+                        recursive_name,
+                        hints,
+                    );
+                }
+                if let Some(finalizer) = finalizer {
+                    let mut finally_bindings = bindings.clone();
+                    collect_return_type_hint_from_statement(
+                        finalizer,
+                        &mut finally_bindings,
+                        recursive_name,
+                        hints,
+                    );
+                }
+            }
+
             StatementKind::FunctionDeclaration(function) => {
                 if let Some(name) = &function.name {
                     bindings.insert(name.clone(), ValueType::Callable);
@@ -571,7 +642,10 @@ fn collect_return_type_hints(
                 // must not widen or seed the function's return specialization.
             }
 
-            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::Empty
+            | StatementKind::Debugger
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_) => {}
         }
 
         // Return/throw make later statements in this lexical sequence
@@ -639,7 +713,28 @@ fn statement_always_terminates(statement: &Statement) -> bool {
                     .all(|case| statements_always_terminate(&case.consequent))
         }
 
-        StatementKind::Expression(_)
+        StatementKind::Labeled { body, .. } => statement_always_terminates(body),
+
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            if finalizer
+                .as_deref()
+                .is_some_and(statement_always_terminates)
+            {
+                true
+            } else if let Some(handler) = handler {
+                statement_always_terminates(block) && statement_always_terminates(&handler.body)
+            } else {
+                statement_always_terminates(block)
+            }
+        }
+
+        StatementKind::Empty
+        | StatementKind::Debugger
+        | StatementKind::Expression(_)
         | StatementKind::VariableDeclaration { .. }
         | StatementKind::If {
             alternate: None, ..
@@ -648,8 +743,8 @@ fn statement_always_terminates(statement: &Statement) -> bool {
         | StatementKind::ForIn { .. }
         | StatementKind::ForOf { .. }
         | StatementKind::FunctionDeclaration(_)
-        | StatementKind::Break
-        | StatementKind::Continue => false,
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => false,
     }
 }
 
@@ -701,13 +796,29 @@ fn statement_contains_direct_throw(statement: &Statement) -> bool {
             .iter()
             .flat_map(|case| &case.consequent)
             .any(statement_contains_direct_throw),
+        StatementKind::Labeled { body, .. } => statement_contains_direct_throw(body),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            statement_contains_direct_throw(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|handler| statement_contains_direct_throw(&handler.body))
+                || finalizer
+                    .as_deref()
+                    .is_some_and(statement_contains_direct_throw)
+        }
         // Nested function throws belong to the nested function.
         StatementKind::FunctionDeclaration(_)
+        | StatementKind::Empty
+        | StatementKind::Debugger
         | StatementKind::Expression(_)
         | StatementKind::VariableDeclaration { .. }
         | StatementKind::Return(_)
-        | StatementKind::Break
-        | StatementKind::Continue => false,
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => false,
     }
 }
 
@@ -1191,13 +1302,32 @@ pub(super) fn collect_used_names(statements: &[Statement]) -> HashSet<String> {
                     walk_statements(&case.consequent, names);
                 }
             }
+            StatementKind::Labeled { body, .. } => {
+                walk_statement(body, names);
+            }
+            StatementKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                walk_statement(block, names);
+                if let Some(handler) = handler {
+                    walk_statement(&handler.body, names);
+                }
+                if let Some(finalizer) = finalizer {
+                    walk_statement(finalizer, names);
+                }
+            }
             StatementKind::FunctionDeclaration(_) => {}
             StatementKind::Return(value) => {
                 if let Some(value) = value {
                     walk_expression(value, names);
                 }
             }
-            StatementKind::Break | StatementKind::Continue => {}
+            StatementKind::Empty
+            | StatementKind::Debugger
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_) => {}
         }
     }
 
@@ -1248,6 +1378,53 @@ pub(super) fn collect_used_names(statements: &[Statement]) -> HashSet<String> {
         }
     }
     names
+}
+
+pub(super) fn statement_contains_break_or_continue(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Break(_) | StatementKind::Continue(_) => true,
+        StatementKind::Block(body) => body.iter().any(statement_contains_break_or_continue),
+        StatementKind::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            statement_contains_break_or_continue(consequent)
+                || alternate
+                    .as_deref()
+                    .is_some_and(statement_contains_break_or_continue)
+        }
+        StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::For { body, .. }
+        | StatementKind::ForIn { body, .. }
+        | StatementKind::ForOf { body, .. }
+        | StatementKind::Labeled { body, .. } => statement_contains_break_or_continue(body),
+        StatementKind::Switch { cases, .. } => cases
+            .iter()
+            .flat_map(|case| &case.consequent)
+            .any(statement_contains_break_or_continue),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            statement_contains_break_or_continue(block)
+                || handler
+                    .as_ref()
+                    .is_some_and(|handler| statement_contains_break_or_continue(&handler.body))
+                || finalizer
+                    .as_deref()
+                    .is_some_and(statement_contains_break_or_continue)
+        }
+        StatementKind::FunctionDeclaration(_) => false,
+        StatementKind::Empty
+        | StatementKind::Debugger
+        | StatementKind::Expression(_)
+        | StatementKind::VariableDeclaration { .. }
+        | StatementKind::Return(_)
+        | StatementKind::Throw(_) => false,
+    }
 }
 
 pub(super) fn is_pure_expression_known(

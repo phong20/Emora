@@ -191,6 +191,23 @@ fn visit_statement(statement: &Statement, summary: &mut SemanticSummary) {
                 }
             }
         }
+        StatementKind::Labeled { body, .. } => {
+            visit_statement(body, summary);
+        }
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            summary.effects.insert(EffectSet::MAY_THROW);
+            visit_statement(block, summary);
+            if let Some(handler) = handler {
+                visit_statement(&handler.body, summary);
+            }
+            if let Some(finalizer) = finalizer {
+                visit_statement(finalizer, summary);
+            }
+        }
         StatementKind::FunctionDeclaration(function) => {
             visit_function(function, summary);
         }
@@ -199,7 +216,10 @@ fn visit_statement(statement: &Statement, summary: &mut SemanticSummary) {
                 visit_expression(value, summary);
             }
         }
-        StatementKind::Break | StatementKind::Continue => {}
+        StatementKind::Empty
+        | StatementKind::Debugger
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => {}
     }
 }
 

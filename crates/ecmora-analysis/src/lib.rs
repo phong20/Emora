@@ -145,6 +145,53 @@ struct PromiseChain {
     kind: PromiseChainKind,
 }
 
+type ControlEdge = (BlockId, Vec<HashMap<String, Binding>>);
+
+#[derive(Debug)]
+struct ControlTarget {
+    labels: Vec<String>,
+    accepts_unlabeled_break: bool,
+    break_target: BlockId,
+    continue_target: Option<BlockId>,
+    break_edges: Vec<ControlEdge>,
+    continue_edges: Vec<ControlEdge>,
+}
+
+impl ControlTarget {
+    fn iteration(labels: &[String], break_target: BlockId, continue_target: BlockId) -> Self {
+        Self {
+            labels: labels.to_vec(),
+            accepts_unlabeled_break: true,
+            break_target,
+            continue_target: Some(continue_target),
+            break_edges: Vec::new(),
+            continue_edges: Vec::new(),
+        }
+    }
+
+    fn switch(labels: &[String], break_target: BlockId) -> Self {
+        Self {
+            labels: labels.to_vec(),
+            accepts_unlabeled_break: true,
+            break_target,
+            continue_target: None,
+            break_edges: Vec::new(),
+            continue_edges: Vec::new(),
+        }
+    }
+
+    fn labeled(labels: &[String], break_target: BlockId) -> Self {
+        Self {
+            labels: labels.to_vec(),
+            accepts_unlabeled_break: false,
+            break_target,
+            continue_target: None,
+            break_edges: Vec::new(),
+            continue_edges: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingBlock {
     name: String,
@@ -159,10 +206,7 @@ struct Lowerer {
     current: usize,
     scopes: Vec<HashMap<String, Binding>>,
     strict: bool,
-    break_targets: Vec<BlockId>,
-    continue_targets: Vec<BlockId>,
-    continue_edges: Vec<Vec<(BlockId, Vec<HashMap<String, Binding>>)>>,
-    break_edges: Vec<Vec<(BlockId, Vec<HashMap<String, Binding>>)>>,
+    control_targets: Vec<ControlTarget>,
     function_defs: HashMap<String, HirFunction>,
     inline_callables: HashMap<String, ClosureBinding>,
     closure_callables: HashMap<String, ClosureBinding>,
@@ -212,6 +256,204 @@ impl Lowerer {
 
     fn set_terminator(&mut self, terminator: Terminator) {
         self.blocks[self.current].terminator = Some(terminator);
+    }
+
+    fn label_is_active(labels: &[String], label: &str) -> bool {
+        labels.iter().any(|candidate| candidate == label)
+    }
+
+    fn resolve_break_target(&self, label: Option<&str>) -> Result<usize> {
+        match label {
+            Some(label) => self
+                .control_targets
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, target)| Self::label_is_active(&target.labels, label))
+                .map(|(index, _)| index)
+                .ok_or_else(|| anyhow::anyhow!("break label `{label}` không tồn tại")),
+            None => self
+                .control_targets
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, target)| target.accepts_unlabeled_break)
+                .map(|(index, _)| index)
+                .ok_or_else(|| anyhow::anyhow!("break ngoài loop/switch")),
+        }
+    }
+
+    fn resolve_continue_target(&self, label: Option<&str>) -> Result<usize> {
+        match label {
+            Some(label) => {
+                let Some((index, target)) = self
+                    .control_targets
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, target)| Self::label_is_active(&target.labels, label))
+                else {
+                    bail!("continue label `{label}` không tồn tại")
+                };
+                if target.continue_target.is_none() {
+                    bail!("continue label `{label}` không trỏ tới iteration statement")
+                }
+                Ok(index)
+            }
+            None => self
+                .control_targets
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, target)| target.continue_target.is_some())
+                .map(|(index, _)| index)
+                .ok_or_else(|| anyhow::anyhow!("continue ngoài loop")),
+        }
+    }
+
+    fn lower_break(&mut self, label: Option<&str>) -> Result<()> {
+        let index = self.resolve_break_target(label)?;
+        let target = self.control_targets[index].break_target;
+        let edge = (BlockId(self.current as u32), self.scopes.clone());
+        self.control_targets[index].break_edges.push(edge);
+        self.set_terminator(Terminator::Jump(target));
+        Ok(())
+    }
+
+    fn lower_continue(&mut self, label: Option<&str>) -> Result<()> {
+        let index = self.resolve_continue_target(label)?;
+        let target = self.control_targets[index]
+            .continue_target
+            .expect("continue target was validated");
+        let edge = (BlockId(self.current as u32), self.scopes.clone());
+        self.control_targets[index].continue_edges.push(edge);
+        self.set_terminator(Terminator::Jump(target));
+        Ok(())
+    }
+
+    fn lower_labeled_statement(&mut self, label: &str, body: &Statement) -> Result<()> {
+        let mut labels = vec![label.to_owned()];
+        let mut body = body;
+        while let StatementKind::Labeled {
+            label: nested,
+            body: nested_body,
+        } = &body.kind
+        {
+            if labels.iter().any(|active| active == nested) {
+                bail!("duplicate active label `{nested}`")
+            }
+            labels.push(nested.clone());
+            body = nested_body.as_ref();
+        }
+
+        match &body.kind {
+            StatementKind::While { test, body } => {
+                self.lower_loop(None, Some(test), None, body, &labels)
+            }
+            StatementKind::DoWhile { body, test } => self.lower_do_while(body, test, &labels),
+            StatementKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => self.lower_loop(init.as_ref(), test.as_ref(), update.as_ref(), body, &labels),
+            StatementKind::Switch {
+                discriminant,
+                cases,
+            } => self.lower_switch(discriminant, cases, &labels),
+            StatementKind::ForIn { .. } | StatementKind::ForOf { .. } => {
+                bail!("labeled for-in/of uses compatibility iterator completion lowering")
+            }
+            _ => self.lower_non_iteration_label(body, &labels),
+        }
+    }
+
+    fn lower_non_iteration_label(&mut self, body: &Statement, labels: &[String]) -> Result<()> {
+        let outer_scopes = self.scopes.clone();
+        let exit = self.new_block("label.exit");
+        self.control_targets
+            .push(ControlTarget::labeled(labels, exit));
+
+        self.lower_statement(body)?;
+        let natural = if self.blocks[self.current].terminator.is_none() {
+            let edge = (BlockId(self.current as u32), self.scopes.clone());
+            self.set_terminator(Terminator::Jump(exit));
+            Some(edge)
+        } else {
+            None
+        };
+
+        let mut control = self
+            .control_targets
+            .pop()
+            .expect("labeled control target disappeared");
+        if !control.continue_edges.is_empty() {
+            bail!("continue cannot target a non-iteration label")
+        }
+        if let Some(natural) = natural {
+            control.break_edges.push(natural);
+        }
+
+        self.current = exit.0 as usize;
+        self.merge_control_exit_scopes(outer_scopes, control.break_edges)
+    }
+
+    fn merge_control_exit_scopes(
+        &mut self,
+        outer_scopes: Vec<HashMap<String, Binding>>,
+        edges: Vec<ControlEdge>,
+    ) -> Result<()> {
+        self.scopes = outer_scopes;
+        if edges.is_empty() {
+            self.set_terminator(Terminator::Unreachable);
+            return Ok(());
+        }
+
+        for scope_index in 0..self.scopes.len() {
+            let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
+            for name in names {
+                let first = edges[0].1[scope_index]
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("label edge thiếu binding `{name}`"))?
+                    .clone();
+                if edges.iter().all(|(_, scopes)| {
+                    scopes[scope_index]
+                        .get(&name)
+                        .is_some_and(|binding| binding.value_id == first.value_id)
+                }) {
+                    *self.scopes[scope_index].get_mut(&name).unwrap() = first;
+                    continue;
+                }
+
+                let mut value_type = first.value_type;
+                let mut initialized = first.initialized;
+                let incoming = edges
+                    .iter()
+                    .map(|(block, scopes)| {
+                        let binding = scopes[scope_index]
+                            .get(&name)
+                            .expect("control edge binding shape changed");
+                        if binding.value_type != value_type {
+                            value_type = ValueType::Dynamic;
+                        }
+                        initialized &= binding.initialized;
+                        (*block, binding.value_id)
+                    })
+                    .collect::<Vec<_>>();
+                let result = self.new_value();
+                self.emit(Instruction::Phi {
+                    result,
+                    value_type,
+                    incoming,
+                });
+                let binding = self.scopes[scope_index].get_mut(&name).unwrap();
+                binding.value_id = result;
+                binding.value_type = value_type;
+                binding.initialized = initialized;
+                binding.value = None;
+            }
+        }
+        Ok(())
     }
 
     fn lower_scope(&mut self, statements: &[Statement]) -> Result<()> {
@@ -294,6 +536,14 @@ impl Lowerer {
 
     fn lower_statement(&mut self, statement: &Statement) -> Result<()> {
         match &statement.kind {
+            StatementKind::Empty | StatementKind::Debugger => Ok(()),
+            StatementKind::Labeled { label, body } => self.lower_labeled_statement(label, body),
+            StatementKind::Try { .. } => {
+                bail!(
+                    "try/catch/finally requires compatibility completion dispatcher; \
+                     native LLVM cleanup ABI is not available"
+                )
+            }
             StatementKind::Expression(expression) => {
                 self.lower_expression(expression)?;
                 Ok(())
@@ -309,14 +559,16 @@ impl Lowerer {
                 consequent,
                 alternate,
             } => self.lower_if(test, consequent, alternate.as_deref()),
-            StatementKind::While { test, body } => self.lower_loop(None, Some(test), None, body),
-            StatementKind::DoWhile { body, test } => self.lower_do_while(body, test),
+            StatementKind::While { test, body } => {
+                self.lower_loop(None, Some(test), None, body, &[])
+            }
+            StatementKind::DoWhile { body, test } => self.lower_do_while(body, test, &[]),
             StatementKind::For {
                 init,
                 test,
                 update,
                 body,
-            } => self.lower_loop(init.as_ref(), test.as_ref(), update.as_ref(), body),
+            } => self.lower_loop(init.as_ref(), test.as_ref(), update.as_ref(), body, &[]),
             StatementKind::ForIn {
                 name,
                 kind,
@@ -363,33 +615,9 @@ impl Lowerer {
             StatementKind::Switch {
                 discriminant,
                 cases,
-            } => self.lower_switch(discriminant, cases),
-            StatementKind::Break => {
-                let target = self
-                    .break_targets
-                    .last()
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("break ngoài loop/switch"))?;
-                let scopes = self.scopes.clone();
-                if let Some(edges) = self.break_edges.last_mut() {
-                    edges.push((BlockId(self.current as u32), scopes));
-                }
-                self.set_terminator(Terminator::Jump(target));
-                Ok(())
-            }
-            StatementKind::Continue => {
-                let target = self
-                    .continue_targets
-                    .last()
-                    .copied()
-                    .ok_or_else(|| anyhow::anyhow!("continue ngoài loop"))?;
-                let scopes = self.scopes.clone();
-                if let Some(edges) = self.continue_edges.last_mut() {
-                    edges.push((BlockId(self.current as u32), scopes));
-                }
-                self.set_terminator(Terminator::Jump(target));
-                Ok(())
-            }
+            } => self.lower_switch(discriminant, cases, &[]),
+            StatementKind::Break(label) => self.lower_break(label.as_deref()),
+            StatementKind::Continue(label) => self.lower_continue(label.as_deref()),
             StatementKind::VariableDeclaration { kind, declarations } => {
                 for declaration in declarations {
                     let is_used = self
@@ -467,6 +695,7 @@ impl Lowerer {
         test: Option<&Expression>,
         update: Option<&Expression>,
         body: &Statement,
+        labels: &[String],
     ) -> Result<()> {
         let has_for_scope = init.is_some();
         if has_for_scope {
@@ -568,15 +797,18 @@ impl Lowerer {
         });
 
         self.current = body_block.0 as usize;
-        self.break_targets.push(exit);
-        self.break_edges.push(Vec::new());
-        self.continue_edges.push(Vec::new());
-        self.continue_targets.push(update_block.unwrap_or(header));
+        self.control_targets.push(ControlTarget::iteration(
+            labels,
+            exit,
+            update_block.unwrap_or(header),
+        ));
         self.lower_statement(body)?;
-        self.continue_targets.pop();
-        let continue_edges = self.continue_edges.pop().unwrap();
-        self.break_targets.pop();
-        let break_edges = self.break_edges.pop().unwrap();
+        let control = self
+            .control_targets
+            .pop()
+            .expect("loop control target disappeared");
+        let continue_edges = control.continue_edges;
+        let break_edges = control.break_edges;
 
         let body_reaches_backedge = self.blocks[self.current].terminator.is_none();
         let body_end = BlockId(self.current as u32);
@@ -706,6 +938,9 @@ impl Lowerer {
         body: &Statement,
         is_of: bool,
     ) -> Result<()> {
+        if statement_contains_break_or_continue(body) {
+            bail!("break/continue in for-in/of requires compatibility iterator completion lowering")
+        }
         let iterable = self.lower_expression(right)?;
         let Some(known) = iterable.2 else {
             bail!("for-in/of cần known iterable để static unroll")
@@ -750,7 +985,12 @@ impl Lowerer {
         Ok(())
     }
 
-    fn lower_do_while(&mut self, body: &Statement, test: &Expression) -> Result<()> {
+    fn lower_do_while(
+        &mut self,
+        body: &Statement,
+        test: &Expression,
+        labels: &[String],
+    ) -> Result<()> {
         let preheader = BlockId(self.current as u32);
         let body_block = self.new_block("do.body");
         let test_block = self.new_block("do.test");
@@ -777,15 +1017,15 @@ impl Lowerer {
                 phis.push((scope_index, name, index, result, binding.value_type));
             }
         }
-        self.break_targets.push(exit);
-        self.break_edges.push(Vec::new());
-        self.continue_targets.push(test_block);
-        self.continue_edges.push(Vec::new());
+        self.control_targets
+            .push(ControlTarget::iteration(labels, exit, test_block));
         self.lower_statement(body)?;
-        let continue_edges = self.continue_edges.pop().unwrap();
-        self.continue_targets.pop();
-        let break_edges = self.break_edges.pop().unwrap();
-        self.break_targets.pop();
+        let control = self
+            .control_targets
+            .pop()
+            .expect("do-while control target disappeared");
+        let continue_edges = control.continue_edges;
+        let break_edges = control.break_edges;
         let body_reaches_test = self.blocks[self.current].terminator.is_none();
         let body_end = BlockId(self.current as u32);
         if body_reaches_test {
@@ -880,6 +1120,7 @@ impl Lowerer {
         &mut self,
         discriminant: &Expression,
         cases: &[ecmora_hir::SwitchCase],
+        labels: &[String],
     ) -> Result<()> {
         let discriminant = self.lower_expression(discriminant)?;
         let outer_scopes = self.scopes.clone();
@@ -965,8 +1206,8 @@ impl Lowerer {
             }
         }
 
-        self.break_targets.push(exit);
-        self.break_edges.push(Vec::new());
+        self.control_targets
+            .push(ControlTarget::switch(labels, exit));
         let mut natural_exit_edges = Vec::new();
         let mut previous_fallthrough: Option<(BlockId, Vec<HashMap<String, Binding>>)> = None;
         for (index, case) in cases.iter().enumerate() {
@@ -1004,8 +1245,11 @@ impl Lowerer {
                 previous_fallthrough = None;
             }
         }
-        self.break_targets.pop();
-        let mut exit_edges = self.break_edges.pop().unwrap();
+        let control = self
+            .control_targets
+            .pop()
+            .expect("switch control target disappeared");
+        let mut exit_edges = control.break_edges;
         exit_edges.extend(natural_exit_edges);
         if let Some(block) = no_match_edge {
             exit_edges.push((block, outer_scopes.clone()));

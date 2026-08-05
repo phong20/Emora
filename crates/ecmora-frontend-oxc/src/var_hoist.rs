@@ -176,13 +176,31 @@ fn collect_var_names(
                     collect_var_names(&case.consequent, names, seen);
                 }
             }
+            StatementKind::Labeled { body, .. } => {
+                collect_var_names(std::slice::from_ref(body.as_ref()), names, seen);
+            }
+            StatementKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                collect_var_names(std::slice::from_ref(block.as_ref()), names, seen);
+                if let Some(handler) = handler {
+                    collect_var_names(std::slice::from_ref(handler.body.as_ref()), names, seen);
+                }
+                if let Some(finalizer) = finalizer {
+                    collect_var_names(std::slice::from_ref(finalizer.as_ref()), names, seen);
+                }
+            }
             StatementKind::FunctionDeclaration(_)
+            | StatementKind::Empty
+            | StatementKind::Debugger
             | StatementKind::Expression(_)
             | StatementKind::VariableDeclaration { .. }
             | StatementKind::Return(_)
             | StatementKind::Throw(_)
-            | StatementKind::Break
-            | StatementKind::Continue => {}
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_) => {}
         }
     }
 }
@@ -342,6 +360,38 @@ fn rewrite_statement(statement: Statement, counter: &mut u32) -> Result<Vec<Stat
                 kind: StatementKind::Switch {
                     discriminant,
                     cases,
+                },
+                span,
+            }])
+        }
+        StatementKind::Labeled { label, body } => Ok(vec![Statement {
+            kind: StatementKind::Labeled {
+                label,
+                body: Box::new(pack(rewrite_statement(*body, counter)?, span)),
+            },
+            span,
+        }]),
+        StatementKind::Try {
+            block,
+            mut handler,
+            finalizer,
+        } => {
+            let block = Box::new(pack(rewrite_statement(*block, counter)?, span));
+            if let Some(handler) = &mut handler {
+                handler.body = Box::new(pack(
+                    rewrite_statement(*handler.body.clone(), counter)?,
+                    handler.span,
+                ));
+            }
+            let finalizer = finalizer
+                .map(|finalizer| rewrite_statement(*finalizer, counter))
+                .transpose()?
+                .map(|statements| Box::new(pack(statements, span)));
+            Ok(vec![Statement {
+                kind: StatementKind::Try {
+                    block,
+                    handler,
+                    finalizer,
                 },
                 span,
             }])
