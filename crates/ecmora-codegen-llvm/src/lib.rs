@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use ecmora_ir::{
-    BinaryNumberOperator, Builtin, CompareNumberOperator, Instruction, Program, Terminator,
-    UnaryBoolOperator, UnaryNumberOperator, ValueId, ValueType,
+    BinaryNumberOperator, Builtin, CallArgument, CompareNumberOperator, DynamicBinaryOperator,
+    DynamicUnaryOperator, Instruction, Program, Terminator, UnaryBoolOperator, UnaryNumberOperator,
+    ValueId, ValueType,
 };
 use inkwell::{
     AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
@@ -251,6 +252,176 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
     let tail_argv_reserve = module.add_function(
         "ecmora_tail_argv_reserve",
         ptr_type.fn_type(&[i32_type.into()], false),
+        None,
+    );
+
+    let closure_new_ex = module.add_function(
+        "ecmora_closure_new_ex",
+        ptr_type.fn_type(
+            &[
+                ptr_type.into(),
+                i32_type.into(),
+                ptr_type.into(),
+                i32_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let current_this = module.add_function(
+        "ecmora_current_this",
+        context.void_type().fn_type(&[ptr_type.into()], false),
+        None,
+    );
+    let arguments_object = module.add_function(
+        "ecmora_arguments_object",
+        ptr_type.fn_type(&[i32_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let rest_array = module.add_function(
+        "ecmora_rest_array",
+        ptr_type.fn_type(&[i32_type.into(), ptr_type.into(), i32_type.into()], false),
+        None,
+    );
+    let argv_builder_init = module.add_function(
+        "ecmora_argv_builder_init",
+        context.void_type().fn_type(&[ptr_type.into()], false),
+        None,
+    );
+    let argv_builder_push = module.add_function(
+        "ecmora_argv_builder_push",
+        context
+            .void_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let argv_builder_spread = module.add_function(
+        "ecmora_argv_builder_spread",
+        i8_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let argv_builder_len = module.add_function(
+        "ecmora_argv_builder_len",
+        i32_type.fn_type(&[ptr_type.into()], false),
+        None,
+    );
+    let argv_builder_data = module.add_function(
+        "ecmora_argv_builder_data",
+        ptr_type.fn_type(&[ptr_type.into()], false),
+        None,
+    );
+    let argv_builder_destroy = module.add_function(
+        "ecmora_argv_builder_destroy",
+        context.void_type().fn_type(&[ptr_type.into()], false),
+        None,
+    );
+    let callable_dispatch = module.add_function(
+        "ecmora_callable_dispatch",
+        i8_type.fn_type(
+            &[
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+                bool_type.into(),
+                i32_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let callable_construct = module.add_function(
+        "ecmora_callable_construct",
+        i8_type.fn_type(
+            &[
+                ptr_type.into(),
+                i32_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let callable_bind = module.add_function(
+        "ecmora_callable_bind_value",
+        i8_type.fn_type(
+            &[
+                ptr_type.into(),
+                ptr_type.into(),
+                i32_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let dynamic_unary = module.add_function(
+        "ecmora_dynamic_unary",
+        i8_type.fn_type(&[i8_type.into(), ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let dynamic_binary = module.add_function(
+        "ecmora_dynamic_binary",
+        i8_type.fn_type(
+            &[
+                i8_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let dynamic_get = module.add_function(
+        "ecmora_dynamic_get",
+        i8_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let dynamic_set = module.add_function(
+        "ecmora_dynamic_set",
+        i8_type.fn_type(
+            &[
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let dynamic_delete = module.add_function(
+        "ecmora_dynamic_delete",
+        i8_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let array_push = module.add_function(
+        "ecmora_array_push",
+        context
+            .void_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let array_spread = module.add_function(
+        "ecmora_array_spread",
+        i8_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let object_get_value = module.add_function(
+        "ecmora_object_get_value",
+        bool_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+    let object_set_value = module.add_function(
+        "ecmora_object_set_value",
+        context
+            .void_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
         None,
     );
     let cell_new = module.add_function(
@@ -757,31 +928,30 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             .into_pointer_value();
                         let key = builder
                             .build_global_string_ptr(key, &format!(".object.key.{}", result.0))?;
-                        if matches!(value_type, ValueType::Undefined | ValueType::Null) {
-                            let value = match value_type {
-                                ValueType::Undefined => i8_type.const_zero(),
-                                ValueType::Null => i8_type.const_int(1, false),
-                                _ => unreachable!(),
-                            };
-                            values.insert(*result, value.into());
-                            continue;
-                        }
-                        let function = match value_type {
-                            ValueType::Number => object_get_number,
-                            ValueType::Bool => object_get_bool,
-                            ValueType::String | ValueType::Object => object_get_string,
-                            _ => bail!("object get kiểu {:?} chưa được hỗ trợ", value_type),
-                        };
-                        let call = builder.build_call(
-                            function,
-                            &[object.into(), key.as_pointer_value().into()],
-                            "object.get",
+                        let dynamic_ptr = builder.build_alloca(dynamic_type, "object.get.value")?;
+                        builder.build_store(dynamic_ptr, dynamic_type.const_zero())?;
+                        builder.build_call(
+                            object_get_value,
+                            &[
+                                object.into(),
+                                key.as_pointer_value().into(),
+                                dynamic_ptr.into(),
+                            ],
+                            "object.get.value",
                         )?;
+                        let dynamic = builder
+                            .build_load(dynamic_type, dynamic_ptr, "object.get.load")?
+                            .into_struct_value();
                         values.insert(
                             *result,
-                            call.try_as_basic_value()
-                                .basic()
-                                .context("object_get không trả value")?,
+                            from_dynamic(
+                                &builder,
+                                dynamic,
+                                *value_type,
+                                bool_type,
+                                f64_type,
+                                ptr_type,
+                            )?,
                         );
                     }
                     Instruction::ObjectSet {
@@ -795,34 +965,27 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             .copied()
                             .context("thiếu object SSA")?
                             .into_pointer_value();
-                        let value = values
-                            .get(value)
-                            .copied()
-                            .context("thiếu property value SSA")?;
+                        let value_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(value)
+                                .copied()
+                                .context("thiếu property value SSA")?,
+                            *value_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "object.set.value",
+                        )?;
                         let key = builder.build_global_string_ptr(key, ".object.set.key")?;
-                        if matches!(value_type, ValueType::Undefined | ValueType::Null) {
-                            let function = if *value_type == ValueType::Undefined {
-                                object_set_undefined
-                            } else {
-                                object_set_null
-                            };
-                            builder.build_call(
-                                function,
-                                &[object.into(), key.as_pointer_value().into()],
-                                "object.set.nullish",
-                            )?;
-                            continue;
-                        }
-                        let function = match value_type {
-                            ValueType::Number => object_set_number,
-                            ValueType::Bool => object_set_bool,
-                            ValueType::String | ValueType::Object => object_set_string,
-                            _ => bail!("object set kiểu {:?} chưa được hỗ trợ", value_type),
-                        };
                         builder.build_call(
-                            function,
-                            &[object.into(), key.as_pointer_value().into(), value.into()],
-                            "object.set",
+                            object_set_value,
+                            &[
+                                object.into(),
+                                key.as_pointer_value().into(),
+                                value_ptr.into(),
+                            ],
+                            "object.set.value",
                         )?;
                     }
                     Instruction::ObjectDelete {
@@ -1389,6 +1552,798 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             )?,
                         );
                     }
+
+                    Instruction::CurrentThis { result } => {
+                        let dynamic_ptr =
+                            builder.build_alloca(dynamic_type, "current.this.value")?;
+                        builder.build_call(current_this, &[dynamic_ptr.into()], "current.this")?;
+                        let dynamic = builder
+                            .build_load(dynamic_type, dynamic_ptr, "current.this.load")?
+                            .into_struct_value();
+                        values.insert(*result, dynamic.into());
+                    }
+                    Instruction::CurrentCallable { result } => {
+                        let closure = main
+                            .get_nth_param(0)
+                            .context("JavaScript function thiếu current callable")?
+                            .into_pointer_value();
+                        values.insert(*result, closure.into());
+                    }
+                    Instruction::ArgumentsObject { result } => {
+                        let argc = main
+                            .get_nth_param(1)
+                            .context("JavaScript function thiếu argc")?
+                            .into_int_value();
+                        let argv = main
+                            .get_nth_param(2)
+                            .context("JavaScript function thiếu argv")?
+                            .into_pointer_value();
+                        let call = builder.build_call(
+                            arguments_object,
+                            &[argc.into(), argv.into()],
+                            "arguments.object",
+                        )?;
+                        values.insert(
+                            *result,
+                            call.try_as_basic_value()
+                                .basic()
+                                .context("arguments_object không trả pointer")?,
+                        );
+                    }
+                    Instruction::RestArray { result, start } => {
+                        let argc = main
+                            .get_nth_param(1)
+                            .context("JavaScript function thiếu argc")?
+                            .into_int_value();
+                        let argv = main
+                            .get_nth_param(2)
+                            .context("JavaScript function thiếu argv")?
+                            .into_pointer_value();
+                        let call = builder.build_call(
+                            rest_array,
+                            &[
+                                argc.into(),
+                                argv.into(),
+                                i32_type.const_int(*start as u64, false).into(),
+                            ],
+                            "rest.array",
+                        )?;
+                        values.insert(
+                            *result,
+                            call.try_as_basic_value()
+                                .basic()
+                                .context("rest_array không trả pointer")?,
+                        );
+                    }
+                    Instruction::ArrayPush {
+                        array,
+                        value,
+                        value_type,
+                    } => {
+                        let array = values
+                            .get(array)
+                            .copied()
+                            .context("thiếu array SSA")?
+                            .into_pointer_value();
+                        let value_ptr = box_value_pointer(
+                            &builder,
+                            values.get(value).copied().context("thiếu array value")?,
+                            *value_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "array.push.value",
+                        )?;
+                        builder.build_call(
+                            array_push,
+                            &[array.into(), value_ptr.into()],
+                            "array.push",
+                        )?;
+                    }
+                    Instruction::ArraySpread {
+                        array,
+                        iterable,
+                        iterable_type,
+                    } => {
+                        let array = values
+                            .get(array)
+                            .copied()
+                            .context("thiếu array SSA")?
+                            .into_pointer_value();
+                        let iterable_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(iterable)
+                                .copied()
+                                .context("thiếu array spread iterable")?,
+                            *iterable_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "array.spread.iterable",
+                        )?;
+                        let error_ptr = builder.build_alloca(dynamic_type, "array.spread.error")?;
+                        builder.build_store(error_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            array_spread,
+                            &[array.into(), iterable_ptr.into(), error_ptr.into()],
+                            "array.spread",
+                        )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("array_spread không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, error_ptr, "array.spread.error.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("array.spread.{index}"),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                    }
+                    Instruction::DynamicUnary {
+                        result,
+                        operator,
+                        operand,
+                        operand_type,
+                    } => {
+                        let operand_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(operand)
+                                .copied()
+                                .context("thiếu dynamic unary operand")?,
+                            *operand_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.unary.operand",
+                        )?;
+                        let result_ptr =
+                            builder.build_alloca(dynamic_type, "dynamic.unary.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            dynamic_unary,
+                            &[
+                                i8_type.const_int(*operator as u64, false).into(),
+                                operand_ptr.into(),
+                                result_ptr.into(),
+                            ],
+                            "dynamic.unary",
+                        )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("dynamic_unary không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "dynamic.unary.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("dynamic.unary.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(*result, dynamic.into());
+                    }
+                    Instruction::DynamicBinary {
+                        result,
+                        operator,
+                        left,
+                        left_type,
+                        right,
+                        right_type,
+                    } => {
+                        let left_ptr = box_value_pointer(
+                            &builder,
+                            values.get(left).copied().context("thiếu dynamic left")?,
+                            *left_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.binary.left",
+                        )?;
+                        let right_ptr = box_value_pointer(
+                            &builder,
+                            values.get(right).copied().context("thiếu dynamic right")?,
+                            *right_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.binary.right",
+                        )?;
+                        let result_ptr =
+                            builder.build_alloca(dynamic_type, "dynamic.binary.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            dynamic_binary,
+                            &[
+                                i8_type.const_int(*operator as u64, false).into(),
+                                left_ptr.into(),
+                                right_ptr.into(),
+                                result_ptr.into(),
+                            ],
+                            "dynamic.binary",
+                        )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("dynamic_binary không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "dynamic.binary.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("dynamic.binary.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(*result, dynamic.into());
+                    }
+                    Instruction::DynamicGet {
+                        result,
+                        object,
+                        object_type,
+                        key,
+                    } => {
+                        let object_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(object)
+                                .copied()
+                                .context("thiếu dynamic object")?,
+                            *object_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.get.object",
+                        )?;
+                        let key = builder.build_global_string_ptr(
+                            key,
+                            &format!(".dynamic.get.key.{}", result.0),
+                        )?;
+                        let result_ptr =
+                            builder.build_alloca(dynamic_type, "dynamic.get.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            dynamic_get,
+                            &[
+                                object_ptr.into(),
+                                key.as_pointer_value().into(),
+                                result_ptr.into(),
+                            ],
+                            "dynamic.get",
+                        )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("dynamic_get không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "dynamic.get.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("dynamic.get.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(*result, dynamic.into());
+                    }
+                    Instruction::DynamicSet {
+                        object,
+                        object_type,
+                        key,
+                        value,
+                        value_type,
+                    } => {
+                        let object_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(object)
+                                .copied()
+                                .context("thiếu dynamic object")?,
+                            *object_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.set.object",
+                        )?;
+                        let value_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(value)
+                                .copied()
+                                .context("thiếu dynamic set value")?,
+                            *value_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.set.value",
+                        )?;
+                        let key = builder.build_global_string_ptr(key, ".dynamic.set.key")?;
+                        let error_ptr = builder.build_alloca(dynamic_type, "dynamic.set.error")?;
+                        builder.build_store(error_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            dynamic_set,
+                            &[
+                                object_ptr.into(),
+                                key.as_pointer_value().into(),
+                                value_ptr.into(),
+                                error_ptr.into(),
+                            ],
+                            "dynamic.set",
+                        )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("dynamic_set không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, error_ptr, "dynamic.set.error.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("dynamic.set.{index}"),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                    }
+                    Instruction::DynamicDelete {
+                        result,
+                        object,
+                        object_type,
+                        key,
+                    } => {
+                        let object_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(object)
+                                .copied()
+                                .context("thiếu dynamic object")?,
+                            *object_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "dynamic.delete.object",
+                        )?;
+                        let key = builder.build_global_string_ptr(
+                            key,
+                            &format!(".dynamic.delete.key.{}", result.0),
+                        )?;
+                        let result_ptr =
+                            builder.build_alloca(dynamic_type, "dynamic.delete.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            dynamic_delete,
+                            &[
+                                object_ptr.into(),
+                                key.as_pointer_value().into(),
+                                result_ptr.into(),
+                            ],
+                            "dynamic.delete",
+                        )?;
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("dynamic_delete không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "dynamic.delete.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("dynamic.delete.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(
+                            *result,
+                            from_dynamic(
+                                &builder,
+                                dynamic,
+                                ValueType::Bool,
+                                bool_type,
+                                f64_type,
+                                ptr_type,
+                            )?,
+                        );
+                    }
+                    Instruction::ClosureNewGeneric {
+                        result,
+                        function,
+                        captures,
+                        capture_types,
+                        constructable,
+                        strict,
+                        lexical_this,
+                        lexical_this_type,
+                    } => {
+                        let code = llvm_functions
+                            .get(function)
+                            .copied()
+                            .with_context(|| {
+                                format!("unknown generic closure function `{function}`")
+                            })?
+                            .as_global_value()
+                            .as_pointer_value();
+                        let capture_array = build_dynamic_array(
+                            &builder,
+                            captures,
+                            capture_types,
+                            &values,
+                            i8_type,
+                            i32_type,
+                            i64_type,
+                            dynamic_type,
+                        )?;
+                        let lexical_pointer = match (lexical_this, lexical_this_type) {
+                            (Some(value), Some(value_type)) => box_value_pointer(
+                                &builder,
+                                values
+                                    .get(value)
+                                    .copied()
+                                    .context("thiếu lexical this SSA")?,
+                                *value_type,
+                                i8_type,
+                                i64_type,
+                                dynamic_type,
+                                "closure.lexical.this",
+                            )?,
+                            (None, None) => ptr_type.const_null(),
+                            _ => bail!("lexical this metadata không khớp"),
+                        };
+                        let mut flags = 0_u64;
+                        if *constructable {
+                            flags |= 1;
+                        }
+                        if lexical_this.is_some() {
+                            flags |= 2;
+                        }
+                        if *strict {
+                            flags |= 4;
+                        }
+                        let call = builder.build_call(
+                            closure_new_ex,
+                            &[
+                                code.into(),
+                                i32_type.const_int(captures.len() as u64, false).into(),
+                                capture_array.into(),
+                                i32_type.const_int(flags, false).into(),
+                                lexical_pointer.into(),
+                            ],
+                            "closure.new.generic",
+                        )?;
+                        values.insert(
+                            *result,
+                            call.try_as_basic_value()
+                                .basic()
+                                .context("closure_new_ex không trả pointer")?,
+                        );
+                    }
+                    Instruction::CallValue {
+                        result,
+                        callee,
+                        callee_type,
+                        receiver,
+                        receiver_type,
+                        arguments,
+                    } => {
+                        let callee_ptr = box_value_pointer(
+                            &builder,
+                            values
+                                .get(callee)
+                                .copied()
+                                .context("thiếu generic callee")?,
+                            *callee_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "call.value.callee",
+                        )?;
+                        let receiver_ptr = match (receiver, receiver_type) {
+                            (Some(value), Some(value_type)) => box_value_pointer(
+                                &builder,
+                                values.get(value).copied().context("thiếu call receiver")?,
+                                *value_type,
+                                i8_type,
+                                i64_type,
+                                dynamic_type,
+                                "call.value.receiver",
+                            )?,
+                            (None, None) => {
+                                let pointer = builder
+                                    .build_alloca(dynamic_type, "call.value.undefined.this")?;
+                                builder.build_store(pointer, dynamic_type.const_zero())?;
+                                pointer
+                            }
+                            _ => bail!("call receiver metadata không khớp"),
+                        };
+                        let new_target_ptr =
+                            builder.build_alloca(dynamic_type, "call.value.new.target")?;
+                        builder.build_store(new_target_ptr, dynamic_type.const_zero())?;
+                        let built = build_generic_arguments(
+                            &builder,
+                            arguments,
+                            &values,
+                            i8_type,
+                            i32_type,
+                            i64_type,
+                            ptr_type,
+                            dynamic_type,
+                            argv_builder_init,
+                            argv_builder_push,
+                            argv_builder_spread,
+                            argv_builder_len,
+                            argv_builder_data,
+                        )?;
+                        let result_ptr = builder.build_alloca(dynamic_type, "call.value.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            callable_dispatch,
+                            &[
+                                callee_ptr.into(),
+                                receiver_ptr.into(),
+                                new_target_ptr.into(),
+                                bool_type.const_zero().into(),
+                                built.argc.into(),
+                                built.argv.into(),
+                                result_ptr.into(),
+                            ],
+                            "call.value",
+                        )?;
+                        if let Some(handle) = built.builder {
+                            builder.build_call(
+                                argv_builder_destroy,
+                                &[handle.into()],
+                                "call.argv.destroy",
+                            )?;
+                        }
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("callable_dispatch không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "call.value.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("call.value.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(*result, dynamic.into());
+                    }
+                    Instruction::ConstructValue {
+                        result,
+                        callee,
+                        callee_type,
+                        arguments,
+                    } => {
+                        let callee_ptr = box_value_pointer(
+                            &builder,
+                            values.get(callee).copied().context("thiếu constructor")?,
+                            *callee_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "construct.callee",
+                        )?;
+                        let built = build_generic_arguments(
+                            &builder,
+                            arguments,
+                            &values,
+                            i8_type,
+                            i32_type,
+                            i64_type,
+                            ptr_type,
+                            dynamic_type,
+                            argv_builder_init,
+                            argv_builder_push,
+                            argv_builder_spread,
+                            argv_builder_len,
+                            argv_builder_data,
+                        )?;
+                        let result_ptr = builder.build_alloca(dynamic_type, "construct.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            callable_construct,
+                            &[
+                                callee_ptr.into(),
+                                built.argc.into(),
+                                built.argv.into(),
+                                result_ptr.into(),
+                            ],
+                            "construct.value",
+                        )?;
+                        if let Some(handle) = built.builder {
+                            builder.build_call(
+                                argv_builder_destroy,
+                                &[handle.into()],
+                                "construct.argv.destroy",
+                            )?;
+                        }
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("callable_construct không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "construct.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("construct.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(*result, dynamic.into());
+                    }
+                    Instruction::BindValue {
+                        result,
+                        target,
+                        target_type,
+                        this_arg,
+                        this_type,
+                        arguments,
+                    } => {
+                        let target_ptr = box_value_pointer(
+                            &builder,
+                            values.get(target).copied().context("thiếu bind target")?,
+                            *target_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "bind.target",
+                        )?;
+                        let this_ptr = box_value_pointer(
+                            &builder,
+                            values.get(this_arg).copied().context("thiếu bind this")?,
+                            *this_type,
+                            i8_type,
+                            i64_type,
+                            dynamic_type,
+                            "bind.this",
+                        )?;
+                        let built = build_generic_arguments(
+                            &builder,
+                            arguments,
+                            &values,
+                            i8_type,
+                            i32_type,
+                            i64_type,
+                            ptr_type,
+                            dynamic_type,
+                            argv_builder_init,
+                            argv_builder_push,
+                            argv_builder_spread,
+                            argv_builder_len,
+                            argv_builder_data,
+                        )?;
+                        let result_ptr = builder.build_alloca(dynamic_type, "bind.result")?;
+                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                        let call = builder.build_call(
+                            callable_bind,
+                            &[
+                                target_ptr.into(),
+                                this_ptr.into(),
+                                built.argc.into(),
+                                built.argv.into(),
+                                result_ptr.into(),
+                            ],
+                            "bind.value",
+                        )?;
+                        if let Some(handle) = built.builder {
+                            builder.build_call(
+                                argv_builder_destroy,
+                                &[handle.into()],
+                                "bind.argv.destroy",
+                            )?;
+                        }
+                        let status = call
+                            .try_as_basic_value()
+                            .basic()
+                            .context("callable_bind không trả status")?
+                            .into_int_value();
+                        let dynamic = builder
+                            .build_load(dynamic_type, result_ptr, "bind.load")?
+                            .into_struct_value();
+                        let continuation = propagate_call_completion(
+                            context,
+                            &builder,
+                            main,
+                            is_process_entry,
+                            status,
+                            dynamic,
+                            dynamic_type,
+                            i8_type,
+                            throw_uncaught,
+                            recursion_leave,
+                            &format!("bind.{index}.{}", result.0),
+                        )?;
+                        llvm_block_exits[index] = continuation;
+                        values.insert(
+                            *result,
+                            from_dynamic(
+                                &builder,
+                                dynamic,
+                                ValueType::Callable,
+                                bool_type,
+                                f64_type,
+                                ptr_type,
+                            )?,
+                        );
+                    }
                     Instruction::CallBuiltin {
                         builtin: Builtin::ConsoleLog,
                         arguments,
@@ -1507,7 +2462,10 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                                         let dynamic = to_dynamic(
                                             &builder,
                                             value,
-                                            ValueType::Object,
+                                            types
+                                                .get(&argument)
+                                                .copied()
+                                                .context("thiếu pointer console type")?,
                                             i8_type,
                                             i64_type,
                                             dynamic_type,
@@ -1750,6 +2708,129 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
     Ok(module)
 }
 
+struct BuiltGenericArguments<'ctx> {
+    argc: IntValue<'ctx>,
+    argv: inkwell::values::PointerValue<'ctx>,
+    builder: Option<inkwell::values::PointerValue<'ctx>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn box_value_pointer<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    value: BasicValueEnum<'ctx>,
+    value_type: ValueType,
+    i8_type: inkwell::types::IntType<'ctx>,
+    i64_type: inkwell::types::IntType<'ctx>,
+    dynamic_type: inkwell::types::StructType<'ctx>,
+    name: &str,
+) -> Result<inkwell::values::PointerValue<'ctx>> {
+    let dynamic = to_dynamic(builder, value, value_type, i8_type, i64_type, dynamic_type)?;
+    let pointer = builder.build_alloca(dynamic_type, name)?;
+    builder.build_store(pointer, dynamic)?;
+    Ok(pointer)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_generic_arguments<'ctx>(
+    builder: &inkwell::builder::Builder<'ctx>,
+    arguments: &[CallArgument],
+    values: &HashMap<ValueId, BasicValueEnum<'ctx>>,
+    i8_type: inkwell::types::IntType<'ctx>,
+    i32_type: inkwell::types::IntType<'ctx>,
+    i64_type: inkwell::types::IntType<'ctx>,
+    ptr_type: inkwell::types::PointerType<'ctx>,
+    dynamic_type: inkwell::types::StructType<'ctx>,
+    argv_builder_init: inkwell::values::FunctionValue<'ctx>,
+    argv_builder_push: inkwell::values::FunctionValue<'ctx>,
+    argv_builder_spread: inkwell::values::FunctionValue<'ctx>,
+    argv_builder_len: inkwell::values::FunctionValue<'ctx>,
+    argv_builder_data: inkwell::values::FunctionValue<'ctx>,
+) -> Result<BuiltGenericArguments<'ctx>> {
+    if !arguments.iter().any(|argument| argument.spread) {
+        let ids = arguments
+            .iter()
+            .map(|argument| argument.value)
+            .collect::<Vec<_>>();
+        let types = arguments
+            .iter()
+            .map(|argument| argument.value_type)
+            .collect::<Vec<_>>();
+        let argv = build_dynamic_array(
+            builder,
+            &ids,
+            &types,
+            values,
+            i8_type,
+            i32_type,
+            i64_type,
+            dynamic_type,
+        )?;
+        return Ok(BuiltGenericArguments {
+            argc: i32_type.const_int(arguments.len() as u64, false),
+            argv,
+            builder: None,
+        });
+    }
+
+    let builder_slot = builder.build_alloca(ptr_type, "generic.argv.builder.slot")?;
+    builder.build_store(builder_slot, ptr_type.const_null())?;
+    builder.build_call(
+        argv_builder_init,
+        &[builder_slot.into()],
+        "generic.argv.builder.init",
+    )?;
+    let handle = builder
+        .build_load(ptr_type, builder_slot, "generic.argv.builder")?
+        .into_pointer_value();
+
+    for (index, argument) in arguments.iter().enumerate() {
+        let value = values
+            .get(&argument.value)
+            .copied()
+            .with_context(|| format!("thiếu generic call argument %v{}", argument.value.0))?;
+        let pointer = box_value_pointer(
+            builder,
+            value,
+            argument.value_type,
+            i8_type,
+            i64_type,
+            dynamic_type,
+            &format!("generic.argv.value.{index}"),
+        )?;
+        if argument.spread {
+            let _ = builder.build_call(
+                argv_builder_spread,
+                &[handle.into(), pointer.into()],
+                &format!("generic.argv.spread.{index}"),
+            )?;
+        } else {
+            builder.build_call(
+                argv_builder_push,
+                &[handle.into(), pointer.into()],
+                &format!("generic.argv.push.{index}"),
+            )?;
+        }
+    }
+
+    let argc = builder
+        .build_call(argv_builder_len, &[handle.into()], "generic.argv.len")?
+        .try_as_basic_value()
+        .basic()
+        .context("argv_builder_len không trả i32")?
+        .into_int_value();
+    let argv = builder
+        .build_call(argv_builder_data, &[handle.into()], "generic.argv.data")?
+        .try_as_basic_value()
+        .basic()
+        .context("argv_builder_data không trả pointer")?
+        .into_pointer_value();
+
+    Ok(BuiltGenericArguments {
+        argc,
+        argv,
+        builder: Some(handle),
+    })
+}
 fn propagate_call_completion<'ctx>(
     context: &'ctx LlvmContext,
     builder: &inkwell::builder::Builder<'ctx>,

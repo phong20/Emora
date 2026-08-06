@@ -53,6 +53,50 @@ pub struct BasicBlock {
     pub terminator: Terminator,
 }
 
+#[derive(Debug, Clone)]
+pub struct CallArgument {
+    pub value: ValueId,
+    pub value_type: ValueType,
+    pub spread: bool,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicUnaryOperator {
+    Plus = 0,
+    Minus = 1,
+    Not = 2,
+    BitwiseNot = 3,
+    TypeOf = 4,
+    Void = 5,
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicBinaryOperator {
+    Add = 0,
+    Subtract = 1,
+    Multiply = 2,
+    Divide = 3,
+    Remainder = 4,
+    Exponential = 5,
+    Equal = 6,
+    NotEqual = 7,
+    StrictEqual = 8,
+    StrictNotEqual = 9,
+    LessThan = 10,
+    LessEqual = 11,
+    GreaterThan = 12,
+    GreaterEqual = 13,
+    ShiftLeft = 14,
+    ShiftRight = 15,
+    ShiftRightZeroFill = 16,
+    BitwiseOr = 17,
+    BitwiseXor = 18,
+    BitwiseAnd = 19,
+    In = 20,
+    InstanceOf = 21,
+}
 #[derive(Debug)]
 pub enum Instruction {
     Parameter {
@@ -243,6 +287,95 @@ pub enum Instruction {
         arguments: Vec<ValueId>,
         argument_types: Vec<ValueType>,
         return_type: ValueType,
+    },
+
+    CurrentThis {
+        result: ValueId,
+    },
+    CurrentCallable {
+        result: ValueId,
+    },
+    ArgumentsObject {
+        result: ValueId,
+    },
+    RestArray {
+        result: ValueId,
+        start: u32,
+    },
+    ArrayPush {
+        array: ValueId,
+        value: ValueId,
+        value_type: ValueType,
+    },
+    ArraySpread {
+        array: ValueId,
+        iterable: ValueId,
+        iterable_type: ValueType,
+    },
+    DynamicUnary {
+        result: ValueId,
+        operator: DynamicUnaryOperator,
+        operand: ValueId,
+        operand_type: ValueType,
+    },
+    DynamicBinary {
+        result: ValueId,
+        operator: DynamicBinaryOperator,
+        left: ValueId,
+        left_type: ValueType,
+        right: ValueId,
+        right_type: ValueType,
+    },
+    DynamicGet {
+        result: ValueId,
+        object: ValueId,
+        object_type: ValueType,
+        key: String,
+    },
+    DynamicSet {
+        object: ValueId,
+        object_type: ValueType,
+        key: String,
+        value: ValueId,
+        value_type: ValueType,
+    },
+    DynamicDelete {
+        result: ValueId,
+        object: ValueId,
+        object_type: ValueType,
+        key: String,
+    },
+    ClosureNewGeneric {
+        result: ValueId,
+        function: String,
+        captures: Vec<ValueId>,
+        capture_types: Vec<ValueType>,
+        constructable: bool,
+        strict: bool,
+        lexical_this: Option<ValueId>,
+        lexical_this_type: Option<ValueType>,
+    },
+    CallValue {
+        result: ValueId,
+        callee: ValueId,
+        callee_type: ValueType,
+        receiver: Option<ValueId>,
+        receiver_type: Option<ValueType>,
+        arguments: Vec<CallArgument>,
+    },
+    ConstructValue {
+        result: ValueId,
+        callee: ValueId,
+        callee_type: ValueType,
+        arguments: Vec<CallArgument>,
+    },
+    BindValue {
+        result: ValueId,
+        target: ValueId,
+        target_type: ValueType,
+        this_arg: ValueId,
+        this_type: ValueType,
+        arguments: Vec<CallArgument>,
     },
     CallBuiltin {
         builtin: Builtin,
@@ -558,6 +691,137 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                         require_type(&types, *callee, ValueType::Callable)?;
                         verify_call_arguments(&types, arguments, argument_types)?;
                     }
+
+                    Instruction::CurrentThis { .. } => {}
+                    Instruction::CurrentCallable { .. } => {
+                        if function.return_type.is_none() {
+                            bail!("process entry không có current callable")
+                        }
+                    }
+                    Instruction::ArgumentsObject { .. } | Instruction::RestArray { .. } => {
+                        if function.return_type.is_none() {
+                            bail!("process entry không có JavaScript argv")
+                        }
+                    }
+                    Instruction::ArrayPush {
+                        array,
+                        value,
+                        value_type,
+                    } => {
+                        require_type(&types, *array, ValueType::Object)?;
+                        require_type(&types, *value, *value_type)?;
+                    }
+                    Instruction::ArraySpread {
+                        array,
+                        iterable,
+                        iterable_type,
+                    } => {
+                        require_type(&types, *array, ValueType::Object)?;
+                        require_type(&types, *iterable, *iterable_type)?;
+                    }
+                    Instruction::DynamicUnary {
+                        operand,
+                        operand_type,
+                        ..
+                    } => require_type(&types, *operand, *operand_type)?,
+                    Instruction::DynamicBinary {
+                        left,
+                        left_type,
+                        right,
+                        right_type,
+                        ..
+                    } => {
+                        require_type(&types, *left, *left_type)?;
+                        require_type(&types, *right, *right_type)?;
+                    }
+                    Instruction::DynamicGet {
+                        object,
+                        object_type,
+                        ..
+                    }
+                    | Instruction::DynamicDelete {
+                        object,
+                        object_type,
+                        ..
+                    } => require_type(&types, *object, *object_type)?,
+                    Instruction::DynamicSet {
+                        object,
+                        object_type,
+                        value,
+                        value_type,
+                        ..
+                    } => {
+                        require_type(&types, *object, *object_type)?;
+                        require_type(&types, *value, *value_type)?;
+                    }
+                    Instruction::ClosureNewGeneric {
+                        function: callee,
+                        captures,
+                        capture_types,
+                        lexical_this,
+                        lexical_this_type,
+                        ..
+                    } => {
+                        if captures.len() != capture_types.len() {
+                            bail!("generic closure capture metadata không khớp")
+                        }
+                        for (capture, value_type) in captures.iter().zip(capture_types) {
+                            require_type(&types, *capture, *value_type)?;
+                        }
+                        match (lexical_this, lexical_this_type) {
+                            (Some(value), Some(value_type)) => {
+                                require_type(&types, *value, *value_type)?;
+                            }
+                            (None, None) => {}
+                            _ => bail!("lexical this metadata không khớp"),
+                        }
+                        let target = program
+                            .functions
+                            .iter()
+                            .find(|candidate| candidate.name == *callee)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("unknown generic closure function `{callee}`")
+                            })?;
+                        if target.return_type.is_none() {
+                            bail!("generic closure không được trỏ tới process entry")
+                        }
+                        if target.captures.len() != captures.len() {
+                            bail!("generic closure `{callee}` sai capture arity")
+                        }
+                    }
+                    Instruction::CallValue {
+                        callee,
+                        callee_type,
+                        receiver,
+                        receiver_type,
+                        arguments,
+                        ..
+                    } => {
+                        require_callable_type(&types, *callee, *callee_type)?;
+                        verify_receiver(&types, *receiver, *receiver_type)?;
+                        verify_generic_call_arguments(&types, arguments)?;
+                    }
+                    Instruction::ConstructValue {
+                        callee,
+                        callee_type,
+                        arguments,
+                        ..
+                    } => {
+                        require_callable_type(&types, *callee, *callee_type)?;
+                        verify_generic_call_arguments(&types, arguments)?;
+                    }
+                    Instruction::BindValue {
+                        target,
+                        target_type,
+                        this_arg,
+                        this_type,
+                        arguments,
+                        ..
+                    } => {
+                        require_callable_type(&types, *target, *target_type)?;
+                        require_type(&types, *this_arg, *this_type)?;
+                        verify_generic_call_arguments(&types, arguments)?;
+                    }
                     Instruction::CallBuiltin {
                         arguments,
                         display_values,
@@ -669,6 +933,25 @@ fn declared_result(instruction: &Instruction) -> Option<(ValueId, ValueType)> {
         Instruction::Phi {
             result, value_type, ..
         } => (*result, *value_type),
+
+        Instruction::CurrentThis { result } => (*result, ValueType::Dynamic),
+        Instruction::CurrentCallable { result } => (*result, ValueType::Callable),
+        Instruction::ArgumentsObject { result } | Instruction::RestArray { result, .. } => {
+            (*result, ValueType::Object)
+        }
+        Instruction::DynamicUnary { result, .. }
+        | Instruction::DynamicBinary { result, .. }
+        | Instruction::DynamicGet { result, .. }
+        | Instruction::CallValue { result, .. }
+        | Instruction::ConstructValue { result, .. } => (*result, ValueType::Dynamic),
+        Instruction::DynamicDelete { result, .. } => (*result, ValueType::Bool),
+        Instruction::ClosureNewGeneric { result, .. } | Instruction::BindValue { result, .. } => {
+            (*result, ValueType::Callable)
+        }
+        Instruction::ArrayPush { .. }
+        | Instruction::ArraySpread { .. }
+        | Instruction::DynamicSet { .. } => return None,
+
         Instruction::ClosureNew { result, .. } => (*result, ValueType::Callable),
         Instruction::CallDirect {
             result,
@@ -690,6 +973,43 @@ fn declared_result(instruction: &Instruction) -> Option<(ValueId, ValueType)> {
         Instruction::PromiseThen { result, .. } => (*result, ValueType::Promise),
         Instruction::MicrotaskDrain => return None,
     })
+}
+
+fn verify_generic_call_arguments(
+    types: &HashMap<ValueId, ValueType>,
+    arguments: &[CallArgument],
+) -> Result<()> {
+    for argument in arguments {
+        require_type(types, argument.value, argument.value_type)?;
+    }
+    Ok(())
+}
+
+fn verify_receiver(
+    types: &HashMap<ValueId, ValueType>,
+    receiver: Option<ValueId>,
+    receiver_type: Option<ValueType>,
+) -> Result<()> {
+    match (receiver, receiver_type) {
+        (Some(value), Some(value_type)) => require_type(types, value, value_type),
+        (None, None) => Ok(()),
+        _ => bail!("receiver metadata không khớp"),
+    }
+}
+
+fn require_callable_type(
+    types: &HashMap<ValueId, ValueType>,
+    value: ValueId,
+    value_type: ValueType,
+) -> Result<()> {
+    require_type(types, value, value_type)?;
+    if !matches!(value_type, ValueType::Callable | ValueType::Dynamic) {
+        bail!(
+            "callee phải là Callable hoặc Dynamic, nhận {:?}",
+            value_type
+        )
+    }
+    Ok(())
 }
 
 fn verify_call_arguments(
@@ -1238,6 +1558,10 @@ pub fn dump_program(program: &Program) -> String {
                             result.0, return_type, callee.0, arguments
                         )
                         .unwrap();
+                    }
+
+                    other => {
+                        writeln!(&mut output, "    {other:?}").unwrap();
                     }
                 }
             }

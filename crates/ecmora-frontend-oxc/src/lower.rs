@@ -1268,12 +1268,7 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
                 arguments: call
                     .arguments
                     .iter()
-                    .map(|argument| {
-                        argument
-                            .as_expression()
-                            .ok_or_else(|| anyhow!("spread argument chưa được hỗ trợ"))
-                            .and_then(lower_expression)
-                    })
+                    .map(lower_call_argument)
                     .collect::<Result<_>>()?,
             },
             call.span,
@@ -1294,12 +1289,7 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
                 arguments: call
                     .arguments
                     .iter()
-                    .map(|argument| {
-                        argument
-                            .as_expression()
-                            .ok_or_else(|| anyhow!("spread argument chưa được hỗ trợ"))
-                            .and_then(lower_expression)
-                    })
+                    .map(lower_call_argument)
                     .collect::<Result<_>>()?,
             },
             call.span,
@@ -1348,6 +1338,25 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
     })
 }
 
+fn lower_call_argument(argument: &oxc_ast::ast::Argument<'_>) -> Result<HirExpression> {
+    match argument {
+        oxc_ast::ast::Argument::SpreadElement(spread) => Ok(HirExpression {
+            kind: ExpressionKind::Call {
+                callee: Box::new(HirExpression {
+                    kind: ExpressionKind::Global("@spread".to_owned()),
+                    span: convert_span(spread.span),
+                }),
+                arguments: vec![lower_expression(&spread.argument)?],
+            },
+            span: convert_span(spread.span),
+        }),
+        _ => lower_expression(
+            argument
+                .as_expression()
+                .ok_or_else(|| anyhow!("call argument không phải expression"))?,
+        ),
+    }
+}
 fn lower_function(function: &OxcFunction<'_>, arrow: bool) -> Result<HirFunction> {
     let mut lowering_error = None;
     let parameters = match lower_parameters(&function.params) {
@@ -1435,10 +1444,7 @@ fn lower_arrow_function(function: &ArrowFunctionExpression<'_>) -> Result<HirFun
 }
 
 fn lower_parameters(parameters: &oxc_ast::ast::FormalParameters<'_>) -> Result<Vec<String>> {
-    if parameters.rest.is_some() {
-        bail!("rest parameter chưa được hỗ trợ")
-    }
-    parameters
+    let mut output = parameters
         .items
         .iter()
         .map(|parameter| {
@@ -1450,9 +1456,17 @@ fn lower_parameters(parameters: &oxc_ast::ast::FormalParameters<'_>) -> Result<V
             };
             Ok(identifier.name.to_string())
         })
-        .collect()
-}
+        .collect::<Result<Vec<_>>>()?;
 
+    if let Some(rest) = &parameters.rest {
+        let BindingPattern::BindingIdentifier(identifier) = &rest.rest.argument else {
+            bail!("destructuring rest parameter chưa được hỗ trợ")
+        };
+        output.push(format!("@rest:{}", identifier.name));
+    }
+
+    Ok(output)
+}
 fn lower_assignment_target(target: &SimpleAssignmentTarget<'_>) -> Result<AssignmentTarget> {
     match target {
         SimpleAssignmentTarget::AssignmentTargetIdentifier(identifier) => {

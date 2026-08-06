@@ -45,18 +45,26 @@ typedef struct {
     uint64_t payload;
 } EcmoraValue;
 
-typedef uint8_t (*EcmoraCode)(
+typedef struct EcmoraCallable EcmoraClosure;
+
+void *ecmora_closure_new(
+    void *code,
+    uint32_t capture_count,
+    EcmoraValue *captures
+);
+
+void ecmora_closure_capture(
+    void *closure,
+    uint32_t index,
+    EcmoraValue *out
+);
+
+uint8_t ecmora_closure_call(
     void *closure,
     uint32_t argc,
     EcmoraValue *argv,
     EcmoraValue *out
 );
-
-typedef struct {
-    EcmoraCode code;
-    uint32_t capture_count;
-    EcmoraValue captures[];
-} EcmoraClosure;
 
 typedef enum {
     ECMORA_PROMISE_PENDING = 0,
@@ -91,28 +99,6 @@ typedef struct EcmoraPromiseJob {
 
 static EcmoraPromiseJob *microtask_head = NULL;
 static EcmoraPromiseJob *microtask_tail = NULL;
-
-
-void *ecmora_closure_new(void *code, uint32_t capture_count, EcmoraValue *captures) {
-    size_t size = sizeof(EcmoraClosure) + sizeof(EcmoraValue) * capture_count;
-    EcmoraClosure *closure = (EcmoraClosure *)calloc(1, size);
-    if (closure == NULL) abort();
-    closure->code = (EcmoraCode)code;
-    closure->capture_count = capture_count;
-    if (capture_count != 0) {
-        memcpy(closure->captures, captures, sizeof(EcmoraValue) * capture_count);
-    }
-    return closure;
-}
-
-void ecmora_closure_capture(void *pointer, uint32_t index, EcmoraValue *out) {
-    EcmoraClosure *closure = (EcmoraClosure *)pointer;
-    if (closure == NULL || index >= closure->capture_count) {
-        if (out != NULL) *out = (EcmoraValue){ ECMORA_UNDEFINED, 0 };
-        return;
-    }
-    if (out != NULL) *out = closure->captures[index];
-}
 
 void ecmora_argument_get(
     uint32_t argc,
@@ -150,26 +136,6 @@ EcmoraValue *ecmora_tail_argv_reserve(uint32_t count) {
     return ecmora_tail_argv_buffer;
 }
 
-uint8_t ecmora_closure_call(
-    void *pointer,
-    uint32_t argc,
-    EcmoraValue *argv,
-    EcmoraValue *out
-) {
-    if (out != NULL) {
-        *out = (EcmoraValue){ ECMORA_UNDEFINED, 0 };
-    }
-
-    EcmoraClosure *closure = (EcmoraClosure *)pointer;
-    if (closure == NULL || closure->code == NULL || (argc != 0 && argv == NULL)) {
-        /*
-         * Status 1 is ThrowCompletion in the native ABI. Until Error objects
-         * are materialized, undefined is the temporary thrown payload.
-         */
-        return 1;
-    }
-    return closure->code(closure, argc, argv, out);
-}
 
 void *ecmora_cell_new(const EcmoraValue *initial) {
     EcmoraValue *cell = (EcmoraValue *)malloc(sizeof(EcmoraValue));
@@ -817,37 +783,53 @@ void ecmora_recursion_leave(void) {
     }
 }
 
-/* callable ABI primitive object hooks */
-void *ecmora_object_new(void) {
-    EcmoraObject *object = (EcmoraObject *)calloc(1, sizeof(EcmoraObject));
-    if (object == NULL) abort();
-    return object;
-}
-
-void ecmora_object_set_index(void *pointer, uint32_t index, const EcmoraValue *value) {
+/* generic callable ABI indexed object/array hooks */
+void ecmora_object_set_index(
+    void *pointer,
+    uint32_t index,
+    const EcmoraValue *value
+) {
     char key[32];
     (void)snprintf(key, sizeof(key), "%u", index);
-    ecmora_object_set(pointer, key, value);
-    EcmoraValue length = { ECMORA_NUMBER, 0 };
-    double numeric_length = (double)(index + 1);
-    memcpy(&length.payload, &numeric_length, sizeof(double));
-    ecmora_object_set(pointer, "length", &length);
+    ecmora_object_set_value(pointer, key, value);
+
+    EcmoraValue current = { ECMORA_UNDEFINED, 0 };
+    (void)ecmora_object_get_value(pointer, "length", &current);
+    uint32_t length = 0;
+    if (current.tag == ECMORA_NUMBER) {
+        double number = 0.0;
+        memcpy(&number, &current.payload, sizeof(number));
+        if (number > 0.0 && number < (double)UINT32_MAX) {
+            length = (uint32_t)number;
+        }
+    }
+    if (index >= length) {
+        const double next = (double)index + 1.0;
+        EcmoraValue updated = { ECMORA_NUMBER, 0 };
+        memcpy(&updated.payload, &next, sizeof(next));
+        ecmora_object_set_value(pointer, "length", &updated);
+    }
 }
 
 uint32_t ecmora_object_length(void *pointer) {
     EcmoraValue value = { ECMORA_UNDEFINED, 0 };
-    ecmora_object_get(pointer, "length", &value);
-    if (value.tag != ECMORA_NUMBER) return 0;
+    if (!ecmora_object_get_value(pointer, "length", &value)
+        || value.tag != ECMORA_NUMBER) {
+        return 0;
+    }
     double length = 0.0;
-    memcpy(&length, &value.payload, sizeof(double));
-    if (length <= 0.0) return 0;
+    memcpy(&length, &value.payload, sizeof(length));
+    if (!(length > 0.0)) return 0;
     if (length >= (double)UINT32_MAX) return UINT32_MAX;
     return (uint32_t)length;
 }
 
-bool ecmora_object_get_index(void *pointer, uint32_t index, EcmoraValue *out) {
+bool ecmora_object_get_index(
+    void *pointer,
+    uint32_t index,
+    EcmoraValue *out
+) {
     char key[32];
     (void)snprintf(key, sizeof(key), "%u", index);
-    ecmora_object_get(pointer, key, out);
-    return out != NULL && out->tag != ECMORA_UNDEFINED;
+    return ecmora_object_get_value(pointer, key, out);
 }

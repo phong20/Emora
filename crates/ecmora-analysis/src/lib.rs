@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 mod abstract_value;
 mod async_normalize;
+mod callable_native;
 pub mod effects;
 mod numeric;
 mod specialization;
@@ -26,6 +27,9 @@ use specialization::*;
 use support::*;
 
 pub fn analyze(hir: &HirProgram) -> Result<Program> {
+    if callable_native::requires_generic_callable_lowering(hir) {
+        return callable_native::analyze(hir);
+    }
     validate_native_semantics(hir)?;
     if !hir.promise_subclasses.is_empty() {
         bail!("Promise subclass/@@species requires compatibility constructor objects")
