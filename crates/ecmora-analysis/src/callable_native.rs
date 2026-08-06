@@ -5,8 +5,9 @@ use ecmora_hir::{
     Program as HirProgram, Statement, StatementKind, UnaryOperator, UpdateOperator, VariableKind,
 };
 use ecmora_ir::{
-    BasicBlock, BlockId, Builtin, CallArgument, DynamicBinaryOperator, DynamicUnaryOperator,
-    Function, Instruction, Parameter, Program, Terminator, ValueId, ValueType,
+    BasicBlock, BinaryNumberOperator, BlockId, Builtin, CallArgument, CompareNumberOperator,
+    DynamicBinaryOperator, DynamicUnaryOperator, Function, Instruction, Parameter, Program,
+    Terminator, UnaryBoolOperator, UnaryNumberOperator, ValueId, ValueType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +16,9 @@ struct Binding {
     kind: VariableKind,
     initialized: bool,
     cell: ValueId,
+    /// Flow-refined concrete value type stored in the cell. `Dynamic` means
+    /// multiple tags can reach the current program point.
+    value_type: ValueType,
 }
 
 #[derive(Debug)]
@@ -142,6 +146,428 @@ impl GenericLowerer {
             .collect()
     }
 
+    fn join_type(left: ValueType, right: ValueType) -> ValueType {
+        if left == right {
+            left
+        } else {
+            ValueType::Dynamic
+        }
+    }
+
+    fn snapshot_scopes(&self) -> Vec<HashMap<String, Binding>> {
+        self.scopes.clone()
+    }
+
+    fn merge_scope_states(
+        base: &[HashMap<String, Binding>],
+        left: &[HashMap<String, Binding>],
+        right: &[HashMap<String, Binding>],
+        left_reaches: bool,
+        right_reaches: bool,
+    ) -> Vec<HashMap<String, Binding>> {
+        if left_reaches && !right_reaches {
+            return left.to_vec();
+        }
+        if right_reaches && !left_reaches {
+            return right.to_vec();
+        }
+        if !left_reaches && !right_reaches {
+            return base.to_vec();
+        }
+
+        let mut merged = base.to_vec();
+        for (scope_index, scope) in merged.iter_mut().enumerate() {
+            for (name, binding) in scope.iter_mut() {
+                let fallback = (binding.initialized, binding.value_type);
+                let left_state = left
+                    .get(scope_index)
+                    .and_then(|scope| scope.get(name))
+                    .map(|binding| (binding.initialized, binding.value_type))
+                    .unwrap_or(fallback);
+                let right_state = right
+                    .get(scope_index)
+                    .and_then(|scope| scope.get(name))
+                    .map(|binding| (binding.initialized, binding.value_type))
+                    .unwrap_or(fallback);
+                binding.initialized = left_state.0 && right_state.0;
+                binding.value_type = Self::join_type(left_state.1, right_state.1);
+            }
+        }
+        merged
+    }
+
+    fn is_number_coercible(value_type: ValueType) -> bool {
+        matches!(
+            value_type,
+            ValueType::Undefined
+                | ValueType::Null
+                | ValueType::Number
+                | ValueType::Bool
+                | ValueType::String
+        )
+    }
+
+    fn infer_expression_type(&self, expression: &Expression) -> ValueType {
+        match &expression.kind {
+            ExpressionKind::String(_) => ValueType::String,
+            ExpressionKind::Number(_) => ValueType::Number,
+            ExpressionKind::BigInt(_) => ValueType::Dynamic,
+            ExpressionKind::Bool(_) => ValueType::Bool,
+            ExpressionKind::Null => ValueType::Null,
+            ExpressionKind::This => ValueType::Dynamic,
+            ExpressionKind::Global(name) => self
+                .find_binding(name)
+                .filter(|binding| binding.initialized)
+                .map(|binding| binding.value_type)
+                .unwrap_or_else(|| match name.as_str() {
+                    "undefined" => ValueType::Undefined,
+                    "NaN" | "Infinity" => ValueType::Number,
+                    _ => ValueType::Dynamic,
+                }),
+            ExpressionKind::Member { .. }
+            | ExpressionKind::Call { .. }
+            | ExpressionKind::New { .. }
+            | ExpressionKind::Await(_) => ValueType::Dynamic,
+            ExpressionKind::Object(_) | ExpressionKind::Array(_) => ValueType::Object,
+            ExpressionKind::Function(_) => ValueType::Callable,
+            ExpressionKind::Conditional {
+                consequent,
+                alternate,
+                ..
+            } => Self::join_type(
+                self.infer_expression_type(consequent),
+                self.infer_expression_type(alternate),
+            ),
+            ExpressionKind::Logical { left, right, .. } => Self::join_type(
+                self.infer_expression_type(left),
+                self.infer_expression_type(right),
+            ),
+            ExpressionKind::Unary { operator, .. } => match operator {
+                UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitwiseNot => {
+                    ValueType::Number
+                }
+                UnaryOperator::Not | UnaryOperator::Delete => ValueType::Bool,
+                UnaryOperator::Typeof => ValueType::String,
+                UnaryOperator::Void => ValueType::Undefined,
+            },
+            ExpressionKind::Binary {
+                left,
+                operator,
+                right,
+            } => match operator {
+                BinaryOperator::Equal
+                | BinaryOperator::NotEqual
+                | BinaryOperator::StrictEqual
+                | BinaryOperator::StrictNotEqual
+                | BinaryOperator::LessThan
+                | BinaryOperator::LessEqual
+                | BinaryOperator::GreaterThan
+                | BinaryOperator::GreaterEqual
+                | BinaryOperator::In
+                | BinaryOperator::InstanceOf => ValueType::Bool,
+                BinaryOperator::Add => {
+                    let left = self.infer_expression_type(left);
+                    let right = self.infer_expression_type(right);
+                    if left == ValueType::String || right == ValueType::String {
+                        if left != ValueType::Dynamic && right != ValueType::Dynamic {
+                            ValueType::String
+                        } else {
+                            ValueType::Dynamic
+                        }
+                    } else if Self::is_number_coercible(left) && Self::is_number_coercible(right) {
+                        ValueType::Number
+                    } else {
+                        ValueType::Dynamic
+                    }
+                }
+                _ => ValueType::Number,
+            },
+            ExpressionKind::Assignment {
+                target,
+                operator,
+                value,
+            } => {
+                let right = self.infer_expression_type(value);
+                if *operator == AssignmentOperator::Assign {
+                    right
+                } else if *operator == AssignmentOperator::Add {
+                    let left = match target {
+                        AssignmentTarget::Identifier(name) => self
+                            .find_binding(name)
+                            .map(|binding| binding.value_type)
+                            .unwrap_or(ValueType::Dynamic),
+                        AssignmentTarget::Member { .. } => ValueType::Dynamic,
+                    };
+                    if left == ValueType::String || right == ValueType::String {
+                        if left != ValueType::Dynamic && right != ValueType::Dynamic {
+                            ValueType::String
+                        } else {
+                            ValueType::Dynamic
+                        }
+                    } else if Self::is_number_coercible(left) && Self::is_number_coercible(right) {
+                        ValueType::Number
+                    } else {
+                        ValueType::Dynamic
+                    }
+                } else {
+                    ValueType::Number
+                }
+            }
+            ExpressionKind::Update { .. } => ValueType::Number,
+        }
+    }
+
+    fn record_loop_write(
+        writes: &mut HashMap<String, ValueType>,
+        name: &str,
+        value_type: ValueType,
+    ) {
+        writes
+            .entry(name.to_owned())
+            .and_modify(|existing| *existing = Self::join_type(*existing, value_type))
+            .or_insert(value_type);
+    }
+
+    fn collect_expression_writes(
+        &self,
+        expression: &Expression,
+        writes: &mut HashMap<String, ValueType>,
+    ) {
+        match &expression.kind {
+            ExpressionKind::Assignment {
+                target,
+                operator,
+                value,
+            } => {
+                self.collect_expression_writes(value, writes);
+                match target {
+                    AssignmentTarget::Identifier(name) => {
+                        let value_type = if *operator == AssignmentOperator::Assign {
+                            self.infer_expression_type(value)
+                        } else {
+                            self.infer_expression_type(expression)
+                        };
+                        Self::record_loop_write(writes, name, value_type);
+                    }
+                    AssignmentTarget::Member { object, property } => {
+                        self.collect_expression_writes(object, writes);
+                        if let MemberProperty::Computed(key) = property {
+                            self.collect_expression_writes(key, writes);
+                        }
+                    }
+                }
+            }
+            ExpressionKind::Update { target, .. } => match target {
+                AssignmentTarget::Identifier(name) => {
+                    Self::record_loop_write(writes, name, ValueType::Number);
+                }
+                AssignmentTarget::Member { object, property } => {
+                    self.collect_expression_writes(object, writes);
+                    if let MemberProperty::Computed(key) = property {
+                        self.collect_expression_writes(key, writes);
+                    }
+                }
+            },
+            ExpressionKind::Member { object, property } => {
+                self.collect_expression_writes(object, writes);
+                if let MemberProperty::Computed(key) = property {
+                    self.collect_expression_writes(key, writes);
+                }
+            }
+            ExpressionKind::Object(entries) => {
+                for entry in entries {
+                    match entry {
+                        ObjectEntry::Property(property) => {
+                            self.collect_expression_writes(&property.value, writes);
+                            if let MemberProperty::Computed(key) = &property.key {
+                                self.collect_expression_writes(key, writes);
+                            }
+                        }
+                        ObjectEntry::Spread(value) => {
+                            self.collect_expression_writes(value, writes);
+                        }
+                        ObjectEntry::Accessor { .. } => {}
+                    }
+                }
+            }
+            ExpressionKind::Array(elements) => {
+                for element in elements {
+                    match element {
+                        ArrayElement::Expression(value) | ArrayElement::Spread(value) => {
+                            self.collect_expression_writes(value, writes);
+                        }
+                        ArrayElement::Hole => {}
+                    }
+                }
+            }
+            ExpressionKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.collect_expression_writes(test, writes);
+                self.collect_expression_writes(consequent, writes);
+                self.collect_expression_writes(alternate, writes);
+            }
+            ExpressionKind::Unary { argument, .. } | ExpressionKind::Await(argument) => {
+                self.collect_expression_writes(argument, writes);
+            }
+            ExpressionKind::Binary { left, right, .. }
+            | ExpressionKind::Logical { left, right, .. } => {
+                self.collect_expression_writes(left, writes);
+                self.collect_expression_writes(right, writes);
+            }
+            ExpressionKind::Call { callee, arguments }
+            | ExpressionKind::New { callee, arguments } => {
+                self.collect_expression_writes(callee, writes);
+                for argument in arguments {
+                    self.collect_expression_writes(argument, writes);
+                }
+            }
+            ExpressionKind::Function(_)
+            | ExpressionKind::String(_)
+            | ExpressionKind::Number(_)
+            | ExpressionKind::BigInt(_)
+            | ExpressionKind::Bool(_)
+            | ExpressionKind::Null
+            | ExpressionKind::This
+            | ExpressionKind::Global(_) => {}
+        }
+    }
+
+    fn collect_statement_writes(
+        &self,
+        statement: &Statement,
+        writes: &mut HashMap<String, ValueType>,
+    ) {
+        match &statement.kind {
+            StatementKind::Expression(value) | StatementKind::Throw(value) => {
+                self.collect_expression_writes(value, writes);
+            }
+            StatementKind::VariableDeclaration { declarations, .. } => {
+                for declaration in declarations {
+                    if let Some(value) = &declaration.init {
+                        self.collect_expression_writes(value, writes);
+                    }
+                }
+            }
+            StatementKind::Block(statements) => {
+                for statement in statements {
+                    self.collect_statement_writes(statement, writes);
+                }
+            }
+            StatementKind::If {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.collect_expression_writes(test, writes);
+                self.collect_statement_writes(consequent, writes);
+                if let Some(alternate) = alternate {
+                    self.collect_statement_writes(alternate, writes);
+                }
+            }
+            StatementKind::While { test, body } | StatementKind::DoWhile { body, test } => {
+                self.collect_expression_writes(test, writes);
+                self.collect_statement_writes(body, writes);
+            }
+            StatementKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    match init {
+                        ForInit::Expression(value) => {
+                            self.collect_expression_writes(value, writes);
+                        }
+                        ForInit::VariableDeclaration { declarations, .. } => {
+                            for declaration in declarations {
+                                if let Some(value) = &declaration.init {
+                                    self.collect_expression_writes(value, writes);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(test) = test {
+                    self.collect_expression_writes(test, writes);
+                }
+                if let Some(update) = update {
+                    self.collect_expression_writes(update, writes);
+                }
+                self.collect_statement_writes(body, writes);
+            }
+            StatementKind::Return(value) => {
+                if let Some(value) = value {
+                    self.collect_expression_writes(value, writes);
+                }
+            }
+            StatementKind::Labeled { body, .. } => {
+                self.collect_statement_writes(body, writes);
+            }
+            StatementKind::ForIn { right, body, .. } | StatementKind::ForOf { right, body, .. } => {
+                self.collect_expression_writes(right, writes);
+                self.collect_statement_writes(body, writes);
+            }
+            StatementKind::Empty
+            | StatementKind::Debugger
+            | StatementKind::FunctionDeclaration(_)
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_)
+            | StatementKind::Switch { .. }
+            | StatementKind::Try { .. } => {}
+        }
+    }
+
+    fn widen_loop_types(
+        &mut self,
+        body: &Statement,
+        test: Option<&Expression>,
+        update: Option<&Expression>,
+    ) {
+        let mut writes = HashMap::new();
+        self.collect_statement_writes(body, &mut writes);
+        if let Some(test) = test {
+            self.collect_expression_writes(test, &mut writes);
+        }
+        if let Some(update) = update {
+            self.collect_expression_writes(update, &mut writes);
+        }
+        for (name, written_type) in writes {
+            if let Some(binding) = self.find_binding_mut(&name) {
+                binding.value_type = Self::join_type(binding.value_type, written_type);
+            }
+        }
+    }
+
+    fn coerce_to_number(&mut self, value: Lowered) -> Option<Lowered> {
+        if value.1 == ValueType::Number {
+            return Some(value);
+        }
+        if !Self::is_number_coercible(value.1) {
+            return None;
+        }
+        let result = self.new_value();
+        self.emit(Instruction::ToNumber {
+            result,
+            operand: value.0,
+            operand_type: value.1,
+        });
+        Some((result, ValueType::Number))
+    }
+
+    fn invert_bool(&mut self, value: ValueId) -> Lowered {
+        let result = self.new_value();
+        self.emit(Instruction::UnaryBool {
+            result,
+            operator: UnaryBoolOperator::Not,
+            operand: value,
+        });
+        (result, ValueType::Bool)
+    }
+
     fn const_undefined(&mut self) -> Lowered {
         let result = self.new_value();
         self.emit(Instruction::ConstUndefined { result });
@@ -185,14 +611,14 @@ impl GenericLowerer {
         result
     }
 
-    fn read_cell(&mut self, cell: ValueId) -> Lowered {
+    fn read_cell(&mut self, cell: ValueId, value_type: ValueType) -> Lowered {
         let result = self.new_value();
         self.emit(Instruction::CellGet {
             result,
             cell,
-            value_type: ValueType::Dynamic,
+            value_type,
         });
-        (result, ValueType::Dynamic)
+        (result, value_type)
     }
 
     fn write_cell(&mut self, cell: ValueId, value: Lowered) {
@@ -219,7 +645,7 @@ impl GenericLowerer {
             if !binding.initialized {
                 bail!("identifier `{name}` đang ở Temporal Dead Zone")
             }
-            return Ok(self.read_cell(binding.cell));
+            return Ok(self.read_cell(binding.cell, binding.value_type));
         }
         match name {
             "undefined" => Ok(self.const_undefined()),
@@ -279,6 +705,7 @@ impl GenericLowerer {
                     kind,
                     initialized: false,
                     cell,
+                    value_type: ValueType::Undefined,
                 },
             );
         }
@@ -290,7 +717,9 @@ impl GenericLowerer {
             let closure = self.lower_function_value(&function)?;
             let cell = self.find_binding(&name).unwrap().cell;
             self.write_cell(cell, closure);
-            self.find_binding_mut(&name).unwrap().initialized = true;
+            let binding = self.find_binding_mut(&name).unwrap();
+            binding.initialized = true;
+            binding.value_type = closure.1;
         }
 
         Ok(())
@@ -321,6 +750,7 @@ impl GenericLowerer {
                     let binding = self.find_binding_mut(&declaration.name).unwrap();
                     binding.kind = *kind;
                     binding.initialized = true;
+                    binding.value_type = value.1;
                 }
                 Ok(())
             }
@@ -444,22 +874,35 @@ impl GenericLowerer {
             else_block,
         });
 
+        let base_state = self.snapshot_scopes();
+
         self.current = then_block.0 as usize;
+        self.scopes = base_state.clone();
         self.lower_statement(consequent)?;
         let then_reaches = self.blocks[self.current].terminator.is_none();
+        let then_state = self.snapshot_scopes();
         if then_reaches {
             self.set_terminator(Terminator::Jump(merge_block));
         }
 
         self.current = else_block.0 as usize;
+        self.scopes = base_state.clone();
         if let Some(alternate) = alternate {
             self.lower_statement(alternate)?;
         }
         let else_reaches = self.blocks[self.current].terminator.is_none();
+        let else_state = self.snapshot_scopes();
         if else_reaches {
             self.set_terminator(Terminator::Jump(merge_block));
         }
 
+        self.scopes = Self::merge_scope_states(
+            &base_state,
+            &then_state,
+            &else_state,
+            then_reaches,
+            else_reaches,
+        );
         self.current = merge_block.0 as usize;
         if !then_reaches && !else_reaches {
             self.set_terminator(Terminator::Unreachable);
@@ -473,12 +916,16 @@ impl GenericLowerer {
         body: &Statement,
         label: Option<&str>,
     ) -> Result<()> {
+        self.widen_loop_types(body, Some(test), None);
+        let header_state = self.snapshot_scopes();
+
         let header = self.new_block("generic.while.header");
         let body_block = self.new_block("generic.while.body");
         let exit = self.new_block("generic.while.exit");
         self.set_terminator(Terminator::Jump(header));
 
         self.current = header.0 as usize;
+        self.scopes = header_state.clone();
         let condition_value = self.lower_expression(test)?;
         let condition = self.to_boolean(condition_value)?;
         self.set_terminator(Terminator::Branch {
@@ -488,6 +935,7 @@ impl GenericLowerer {
         });
 
         self.current = body_block.0 as usize;
+        self.scopes = header_state.clone();
         self.controls.push(ControlTarget {
             label: label.map(str::to_owned),
             break_target: exit,
@@ -500,6 +948,7 @@ impl GenericLowerer {
         }
 
         self.current = exit.0 as usize;
+        self.scopes = header_state;
         Ok(())
     }
 
@@ -509,12 +958,16 @@ impl GenericLowerer {
         test: &Expression,
         label: Option<&str>,
     ) -> Result<()> {
+        self.widen_loop_types(body, Some(test), None);
+        let header_state = self.snapshot_scopes();
+
         let body_block = self.new_block("generic.do.body");
         let test_block = self.new_block("generic.do.test");
         let exit = self.new_block("generic.do.exit");
         self.set_terminator(Terminator::Jump(body_block));
 
         self.current = body_block.0 as usize;
+        self.scopes = header_state.clone();
         self.controls.push(ControlTarget {
             label: label.map(str::to_owned),
             break_target: exit,
@@ -536,6 +989,7 @@ impl GenericLowerer {
         });
 
         self.current = exit.0 as usize;
+        self.scopes = header_state;
         Ok(())
     }
 
@@ -566,6 +1020,7 @@ impl GenericLowerer {
                                 kind: *kind,
                                 initialized: false,
                                 cell,
+                                value_type: ValueType::Undefined,
                             },
                         );
                     }
@@ -578,13 +1033,16 @@ impl GenericLowerer {
                             .unwrap_or_else(|| self.const_undefined());
                         let cell = self.find_binding(&declaration.name).unwrap().cell;
                         self.write_cell(cell, value);
-                        self.find_binding_mut(&declaration.name)
-                            .unwrap()
-                            .initialized = true;
+                        let binding = self.find_binding_mut(&declaration.name).unwrap();
+                        binding.initialized = true;
+                        binding.value_type = value.1;
                     }
                 }
             }
         }
+
+        self.widen_loop_types(body, test, update);
+        let header_state = self.snapshot_scopes();
 
         let header = self.new_block("generic.for.header");
         let body_block = self.new_block("generic.for.body");
@@ -593,6 +1051,7 @@ impl GenericLowerer {
         self.set_terminator(Terminator::Jump(header));
 
         self.current = header.0 as usize;
+        self.scopes = header_state.clone();
         let condition = match test {
             Some(test) => {
                 let value = self.lower_expression(test)?;
@@ -607,6 +1066,7 @@ impl GenericLowerer {
         });
 
         self.current = body_block.0 as usize;
+        self.scopes = header_state.clone();
         self.controls.push(ControlTarget {
             label: label.map(str::to_owned),
             break_target: exit,
@@ -627,6 +1087,7 @@ impl GenericLowerer {
         }
 
         self.current = exit.0 as usize;
+        self.scopes = header_state;
         self.scopes.pop();
         Ok(())
     }
@@ -642,6 +1103,275 @@ impl GenericLowerer {
             operand_type: value.1,
         });
         Ok(result)
+    }
+
+    fn emit_unary_value(&mut self, operator: UnaryOperator, operand: Lowered) -> Lowered {
+        match operator {
+            UnaryOperator::Not => {
+                let boolean = self
+                    .to_boolean(operand)
+                    .expect("ToBoolean lowering cannot fail");
+                self.invert_bool(boolean)
+            }
+            UnaryOperator::Typeof => {
+                let text = match operand.1 {
+                    ValueType::Undefined => Some("undefined"),
+                    ValueType::Null | ValueType::Object | ValueType::Promise | ValueType::Cell => {
+                        Some("object")
+                    }
+                    ValueType::Number => Some("number"),
+                    ValueType::Bool => Some("boolean"),
+                    ValueType::String => Some("string"),
+                    ValueType::Callable => Some("function"),
+                    ValueType::Dynamic => None,
+                };
+                if let Some(text) = text {
+                    self.const_string(text)
+                } else {
+                    let result = self.new_value();
+                    self.emit(Instruction::TypeOfDynamic {
+                        result,
+                        operand: operand.0,
+                    });
+                    (result, ValueType::String)
+                }
+            }
+            UnaryOperator::Void => self.const_undefined(),
+            UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::BitwiseNot => {
+                if let Some(number) = self.coerce_to_number(operand) {
+                    let result = self.new_value();
+                    self.emit(Instruction::UnaryNumber {
+                        result,
+                        operator: match operator {
+                            UnaryOperator::Plus => UnaryNumberOperator::Plus,
+                            UnaryOperator::Minus => UnaryNumberOperator::Minus,
+                            UnaryOperator::BitwiseNot => UnaryNumberOperator::BitwiseNot,
+                            _ => unreachable!(),
+                        },
+                        operand: number.0,
+                    });
+                    (result, ValueType::Number)
+                } else {
+                    let result = self.new_value();
+                    self.emit(Instruction::DynamicUnary {
+                        result,
+                        operator: map_unary(operator).expect("numeric unary mapping"),
+                        operand: operand.0,
+                        operand_type: operand.1,
+                    });
+                    (result, ValueType::Dynamic)
+                }
+            }
+            UnaryOperator::Delete => unreachable!("delete handled before emit_unary_value"),
+        }
+    }
+
+    fn emit_raw_dynamic_binary(
+        &mut self,
+        operator: DynamicBinaryOperator,
+        left: Lowered,
+        right: Lowered,
+    ) -> Lowered {
+        let result = self.new_value();
+        self.emit(Instruction::DynamicBinary {
+            result,
+            operator,
+            left: left.0,
+            left_type: left.1,
+            right: right.0,
+            right_type: right.1,
+        });
+        (result, ValueType::Dynamic)
+    }
+
+    fn emit_number_binary(
+        &mut self,
+        operator: DynamicBinaryOperator,
+        left: Lowered,
+        right: Lowered,
+    ) -> Option<Lowered> {
+        let left = self.coerce_to_number(left)?;
+        let right = self.coerce_to_number(right)?;
+        let operator = map_number_binary(operator)?;
+        let result = self.new_value();
+        self.emit(Instruction::BinaryNumber {
+            result,
+            operator,
+            left: left.0,
+            right: right.0,
+        });
+        Some((result, ValueType::Number))
+    }
+
+    fn emit_number_compare(
+        &mut self,
+        operator: DynamicBinaryOperator,
+        left: Lowered,
+        right: Lowered,
+    ) -> Option<Lowered> {
+        let left = self.coerce_to_number(left)?;
+        let right = self.coerce_to_number(right)?;
+        let operator = map_number_compare(operator)?;
+        let result = self.new_value();
+        self.emit(Instruction::CompareNumber {
+            result,
+            operator,
+            left: left.0,
+            right: right.0,
+        });
+        Some((result, ValueType::Bool))
+    }
+
+    fn emit_known_equality(
+        &mut self,
+        operator: DynamicBinaryOperator,
+        left: Lowered,
+        right: Lowered,
+    ) -> Option<Lowered> {
+        let strict = matches!(
+            operator,
+            DynamicBinaryOperator::StrictEqual | DynamicBinaryOperator::StrictNotEqual
+        );
+        let negate = matches!(
+            operator,
+            DynamicBinaryOperator::NotEqual | DynamicBinaryOperator::StrictNotEqual
+        );
+
+        if left.1 == right.1 {
+            return match left.1 {
+                ValueType::Undefined | ValueType::Null => Some(self.const_bool(!negate)),
+                ValueType::Number => self.emit_number_compare(operator, left, right),
+                ValueType::String => {
+                    let result = self.new_value();
+                    self.emit(Instruction::CompareString {
+                        result,
+                        left: left.0,
+                        right: right.0,
+                    });
+                    Some(if negate {
+                        self.invert_bool(result)
+                    } else {
+                        (result, ValueType::Bool)
+                    })
+                }
+                ValueType::Object => {
+                    let result = self.new_value();
+                    self.emit(Instruction::CompareObject {
+                        result,
+                        operator: if negate {
+                            CompareNumberOperator::StrictNotEqual
+                        } else {
+                            CompareNumberOperator::StrictEqual
+                        },
+                        left: left.0,
+                        right: right.0,
+                    });
+                    Some((result, ValueType::Bool))
+                }
+                ValueType::Bool
+                | ValueType::Callable
+                | ValueType::Cell
+                | ValueType::Promise
+                | ValueType::Dynamic => None,
+            };
+        }
+
+        if strict && left.1 != ValueType::Dynamic && right.1 != ValueType::Dynamic {
+            return Some(self.const_bool(negate));
+        }
+
+        let left_nullish = matches!(left.1, ValueType::Undefined | ValueType::Null);
+        let right_nullish = matches!(right.1, ValueType::Undefined | ValueType::Null);
+        if left_nullish || right_nullish {
+            if left_nullish && right_nullish {
+                return Some(self.const_bool(!negate));
+            }
+            if left.1 != ValueType::Dynamic && right.1 != ValueType::Dynamic {
+                return Some(self.const_bool(negate));
+            }
+            return None;
+        }
+
+        let primitive_numeric = |value_type: ValueType| {
+            matches!(
+                value_type,
+                ValueType::Number | ValueType::Bool | ValueType::String
+            )
+        };
+        if !strict && primitive_numeric(left.1) && primitive_numeric(right.1) {
+            return self.emit_number_compare(
+                if negate {
+                    DynamicBinaryOperator::NotEqual
+                } else {
+                    DynamicBinaryOperator::Equal
+                },
+                left,
+                right,
+            );
+        }
+
+        None
+    }
+
+    fn emit_dynamic_binary(
+        &mut self,
+        operator: DynamicBinaryOperator,
+        left: Lowered,
+        right: Lowered,
+    ) -> Lowered {
+        match operator {
+            DynamicBinaryOperator::Add => {
+                if left.1 != ValueType::String
+                    && right.1 != ValueType::String
+                    && Self::is_number_coercible(left.1)
+                    && Self::is_number_coercible(right.1)
+                {
+                    if let Some(value) = self.emit_number_binary(operator, left, right) {
+                        return value;
+                    }
+                }
+            }
+            DynamicBinaryOperator::Subtract
+            | DynamicBinaryOperator::Multiply
+            | DynamicBinaryOperator::Divide
+            | DynamicBinaryOperator::Remainder
+            | DynamicBinaryOperator::Exponential
+            | DynamicBinaryOperator::ShiftLeft
+            | DynamicBinaryOperator::ShiftRight
+            | DynamicBinaryOperator::ShiftRightZeroFill
+            | DynamicBinaryOperator::BitwiseOr
+            | DynamicBinaryOperator::BitwiseXor
+            | DynamicBinaryOperator::BitwiseAnd => {
+                if Self::is_number_coercible(left.1) && Self::is_number_coercible(right.1) {
+                    if let Some(value) = self.emit_number_binary(operator, left, right) {
+                        return value;
+                    }
+                }
+            }
+            DynamicBinaryOperator::Equal
+            | DynamicBinaryOperator::NotEqual
+            | DynamicBinaryOperator::StrictEqual
+            | DynamicBinaryOperator::StrictNotEqual => {
+                if let Some(value) = self.emit_known_equality(operator, left, right) {
+                    return value;
+                }
+            }
+            DynamicBinaryOperator::LessThan
+            | DynamicBinaryOperator::LessEqual
+            | DynamicBinaryOperator::GreaterThan
+            | DynamicBinaryOperator::GreaterEqual => {
+                if !(left.1 == ValueType::String && right.1 == ValueType::String)
+                    && Self::is_number_coercible(left.1)
+                    && Self::is_number_coercible(right.1)
+                {
+                    if let Some(value) = self.emit_number_compare(operator, left, right) {
+                        return value;
+                    }
+                }
+            }
+            DynamicBinaryOperator::In | DynamicBinaryOperator::InstanceOf => {}
+        }
+        self.emit_raw_dynamic_binary(operator, left, right)
     }
 
     fn lower_expression(&mut self, expression: &Expression) -> Result<Lowered> {
@@ -696,14 +1426,7 @@ impl GenericLowerer {
                     return Ok((result, ValueType::Bool));
                 }
                 let operand = self.lower_expression(argument)?;
-                let result = self.new_value();
-                self.emit(Instruction::DynamicUnary {
-                    result,
-                    operator: map_unary(*operator)?,
-                    operand: operand.0,
-                    operand_type: operand.1,
-                });
-                Ok((result, ValueType::Dynamic))
+                Ok(self.emit_unary_value(*operator, operand))
             }
             ExpressionKind::Binary {
                 left,
@@ -712,16 +1435,7 @@ impl GenericLowerer {
             } => {
                 let left = self.lower_expression(left)?;
                 let right = self.lower_expression(right)?;
-                let result = self.new_value();
-                self.emit(Instruction::DynamicBinary {
-                    result,
-                    operator: map_binary(*operator),
-                    left: left.0,
-                    left_type: left.1,
-                    right: right.0,
-                    right_type: right.1,
-                });
-                Ok((result, ValueType::Dynamic))
+                Ok(self.emit_dynamic_binary(map_binary(*operator), left, right))
             }
             ExpressionKind::Logical {
                 left,
@@ -872,22 +1586,33 @@ impl GenericLowerer {
             else_block,
         });
 
+        let base_state = self.snapshot_scopes();
+
         self.current = then_block.0 as usize;
-        let value = self.lower_expression(consequent)?;
-        self.write_cell(cell, value);
+        self.scopes = base_state.clone();
+        let then_value = self.lower_expression(consequent)?;
+        self.write_cell(cell, then_value);
+        let then_state = self.snapshot_scopes();
+        let then_end = BlockId(self.current as u32);
         if self.blocks[self.current].terminator.is_none() {
             self.set_terminator(Terminator::Jump(merge));
         }
 
         self.current = else_block.0 as usize;
-        let value = self.lower_expression(alternate)?;
-        self.write_cell(cell, value);
+        self.scopes = base_state.clone();
+        let else_value = self.lower_expression(alternate)?;
+        self.write_cell(cell, else_value);
+        let else_state = self.snapshot_scopes();
+        let else_end = BlockId(self.current as u32);
         if self.blocks[self.current].terminator.is_none() {
             self.set_terminator(Terminator::Jump(merge));
         }
 
+        let _ = (then_end, else_end);
+        self.scopes = Self::merge_scope_states(&base_state, &then_state, &else_state, true, true);
         self.current = merge.0 as usize;
-        Ok(self.read_cell(cell))
+        let value_type = Self::join_type(then_value.1, else_value.1);
+        Ok(self.read_cell(cell, value_type))
     }
 
     fn lower_logical(
@@ -897,77 +1622,70 @@ impl GenericLowerer {
         right: &Expression,
     ) -> Result<Lowered> {
         let left = self.lower_expression(left)?;
+
+        if matches!(operator, LogicalOperator::Nullish) {
+            if matches!(left.1, ValueType::Null | ValueType::Undefined) {
+                return self.lower_expression(right);
+            }
+            if left.1 != ValueType::Dynamic {
+                return Ok(left);
+            }
+        }
+
         let cell = self.create_cell(left);
-        let condition = self.to_boolean(left)?;
         let rhs_block = self.new_block("generic.logical.rhs");
         let short_block = self.new_block("generic.logical.short");
         let merge = self.new_block("generic.logical.merge");
+        let base_state = self.snapshot_scopes();
 
-        let (then_block, else_block) = match operator {
-            LogicalOperator::Or => (short_block, rhs_block),
-            LogicalOperator::And => (rhs_block, short_block),
-            LogicalOperator::Nullish => {
-                // Nullish uses a runtime equality check against null and
-                // undefined rather than truthiness.
-                let null = self.const_null();
-                let undefined = self.const_undefined();
-                let left_null = self.new_value();
-                self.emit(Instruction::DynamicBinary {
-                    result: left_null,
-                    operator: DynamicBinaryOperator::StrictEqual,
-                    left: left.0,
-                    left_type: left.1,
-                    right: null.0,
-                    right_type: null.1,
-                });
-                let left_undefined = self.new_value();
-                self.emit(Instruction::DynamicBinary {
-                    result: left_undefined,
-                    operator: DynamicBinaryOperator::StrictEqual,
-                    left: left.0,
-                    left_type: left.1,
-                    right: undefined.0,
-                    right_type: undefined.1,
-                });
-                let nullish = self.new_value();
-                self.emit(Instruction::DynamicBinary {
-                    result: nullish,
-                    operator: DynamicBinaryOperator::BitwiseOr,
-                    left: left_null,
-                    left_type: ValueType::Dynamic,
-                    right: left_undefined,
-                    right_type: ValueType::Dynamic,
-                });
-                let nullish_bool = self.to_boolean((nullish, ValueType::Dynamic))?;
-                self.set_terminator(Terminator::Branch {
-                    condition: nullish_bool,
-                    then_block: rhs_block,
-                    else_block: short_block,
-                });
-                self.current = short_block.0 as usize;
-                self.set_terminator(Terminator::Jump(merge));
-                self.current = rhs_block.0 as usize;
-                let rhs = self.lower_expression(right)?;
-                self.write_cell(cell, rhs);
-                self.set_terminator(Terminator::Jump(merge));
-                self.current = merge.0 as usize;
-                return Ok(self.read_cell(cell));
-            }
-        };
+        if matches!(operator, LogicalOperator::Nullish) {
+            let null = self.const_null();
+            let undefined = self.const_undefined();
+            let left_null =
+                self.emit_raw_dynamic_binary(DynamicBinaryOperator::StrictEqual, left, null);
+            let left_undefined =
+                self.emit_raw_dynamic_binary(DynamicBinaryOperator::StrictEqual, left, undefined);
+            let nullish = self.emit_raw_dynamic_binary(
+                DynamicBinaryOperator::BitwiseOr,
+                left_null,
+                left_undefined,
+            );
+            let condition = self.to_boolean(nullish)?;
+            self.set_terminator(Terminator::Branch {
+                condition,
+                then_block: rhs_block,
+                else_block: short_block,
+            });
+        } else {
+            let condition = self.to_boolean(left)?;
+            let (then_block, else_block) = match operator {
+                LogicalOperator::Or => (short_block, rhs_block),
+                LogicalOperator::And => (rhs_block, short_block),
+                LogicalOperator::Nullish => unreachable!(),
+            };
+            self.set_terminator(Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            });
+        }
 
-        self.set_terminator(Terminator::Branch {
-            condition,
-            then_block,
-            else_block,
-        });
         self.current = short_block.0 as usize;
+        self.scopes = base_state.clone();
+        let short_state = self.snapshot_scopes();
         self.set_terminator(Terminator::Jump(merge));
+
         self.current = rhs_block.0 as usize;
+        self.scopes = base_state.clone();
         let rhs = self.lower_expression(right)?;
         self.write_cell(cell, rhs);
+        let rhs_state = self.snapshot_scopes();
         self.set_terminator(Terminator::Jump(merge));
+
+        self.scopes = Self::merge_scope_states(&base_state, &short_state, &rhs_state, true, true);
         self.current = merge.0 as usize;
-        Ok(self.read_cell(cell))
+        let value_type = Self::join_type(left.1, rhs.1);
+        Ok(self.read_cell(cell, value_type))
     }
 
     fn lower_assignment(
@@ -997,12 +1715,14 @@ impl GenericLowerer {
                 let value = if operator == AssignmentOperator::Assign {
                     self.lower_expression(expression)?
                 } else {
-                    let old = self.read_cell(binding.cell);
+                    let old = self.read_cell(binding.cell, binding.value_type);
                     let right = self.lower_expression(expression)?;
                     self.emit_dynamic_binary(map_assignment(operator)?, old, right)
                 };
                 self.write_cell(binding.cell, value);
-                self.find_binding_mut(name).unwrap().initialized = true;
+                let binding = self.find_binding_mut(name).unwrap();
+                binding.initialized = true;
+                binding.value_type = value.1;
                 Ok(value)
             }
             AssignmentTarget::Member { object, property } => {
@@ -1058,9 +1778,10 @@ impl GenericLowerer {
                 if binding.kind == VariableKind::Const {
                     bail!("không thể update const `{name}`")
                 }
-                let old = self.read_cell(binding.cell);
+                let old = self.read_cell(binding.cell, binding.value_type);
                 let new = self.emit_dynamic_binary(binary, old, one);
                 self.write_cell(binding.cell, new);
+                self.find_binding_mut(name).unwrap().value_type = new.1;
                 Ok(if prefix { new } else { old })
             }
             AssignmentTarget::Member { object, property } => {
@@ -1085,24 +1806,6 @@ impl GenericLowerer {
                 Ok(if prefix { new } else { old })
             }
         }
-    }
-
-    fn emit_dynamic_binary(
-        &mut self,
-        operator: DynamicBinaryOperator,
-        left: Lowered,
-        right: Lowered,
-    ) -> Lowered {
-        let result = self.new_value();
-        self.emit(Instruction::DynamicBinary {
-            result,
-            operator,
-            left: left.0,
-            left_type: left.1,
-            right: right.0,
-            right_type: right.1,
-        });
-        (result, ValueType::Dynamic)
     }
 
     fn lower_call(&mut self, callee: &Expression, arguments: &[Expression]) -> Result<Lowered> {
@@ -1263,10 +1966,20 @@ impl GenericLowerer {
             .filter(|name| !is_builtin_name(name) && (function.arrow || name != "arguments"))
             .collect::<Vec<_>>();
         free_names.sort();
-        let mut captures = Vec::<(String, ValueId)>::new();
+
+        let mut captures = Vec::<(String, ValueId, ValueType)>::new();
         for name in free_names {
-            if let Some(binding) = self.find_binding(&name) {
-                captures.push((name, binding.cell));
+            if let Some(binding) = self.find_binding(&name).cloned() {
+                let captured_type = if binding.kind == VariableKind::Const && binding.initialized {
+                    binding.value_type
+                } else {
+                    // A mutable captured cell can be changed by any later
+                    // invocation of the closure. Widen both parent and child
+                    // views instead of speculating across call boundaries.
+                    self.find_binding_mut(&name).unwrap().value_type = ValueType::Dynamic;
+                    ValueType::Dynamic
+                };
+                captures.push((name, binding.cell, captured_type));
             }
         }
 
@@ -1287,7 +2000,7 @@ impl GenericLowerer {
         self.emit(Instruction::ClosureNewGeneric {
             result,
             function: function_name,
-            captures: captures.iter().map(|(_, cell)| *cell).collect(),
+            captures: captures.iter().map(|(_, cell, _)| *cell).collect(),
             capture_types: vec![ValueType::Cell; captures.len()],
             constructable: !function.arrow,
             strict: self.strict,
@@ -1300,7 +2013,7 @@ impl GenericLowerer {
     fn compile_function(
         &mut self,
         function: &HirFunction,
-        captures: &[(String, ValueId)],
+        captures: &[(String, ValueId, ValueType)],
     ) -> Result<String> {
         let id = self.next_function;
         self.next_function += 1;
@@ -1324,7 +2037,7 @@ impl GenericLowerer {
         child.next_function = self.next_function;
 
         let mut ir_captures = Vec::new();
-        for (index, (name, _)) in captures.iter().enumerate() {
+        for (index, (name, _, captured_type)) in captures.iter().enumerate() {
             let value = child.new_value();
             child.emit(Instruction::Capture {
                 result: value,
@@ -1342,6 +2055,7 @@ impl GenericLowerer {
                     kind: VariableKind::Let,
                     initialized: true,
                     cell: value,
+                    value_type: *captured_type,
                 },
             );
         }
@@ -1356,6 +2070,7 @@ impl GenericLowerer {
                     kind: VariableKind::Const,
                     initialized: true,
                     cell,
+                    value_type: ValueType::Callable,
                 },
             );
         }
@@ -1389,6 +2104,7 @@ impl GenericLowerer {
                     kind: VariableKind::Let,
                     initialized: true,
                     cell,
+                    value_type: ValueType::Dynamic,
                 },
             );
         }
@@ -1406,6 +2122,7 @@ impl GenericLowerer {
                     kind: VariableKind::Let,
                     initialized: true,
                     cell,
+                    value_type: ValueType::Object,
                 },
             );
         }
@@ -1420,6 +2137,7 @@ impl GenericLowerer {
                     kind: VariableKind::Let,
                     initialized: true,
                     cell,
+                    value_type: ValueType::Object,
                 },
             );
         }
@@ -1554,6 +2272,38 @@ fn map_assignment(operator: AssignmentOperator) -> Result<DynamicBinaryOperator>
         | AssignmentOperator::LogicalNullish => {
             bail!("operator không phải compound binary")
         }
+    })
+}
+
+fn map_number_binary(operator: DynamicBinaryOperator) -> Option<BinaryNumberOperator> {
+    Some(match operator {
+        DynamicBinaryOperator::Add => BinaryNumberOperator::Add,
+        DynamicBinaryOperator::Subtract => BinaryNumberOperator::Subtract,
+        DynamicBinaryOperator::Multiply => BinaryNumberOperator::Multiply,
+        DynamicBinaryOperator::Divide => BinaryNumberOperator::Divide,
+        DynamicBinaryOperator::Remainder => BinaryNumberOperator::Remainder,
+        DynamicBinaryOperator::Exponential => BinaryNumberOperator::Exponential,
+        DynamicBinaryOperator::ShiftLeft => BinaryNumberOperator::ShiftLeft,
+        DynamicBinaryOperator::ShiftRight => BinaryNumberOperator::ShiftRight,
+        DynamicBinaryOperator::ShiftRightZeroFill => BinaryNumberOperator::ShiftRightZeroFill,
+        DynamicBinaryOperator::BitwiseOr => BinaryNumberOperator::BitwiseOr,
+        DynamicBinaryOperator::BitwiseXor => BinaryNumberOperator::BitwiseXor,
+        DynamicBinaryOperator::BitwiseAnd => BinaryNumberOperator::BitwiseAnd,
+        _ => return None,
+    })
+}
+
+fn map_number_compare(operator: DynamicBinaryOperator) -> Option<CompareNumberOperator> {
+    Some(match operator {
+        DynamicBinaryOperator::Equal => CompareNumberOperator::Equal,
+        DynamicBinaryOperator::NotEqual => CompareNumberOperator::NotEqual,
+        DynamicBinaryOperator::StrictEqual => CompareNumberOperator::StrictEqual,
+        DynamicBinaryOperator::StrictNotEqual => CompareNumberOperator::StrictNotEqual,
+        DynamicBinaryOperator::LessThan => CompareNumberOperator::LessThan,
+        DynamicBinaryOperator::LessEqual => CompareNumberOperator::LessEqual,
+        DynamicBinaryOperator::GreaterThan => CompareNumberOperator::GreaterThan,
+        DynamicBinaryOperator::GreaterEqual => CompareNumberOperator::GreaterEqual,
+        _ => return None,
     })
 }
 

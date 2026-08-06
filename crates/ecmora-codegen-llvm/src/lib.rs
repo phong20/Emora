@@ -1140,31 +1140,48 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             .get(operand)
                             .copied()
                             .context("thiếu ToNumber operand")?;
-                        let dynamic = to_dynamic(
-                            &builder,
-                            value,
-                            *operand_type,
-                            i8_type,
-                            i64_type,
-                            dynamic_type,
-                        )?;
-                        let tag = builder
-                            .build_extract_value(dynamic, 0, "to.number.tag")?
-                            .into_int_value();
-                        let payload = builder
-                            .build_extract_value(dynamic, 1, "to.number.payload")?
-                            .into_int_value();
-                        let call = builder.build_call(
-                            primitive_to_number,
-                            &[tag.into(), payload.into()],
-                            "primitive.to.number",
-                        )?;
-                        values.insert(
-                            *result,
-                            call.try_as_basic_value()
-                                .basic()
-                                .context("primitive ToNumber không trả f64")?,
-                        );
+                        let number = match operand_type {
+                            ValueType::Number => value.into_float_value(),
+                            ValueType::Bool => builder.build_unsigned_int_to_float(
+                                value.into_int_value(),
+                                f64_type,
+                                "bool.to.number",
+                            )?,
+                            ValueType::Null => f64_type.const_zero(),
+                            ValueType::Undefined => f64_type.const_float(f64::NAN),
+                            ValueType::String | ValueType::Dynamic => {
+                                let dynamic = to_dynamic(
+                                    &builder,
+                                    value,
+                                    *operand_type,
+                                    i8_type,
+                                    i64_type,
+                                    dynamic_type,
+                                )?;
+                                let tag = builder
+                                    .build_extract_value(dynamic, 0, "to.number.tag")?
+                                    .into_int_value();
+                                let payload = builder
+                                    .build_extract_value(dynamic, 1, "to.number.payload")?
+                                    .into_int_value();
+                                let call = builder.build_call(
+                                    primitive_to_number,
+                                    &[tag.into(), payload.into()],
+                                    "primitive.to.number",
+                                )?;
+                                call.try_as_basic_value()
+                                    .basic()
+                                    .context("primitive ToNumber không trả f64")?
+                                    .into_float_value()
+                            }
+                            ValueType::Object
+                            | ValueType::Callable
+                            | ValueType::Cell
+                            | ValueType::Promise => {
+                                bail!("ToNumber object coercion không thuộc typed LLVM path")
+                            }
+                        };
+                        values.insert(*result, number.into());
                     }
                     Instruction::TypeOfDynamic { result, operand } => {
                         let dynamic = values
