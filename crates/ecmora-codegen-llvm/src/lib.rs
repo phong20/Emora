@@ -235,6 +235,24 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         ),
         None,
     );
+    let argument_get = module.add_function(
+        "ecmora_argument_get",
+        context.void_type().fn_type(
+            &[
+                i32_type.into(),
+                ptr_type.into(),
+                i32_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+    let tail_argv_reserve = module.add_function(
+        "ecmora_tail_argv_reserve",
+        ptr_type.fn_type(&[i32_type.into()], false),
+        None,
+    );
     let cell_new = module.add_function(
         "ecmora_cell_new",
         ptr_type.fn_type(&[ptr_type.into()], false),
@@ -374,20 +392,28 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         index,
                         value_type,
                     } => {
+                        let argc = main
+                            .get_nth_param(1)
+                            .context("JavaScript function thiếu argc")?
+                            .into_int_value();
                         let argv = main
                             .get_nth_param(2)
                             .context("JavaScript function thiếu argv")?
                             .into_pointer_value();
-                        let slot = unsafe {
-                            builder.build_gep(
-                                dynamic_type,
-                                argv,
-                                &[i32_type.const_int(*index as u64, false)],
-                                "parameter.slot",
-                            )?
-                        };
+                        let dynamic_ptr =
+                            builder.build_alloca(dynamic_type, "parameter.dynamic.slot")?;
+                        builder.build_call(
+                            argument_get,
+                            &[
+                                argc.into(),
+                                argv.into(),
+                                i32_type.const_int(*index as u64, false).into(),
+                                dynamic_ptr.into(),
+                            ],
+                            "parameter.get",
+                        )?;
                         let dynamic = builder
-                            .build_load(dynamic_type, slot, "parameter.dynamic")?
+                            .build_load(dynamic_type, dynamic_ptr, "parameter.dynamic")?
                             .into_struct_value();
                         values.insert(
                             *result,
@@ -1249,6 +1275,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         )?;
                         let dynamic_ptr =
                             builder.build_alloca(dynamic_type, "call.direct.result")?;
+                        builder.build_store(dynamic_ptr, dynamic_type.const_zero())?;
                         let call = builder.build_call(
                             target,
                             &[
@@ -1317,6 +1344,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         )?;
                         let dynamic_ptr =
                             builder.build_alloca(dynamic_type, "call.indirect.result")?;
+                        builder.build_store(dynamic_ptr, dynamic_type.const_zero())?;
                         let call = builder.build_call(
                             closure_call,
                             &[
@@ -1609,11 +1637,22 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         .get(function)
                         .copied()
                         .with_context(|| format!("unknown direct tail callee `{function}`"))?;
-                    let argv = main
-                        .get_nth_param(2)
-                        .context("JavaScript function thiếu argv cho tail call")?
+                    // A stack alloca cannot safely escape into a tail-called
+                    // frame. Use a reusable thread-local buffer whose lifetime
+                    // spans the whole tail-call chain and supports cross-arity
+                    // mutual recursion without leaking one allocation per hop.
+                    let tail_argc = i32_type.const_int(arguments.len() as u64, false);
+                    let tail_argv_call = builder.build_call(
+                        tail_argv_reserve,
+                        &[tail_argc.into()],
+                        "tail.argv.reserve",
+                    )?;
+                    let argv = tail_argv_call
+                        .try_as_basic_value()
+                        .basic()
+                        .context("tail argv reserve không trả pointer")?
                         .into_pointer_value();
-                    for (index, (argument, value_type)) in
+                    for (argument_index, (argument, value_type)) in
                         arguments.iter().zip(argument_types).enumerate()
                     {
                         let value = values
@@ -1632,7 +1671,7 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                             builder.build_gep(
                                 dynamic_type,
                                 argv,
-                                &[i32_type.const_int(index as u64, false)],
+                                &[i32_type.const_int(argument_index as u64, false)],
                                 "tail.argv.slot",
                             )?
                         };

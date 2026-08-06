@@ -1,48 +1,50 @@
-use std::{
-    ffi::{CStr, c_char},
-    path::Path,
-    slice,
-};
+//! Detached compatibility ABI stub.
+//!
+//! This crate intentionally contains no parser, HIR lowering, analyzer,
+//! interpreter, or native compiler dependency. It remains a workspace member
+//! only so old external link integrations receive a deterministic failure
+//! instead of silently executing a second implementation of JavaScript.
 
-/// Marker used by the driver so Cargo always emits the companion static library.
+use std::ffi::c_char;
+
+/// Compatibility execution is intentionally unavailable.
+pub const COMPATIBILITY_BACKEND_AVAILABLE: bool = false;
+
+/// Legacy no-op retained for source compatibility with external callers.
+///
+/// The compiler driver does not depend on or call this function.
 pub fn ensure_linked() {}
 
-/// Parse and execute an embedded ECMAScript source inside a native executable.
+/// Legacy C ABI stub.
+///
+/// It never reads, parses, lowers, analyzes, or executes `path`/`source`.
+/// Status 78 follows the conventional "configuration unavailable" exit code.
 ///
 /// # Safety
-/// `path` must be a valid NUL-terminated string. `source` must address `length`
-/// readable bytes for the duration of this call.
+/// This function deliberately does not dereference any pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ecmora_execute_source(
-    path: *const c_char,
-    source: *const u8,
-    length: usize,
+    _path: *const c_char,
+    _source: *const u8,
+    _length: usize,
 ) -> i32 {
-    let result = std::panic::catch_unwind(|| {
-        if path.is_null() || source.is_null() {
-            return Err("native host nhận null pointer".to_owned());
-        }
-        // SAFETY: guaranteed by the exported function contract.
-        let path = unsafe { CStr::from_ptr(path) }
-            .to_str()
-            .map_err(|error| error.to_string())?;
-        // SAFETY: guaranteed by the exported function contract.
-        let source = unsafe { slice::from_raw_parts(source, length) };
-        let source = std::str::from_utf8(source).map_err(|error| error.to_string())?;
-        let hir = ecmora_frontend_oxc::lower_source(Path::new(path), source)
-            .map_err(|error| format!("{error:#}"))?;
-        ecmora_runtime::execute(&hir).map_err(|error| format!("{error:#}"))
-    });
+    eprintln!(
+        "Ecmora compatibility backend is detached; compile the source through the native SSA/LLVM pipeline"
+    );
+    78
+}
 
-    match result {
-        Ok(Ok(())) => 0,
-        Ok(Err(error)) => {
-            eprintln!("Ecmora runtime error: {error}");
-            1
-        }
-        Err(_) => {
-            eprintln!("Ecmora runtime panic");
-            101
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compatibility_backend_is_a_non_executing_stub() {
+        assert!(!COMPATIBILITY_BACKEND_AVAILABLE);
+
+        // Null is safe specifically because the detached stub does not inspect
+        // or execute input. This guards against reconnecting parser/runtime code.
+        let status = unsafe { ecmora_execute_source(std::ptr::null(), std::ptr::null(), 0) };
+        assert_eq!(status, 78);
     }
 }

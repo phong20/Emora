@@ -200,11 +200,11 @@ impl Lowerer {
         operator: UnaryOperator,
         argument: &Expression,
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
-        let abstract_value = self.abstract_value_for_expression(argument);
-        if abstract_value.may_be_bigint() {
-            bail!("BigInt unary arithmetic uses compatibility numeric tower")
-        }
-        let operand = self.lower_expression(argument)?;
+        // Lower a known call under Number context before asking whether an
+        // unresolved Dynamic value may contain BigInt. Concrete BigInt still
+        // fails in lower_expression; unresolved Dynamic still fails inside
+        // coerce_to_number.
+        let operand = self.lower_expression_with_hint(argument, Some(ValueType::Number))?;
         let operand = self.coerce_to_number(argument, operand)?;
         let result = self.new_value();
         self.emit(Instruction::UnaryNumber {

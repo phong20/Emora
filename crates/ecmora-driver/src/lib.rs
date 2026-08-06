@@ -11,9 +11,22 @@ use anyhow::{Context, Result, bail};
 mod modules;
 
 pub fn run_file(path: &Path) -> Result<()> {
-    let hir = lower_hir_from_file(path)?;
+    // `run` is deliberately not an interpreter shortcut. It exercises exactly
+    // the same native-only pipeline as `build`, then executes that artifact.
+    let executable = build_file(path)?;
+    let status = Command::new(&executable)
+        .status()
+        .with_context(|| format!("không thể chạy native executable {}", executable.display()))?;
 
-    ecmora_runtime::execute(&hir)
+    if !status.success() {
+        bail!(
+            "native executable {} kết thúc với status {}",
+            executable.display(),
+            status
+        )
+    }
+
+    Ok(())
 }
 
 pub fn check_file(path: &Path) -> Result<()> {
@@ -69,26 +82,16 @@ pub fn dump_llvm_file(path: &Path) -> Result<PathBuf> {
 ///
 /// Pipeline:
 ///
-/// source → AST → HIR → SSA → LLVM IR → clang → exe
+/// source → AST → HIR → SSA → LLVM IR → object → native runtime → executable
+///
+/// There is intentionally no compatibility fallback here. A native analysis,
+/// verification, codegen, or linker failure is returned to the caller.
 pub fn build_file(path: &Path) -> Result<PathBuf> {
-    ecmora_native_host::ensure_linked();
-    match lower_ssa_from_file(path) {
-        Ok(ssa) => match build_ssa_file(path, &ssa) {
-            Ok(executable) => Ok(executable),
-            Err(reason) => {
-                eprintln!(
-                    "LLVM native backend chưa phủ SSA này; dùng compatibility executable: {reason:#}"
-                );
-                build_compatibility_file(path)
-            }
-        },
-        Err(reason) => {
-            eprintln!(
-                "native SSA chưa phủ chương trình này; dùng compatibility executable: {reason:#}"
-            );
-            build_compatibility_file(path)
-        }
-    }
+    let ssa = lower_ssa_from_file(path)
+        .with_context(|| format!("native analysis/lowering thất bại cho {}", path.display()))?;
+
+    build_ssa_file(path, &ssa)
+        .with_context(|| format!("native LLVM codegen/link thất bại cho {}", path.display()))
 }
 
 fn build_ssa_file(path: &Path, ssa: &ecmora_ir::Program) -> Result<PathBuf> {
@@ -134,104 +137,6 @@ fn build_ssa_file(path: &Path, ssa: &ecmora_ir::Program) -> Result<PathBuf> {
         );
     }
 
-    Ok(executable_path)
-}
-
-fn build_compatibility_file(path: &Path) -> Result<PathBuf> {
-    let source = read_source(path)?;
-    let wrapper_path = artifact_path(path, "compat.c")?;
-    let embedded_name = format!(
-        "embedded.{}",
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("js")
-    );
-    let embedded_name = embedded_name.replace('\\', "\\\\").replace('"', "\\\"");
-    let source_bytes = source
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("0x{byte:02x}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let wrapper = format!(
-        "#include <stddef.h>\n\
-         extern int ecmora_execute_source(const char *, const unsigned char *, size_t);\n\
-         static const unsigned char source[] = {{{source_bytes}}};\n\
-         int main(void) {{ return ecmora_execute_source(\"{embedded_name}\", source, sizeof(source)); }}\n"
-    );
-    fs::write(&wrapper_path, wrapper)
-        .with_context(|| format!("không thể ghi {}", wrapper_path.display()))?;
-
-    let executable_path = executable_artifact_path(path)?;
-    let clang = find_clang()?;
-    let executable = env::current_exe().context("không tìm được executable ecmora hiện tại")?;
-    let target_directory = executable
-        .parent()
-        .context("executable ecmora không có parent directory")?;
-    let workspace_manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("Cargo.toml");
-    let mut cargo = Command::new("cargo");
-    cargo.args([
-        "build",
-        "-p",
-        "ecmora-native-host",
-        "--offline",
-        "--manifest-path",
-    ]);
-    cargo.arg(&workspace_manifest);
-    if target_directory
-        .file_name()
-        .is_some_and(|name| name == "release")
-    {
-        cargo.arg("--release");
-    }
-    let status = cargo
-        .status()
-        .context("không thể cập nhật compatibility static library")?;
-    if !status.success() {
-        bail!("cargo build ecmora-native-host thất bại")
-    }
-    let static_library = target_directory.join(if cfg!(windows) {
-        "ecmora_native_host.lib"
-    } else {
-        "libecmora_native_host.a"
-    });
-    if !static_library.exists() {
-        bail!(
-            "thiếu compatibility static library {}; chạy `cargo build -p ecmora-native-host`",
-            static_library.display()
-        )
-    }
-
-    let mut command = Command::new(&clang);
-    command.arg(&wrapper_path).arg(&static_library);
-    if cfg!(windows) {
-        command.args([
-            "-ladvapi32",
-            "-lbcrypt",
-            "-lkernel32",
-            "-lntdll",
-            "-lole32",
-            "-lshell32",
-            "-luserenv",
-            "-lws2_32",
-        ]);
-    }
-    let output = command
-        .arg("-o")
-        .arg(&executable_path)
-        .output()
-        .with_context(|| format!("không thể link compatibility executable bằng {:?}", clang))?;
-    if !output.status.success() {
-        bail!(
-            "link compatibility executable thất bại\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        )
-    }
     Ok(executable_path)
 }
 

@@ -117,9 +117,7 @@ dependencies = [
  "ecmora-frontend-oxc",
  "ecmora-hir",
  "ecmora-ir",
- "ecmora-native-host",
  "ecmora-opt",
- "ecmora-runtime",
 ]
 
 [[package]]
@@ -148,10 +146,6 @@ dependencies = [
 [[package]]
 name = "ecmora-native-host"
 version = "0.1.0"
-dependencies = [
- "ecmora-frontend-oxc",
- "ecmora-runtime",
-]
 
 [[package]]
 name = "ecmora-opt"

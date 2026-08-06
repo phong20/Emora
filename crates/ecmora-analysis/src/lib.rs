@@ -219,7 +219,6 @@ struct Lowerer {
     specialization_counts: HashMap<String, usize>,
     expected_type_hint: Option<ValueType>,
     function_return_hint: Option<ValueType>,
-    function_arity: Option<usize>,
     static_accessors: HashMap<(ValueId, String), StaticAccessor>,
     static_object_callables: HashMap<(ValueId, String), ClosureBinding>,
     promise_settlements: HashMap<ValueId, PromiseSettlement>,
@@ -1461,14 +1460,10 @@ impl Lowerer {
         if !is_tail_call {
             return None;
         }
-        let expected_arity = self.function_arity?;
-        let argument_count = match self.blocks[self.current].instructions.last() {
-            Some(Instruction::CallDirect { arguments, .. }) => arguments.len(),
-            _ => return None,
-        };
-        if argument_count != expected_arity {
-            return None;
-        }
+
+        // LLVM codegen materializes a fresh argv array for every direct tail
+        // call. The former same-arity restriction only protected an in-place
+        // overwrite of caller-owned argv storage.
         let Instruction::CallDirect {
             function,
             arguments,
@@ -1834,14 +1829,18 @@ impl Lowerer {
                 {
                     return self.lower_number_arithmetic(left, *operator, right);
                 }
-                if numeric_context
-                    && (self.abstract_value_for_expression(left).may_be_bigint()
-                        || self.abstract_value_for_expression(right).may_be_bigint())
-                {
-                    bail!("BigInt arithmetic uses compatibility numeric tower")
-                }
+                // AbstractValue::dynamic() deliberately includes BigInt. A known
+                // direct/callback call is still syntactically Dynamic before its
+                // call-site specialization is lowered, so rejecting it here would
+                // classify every unresolved call as BigInt too early. Propagate the
+                // numeric context first. Literal/constructor BigInt still fails in
+                // lower_expression, while a genuinely Dynamic result is rejected
+                // later because it never becomes a typed Number value.
+                let number_hint_context = numeric_context
+                    || (*operator == BinaryOperator::Add
+                        && self.expected_type_hint == Some(ValueType::Number));
                 let right_hint = self.expression_type_hint(right);
-                let left_hint = if numeric_context
+                let left_hint = if number_hint_context
                     || (*operator == BinaryOperator::Add && right_hint == Some(ValueType::Number))
                 {
                     Some(ValueType::Number)
@@ -1856,7 +1855,7 @@ impl Lowerer {
                         }
                     }
                 }
-                let right_hint = if numeric_context
+                let right_hint = if number_hint_context
                     || (*operator == BinaryOperator::Add && left.1 == ValueType::Number)
                 {
                     Some(ValueType::Number)
@@ -2213,10 +2212,11 @@ impl Lowerer {
                 key: key.clone(),
                 value_type: old_type,
             });
-            let rhs = self.lower_expression(rhs_expression)?;
             let binary = assignment_binary(operator).ok_or_else(|| {
                 anyhow::anyhow!("logical object assignment động chưa được hỗ trợ")
             })?;
+            let rhs_hint = (old_type == ValueType::Number).then_some(ValueType::Number);
+            let rhs = self.lower_expression_with_hint(rhs_expression, rhs_hint)?;
             if old_type != ValueType::Number || rhs.1 != ValueType::Number {
                 bail!("compound object assignment hiện cần Number")
             }
@@ -2443,7 +2443,22 @@ impl Lowerer {
         if should_skip {
             return Ok(old);
         }
-        let rhs = self.lower_expression(expression)?;
+        let rhs_hint = match operator {
+            AssignmentOperator::Add if old.1 == ValueType::Number => Some(ValueType::Number),
+            AssignmentOperator::Subtract
+            | AssignmentOperator::Multiply
+            | AssignmentOperator::Divide
+            | AssignmentOperator::Remainder
+            | AssignmentOperator::Exponential
+            | AssignmentOperator::ShiftLeft
+            | AssignmentOperator::ShiftRight
+            | AssignmentOperator::ShiftRightZeroFill
+            | AssignmentOperator::BitwiseOr
+            | AssignmentOperator::BitwiseXor
+            | AssignmentOperator::BitwiseAnd => Some(ValueType::Number),
+            _ => None,
+        };
+        let rhs = self.lower_expression_with_hint(expression, rhs_hint)?;
         let value = match operator {
             AssignmentOperator::LogicalOr
             | AssignmentOperator::LogicalAnd
@@ -2461,12 +2476,18 @@ impl Lowerer {
                 };
                 let old_abstract = self.abstract_value_for_expression(&old_expression);
                 let rhs_abstract = self.abstract_value_for_expression(expression);
-                let number_safe = old_abstract.numeric_coercion_safe()
-                    && rhs_abstract.numeric_coercion_safe()
-                    && !old_abstract.may_be_bigint()
-                    && !rhs_abstract.may_be_bigint()
-                    && (!matches!(binary, SemBinary::Add)
-                        || (!old_abstract.may_be_string() && !rhs_abstract.may_be_string()));
+                // The lowered type is stronger evidence than the pre-lowering
+                // syntactic abstract value. In particular, a specialized call can
+                // now be Number even though its source expression initially looked
+                // Dynamic (and therefore may-be-BigInt/may-be-String).
+                let old_number_safe = old.1 == ValueType::Number
+                    || (old_abstract.numeric_coercion_safe() && !old_abstract.may_be_bigint());
+                let rhs_number_safe = rhs.1 == ValueType::Number
+                    || (rhs_abstract.numeric_coercion_safe() && !rhs_abstract.may_be_bigint());
+                let add_may_concatenate = matches!(binary, SemBinary::Add)
+                    && ((old.1 != ValueType::Number && old_abstract.may_be_string())
+                        || (rhs.1 != ValueType::Number && rhs_abstract.may_be_string()));
+                let number_safe = old_number_safe && rhs_number_safe && !add_may_concatenate;
                 if number_safe {
                     let native_operator = number_operator_for_sem(binary).ok_or_else(|| {
                         anyhow::anyhow!("compound operator động chưa được hỗ trợ")
@@ -3274,7 +3295,9 @@ impl Lowerer {
             specialization_captures.extend(callbacks[parameter].captures.iter().cloned());
         }
 
-        let return_seed = self.expected_type_hint.unwrap_or(ValueType::Dynamic);
+        let inferred_return_type =
+            infer_function_return_type(function, &parameter_type_hints, captures);
+        let return_seed = canonical_return_seed(inferred_return_type, self.expected_type_hint);
         let specialization_key = SpecializationKey::new(
             name,
             parameters
@@ -3318,13 +3341,10 @@ impl Lowerer {
             }
         }
 
-        let inferred_return_type =
-            infer_function_return_type(function, &parameter_type_hints, captures);
-        let declared_return_type = if inferred_return_type == ValueType::Dynamic {
-            self.expected_type_hint.unwrap_or(ValueType::Dynamic)
-        } else {
-            inferred_return_type
-        };
+        // The key and ABI use the same canonical seed. Concrete body
+        // inference prevents duplicate specializations across caller contexts;
+        // Dynamic inference still receives the contextual recursion seed.
+        let declared_return_type = return_seed;
 
         let specialization_count = self
             .specialization_counts
@@ -3372,7 +3392,7 @@ impl Lowerer {
             active_specializations: self.active_specializations.clone(),
             specialization_counts: self.specialization_counts.clone(),
             function_return_hint: Some(declared_return_type),
-            function_arity: Some(parameters.len()),
+
             ..Default::default()
         };
         let mut ir_captures = Vec::with_capacity(specialization_captures.len());

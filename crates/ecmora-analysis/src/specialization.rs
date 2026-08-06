@@ -38,6 +38,20 @@ impl SpecializationKey {
     }
 }
 
+/// Pick the return seed used by both specialization identity and its ABI.
+///
+/// A concrete body-inferred return type must win over an unrelated caller
+/// context, otherwise identical callees are compiled repeatedly. A genuinely
+/// Dynamic return still needs its contextual seed for callback-only recursive
+/// functions such as `return thunk()` / `return self(...)`.
+pub(super) fn canonical_return_seed(inferred: ValueType, expected: Option<ValueType>) -> ValueType {
+    if inferred == ValueType::Dynamic {
+        expected.unwrap_or(ValueType::Dynamic)
+    } else {
+        inferred
+    }
+}
+
 pub(super) fn callback_specialization_fingerprint(callback: &ClosureBinding) -> u64 {
     let mut hasher = DefaultHasher::new();
     format!("{:?}", callback.function).hash(&mut hasher);
@@ -69,5 +83,21 @@ mod tests {
             ValueType::Dynamic,
         );
         assert_ne!(number, dynamic);
+    }
+
+    #[test]
+    fn concrete_inference_ignores_caller_context() {
+        assert_eq!(
+            canonical_return_seed(ValueType::Number, Some(ValueType::String)),
+            ValueType::Number,
+        );
+    }
+
+    #[test]
+    fn dynamic_inference_uses_contextual_seed() {
+        assert_eq!(
+            canonical_return_seed(ValueType::Dynamic, Some(ValueType::Number)),
+            ValueType::Number,
+        );
     }
 }

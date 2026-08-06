@@ -543,14 +543,8 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                         ..
                     } => {
                         verify_call_arguments(&types, arguments, argument_types)?;
-                        let target = program
-                            .functions
-                            .iter()
-                            .find(|candidate| candidate.name == *callee)
-                            .ok_or_else(|| anyhow::anyhow!("unknown direct callee `{callee}`"))?;
-                        if target.parameters.len() != arguments.len() {
-                            bail!("direct call `{callee}` sai arity")
-                        }
+                        let target =
+                            verify_direct_target(program, callee, argument_types, "direct call")?;
                         if target.return_type != Some(*return_type) {
                             bail!("direct call `{callee}` sai return type")
                         }
@@ -612,17 +606,18 @@ pub fn value_types(program: &Program) -> Result<HashMap<ValueId, ValueType>> {
                     argument_types,
                 } => {
                     verify_call_arguments(&types, arguments, argument_types)?;
-                    let target = program
-                        .functions
-                        .iter()
-                        .find(|candidate| candidate.name == *callee)
-                        .ok_or_else(|| anyhow::anyhow!("unknown direct tail callee `{callee}`"))?;
-                    if target.parameters.len() != arguments.len() {
-                        bail!("direct tail call `{callee}` sai target arity")
+                    let target =
+                        verify_direct_target(program, callee, argument_types, "direct tail call")?;
+                    if function.return_type.is_none() {
+                        bail!(
+                            "process entry `{}` không được tail-call JavaScript function",
+                            function.name
+                        )
                     }
-                    if function.parameters.len() != arguments.len() {
-                        bail!("direct tail call `{callee}` không thể tái sử dụng argv")
-                    }
+                    // TailCallDirect owns a fresh logical call frame. LLVM
+                    // codegen may implement that frame with TLS storage, but
+                    // IR validity must not depend on reusing caller argv or on
+                    // caller/callee arity equality.
                     if function.return_type != Some(ValueType::Dynamic)
                         && function.return_type != target.return_type
                     {
@@ -709,6 +704,46 @@ fn verify_call_arguments(
         require_type(types, *argument, *value_type)?;
     }
     Ok(())
+}
+
+fn verify_direct_target<'a>(
+    program: &'a Program,
+    callee: &str,
+    argument_types: &[ValueType],
+    operation: &str,
+) -> Result<&'a Function> {
+    let target = program
+        .functions
+        .iter()
+        .find(|candidate| candidate.name == callee)
+        .ok_or_else(|| anyhow::anyhow!("unknown {operation} callee `{callee}`"))?;
+
+    if target.return_type.is_none() {
+        bail!("{operation} `{callee}` không được gọi process entry")
+    }
+    if !target.captures.is_empty() {
+        bail!(
+            "{operation} `{callee}` thiếu closure environment cho {} capture",
+            target.captures.len()
+        )
+    }
+    if target.parameters.len() != argument_types.len() {
+        bail!(
+            "{operation} `{callee}` sai arity: cần {}, nhận {}",
+            target.parameters.len(),
+            argument_types.len()
+        )
+    }
+    for (index, (parameter, actual)) in target.parameters.iter().zip(argument_types).enumerate() {
+        if parameter.value_type != *actual {
+            bail!(
+                "{operation} `{callee}` argument {index} có kiểu {:?}, target cần {:?}",
+                actual,
+                parameter.value_type
+            )
+        }
+    }
+    Ok(target)
 }
 
 fn require_type(
