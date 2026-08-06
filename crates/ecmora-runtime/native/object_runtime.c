@@ -816,3 +816,38 @@ void ecmora_recursion_leave(void) {
         ecmora_recursion_depth -= 1;
     }
 }
+
+/* callable ABI primitive object hooks */
+void *ecmora_object_new(void) {
+    EcmoraObject *object = (EcmoraObject *)calloc(1, sizeof(EcmoraObject));
+    if (object == NULL) abort();
+    return object;
+}
+
+void ecmora_object_set_index(void *pointer, uint32_t index, const EcmoraValue *value) {
+    char key[32];
+    (void)snprintf(key, sizeof(key), "%u", index);
+    ecmora_object_set(pointer, key, value);
+    EcmoraValue length = { ECMORA_NUMBER, 0 };
+    double numeric_length = (double)(index + 1);
+    memcpy(&length.payload, &numeric_length, sizeof(double));
+    ecmora_object_set(pointer, "length", &length);
+}
+
+uint32_t ecmora_object_length(void *pointer) {
+    EcmoraValue value = { ECMORA_UNDEFINED, 0 };
+    ecmora_object_get(pointer, "length", &value);
+    if (value.tag != ECMORA_NUMBER) return 0;
+    double length = 0.0;
+    memcpy(&length, &value.payload, sizeof(double));
+    if (length <= 0.0) return 0;
+    if (length >= (double)UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)length;
+}
+
+bool ecmora_object_get_index(void *pointer, uint32_t index, EcmoraValue *out) {
+    char key[32];
+    (void)snprintf(key, sizeof(key), "%u", index);
+    ecmora_object_get(pointer, key, out);
+    return out != NULL && out->tag != ECMORA_UNDEFINED;
+}

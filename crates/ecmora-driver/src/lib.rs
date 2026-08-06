@@ -120,6 +120,13 @@ fn build_ssa_file(path: &Path, ssa: &ecmora_ir::Program) -> Result<PathBuf> {
                 .join("native")
                 .join("object_runtime.c"),
         )
+        .arg(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("ecmora-runtime")
+                .join("native")
+                .join("callable_abi.c"),
+        )
         .arg("-o")
         .arg(&executable_path)
         .output()
