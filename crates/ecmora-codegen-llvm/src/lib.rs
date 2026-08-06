@@ -1771,60 +1771,92 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         right,
                         right_type,
                     } => {
-                        let left_ptr = box_value_pointer(
-                            &builder,
-                            values.get(left).copied().context("thiếu dynamic left")?,
-                            *left_type,
-                            i8_type,
-                            i64_type,
-                            dynamic_type,
-                            "dynamic.binary.left",
-                        )?;
-                        let right_ptr = box_value_pointer(
-                            &builder,
-                            values.get(right).copied().context("thiếu dynamic right")?,
-                            *right_type,
-                            i8_type,
-                            i64_type,
-                            dynamic_type,
-                            "dynamic.binary.right",
-                        )?;
-                        let result_ptr =
-                            builder.build_alloca(dynamic_type, "dynamic.binary.result")?;
-                        builder.build_store(result_ptr, dynamic_type.const_zero())?;
-                        let call = builder.build_call(
-                            dynamic_binary,
-                            &[
-                                i8_type.const_int(*operator as u64, false).into(),
-                                left_ptr.into(),
-                                right_ptr.into(),
-                                result_ptr.into(),
-                            ],
-                            "dynamic.binary",
-                        )?;
-                        let status = call
-                            .try_as_basic_value()
-                            .basic()
-                            .context("dynamic_binary không trả status")?
-                            .into_int_value();
-                        let dynamic = builder
-                            .build_load(dynamic_type, result_ptr, "dynamic.binary.load")?
-                            .into_struct_value();
-                        let continuation = propagate_call_completion(
-                            context,
-                            &builder,
-                            main,
-                            is_process_entry,
-                            status,
-                            dynamic,
-                            dynamic_type,
-                            i8_type,
-                            throw_uncaught,
-                            recursion_leave,
-                            &format!("dynamic.binary.{index}.{}", result.0),
-                        )?;
-                        llvm_block_exits[index] = continuation;
-                        values.insert(*result, dynamic.into());
+                        let left_value = values.get(left).copied().context("thiếu dynamic left")?;
+                        let right_value =
+                            values.get(right).copied().context("thiếu dynamic right")?;
+
+                        let guarded_add = *operator == DynamicBinaryOperator::Add
+                            && matches!(*left_type, ValueType::Number | ValueType::Dynamic)
+                            && matches!(*right_type, ValueType::Number | ValueType::Dynamic);
+
+                        if guarded_add {
+                            let suffix = format!("{index}.{}", result.0);
+                            let (dynamic, continuation) = build_guarded_dynamic_add(
+                                context,
+                                &builder,
+                                main,
+                                is_process_entry,
+                                left_value,
+                                *left_type,
+                                right_value,
+                                *right_type,
+                                dynamic_type,
+                                i8_type,
+                                i64_type,
+                                f64_type,
+                                dynamic_binary,
+                                throw_uncaught,
+                                recursion_leave,
+                                &suffix,
+                            )?;
+                            llvm_block_exits[index] = continuation;
+                            values.insert(*result, dynamic.into());
+                        } else {
+                            let left_ptr = box_value_pointer(
+                                &builder,
+                                left_value,
+                                *left_type,
+                                i8_type,
+                                i64_type,
+                                dynamic_type,
+                                "dynamic.binary.left",
+                            )?;
+                            let right_ptr = box_value_pointer(
+                                &builder,
+                                right_value,
+                                *right_type,
+                                i8_type,
+                                i64_type,
+                                dynamic_type,
+                                "dynamic.binary.right",
+                            )?;
+                            let result_ptr =
+                                builder.build_alloca(dynamic_type, "dynamic.binary.result")?;
+                            builder.build_store(result_ptr, dynamic_type.const_zero())?;
+                            let call = builder.build_call(
+                                dynamic_binary,
+                                &[
+                                    i8_type.const_int(*operator as u64, false).into(),
+                                    left_ptr.into(),
+                                    right_ptr.into(),
+                                    result_ptr.into(),
+                                ],
+                                "dynamic.binary",
+                            )?;
+                            let status = call
+                                .try_as_basic_value()
+                                .basic()
+                                .context("dynamic_binary không trả status")?
+                                .into_int_value();
+                            let dynamic = builder
+                                .build_load(dynamic_type, result_ptr, "dynamic.binary.load")?
+                                .into_struct_value();
+                            let continuation = propagate_call_completion(
+                                context,
+                                &builder,
+                                main,
+                                is_process_entry,
+                                status,
+                                dynamic,
+                                dynamic_type,
+                                i8_type,
+                                throw_uncaught,
+                                recursion_leave,
+                                &format!("dynamic.binary.{index}.{}", result.0),
+                            )?;
+                            llvm_block_exits[index] = continuation;
+                            values.insert(*result, dynamic.into());
+                        }
                     }
                     Instruction::DynamicGet {
                         result,
@@ -2848,6 +2880,181 @@ fn build_generic_arguments<'ctx>(
         builder: Some(handle),
     })
 }
+#[allow(clippy::too_many_arguments)]
+fn build_guarded_dynamic_add<'ctx>(
+    context: &'ctx LlvmContext,
+    builder: &inkwell::builder::Builder<'ctx>,
+    function: inkwell::values::FunctionValue<'ctx>,
+    function_is_entry: bool,
+    left_value: BasicValueEnum<'ctx>,
+    left_type: ValueType,
+    right_value: BasicValueEnum<'ctx>,
+    right_type: ValueType,
+    dynamic_type: inkwell::types::StructType<'ctx>,
+    i8_type: inkwell::types::IntType<'ctx>,
+    i64_type: inkwell::types::IntType<'ctx>,
+    f64_type: inkwell::types::FloatType<'ctx>,
+    dynamic_binary: inkwell::values::FunctionValue<'ctx>,
+    throw_uncaught: inkwell::values::FunctionValue<'ctx>,
+    recursion_leave: inkwell::values::FunctionValue<'ctx>,
+    suffix: &str,
+) -> Result<(StructValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> {
+    let left_dynamic = to_dynamic(
+        builder,
+        left_value,
+        left_type,
+        i8_type,
+        i64_type,
+        dynamic_type,
+    )?;
+    let right_dynamic = to_dynamic(
+        builder,
+        right_value,
+        right_type,
+        i8_type,
+        i64_type,
+        dynamic_type,
+    )?;
+
+    let left_tag = builder
+        .build_extract_value(left_dynamic, 0, &format!("dynamic.add.left.tag.{suffix}"))?
+        .into_int_value();
+    let right_tag = builder
+        .build_extract_value(right_dynamic, 0, &format!("dynamic.add.right.tag.{suffix}"))?
+        .into_int_value();
+    let number_tag = i8_type.const_int(2, false);
+    let left_is_number = builder.build_int_compare(
+        IntPredicate::EQ,
+        left_tag,
+        number_tag,
+        &format!("dynamic.add.left.is.number.{suffix}"),
+    )?;
+    let right_is_number = builder.build_int_compare(
+        IntPredicate::EQ,
+        right_tag,
+        number_tag,
+        &format!("dynamic.add.right.is.number.{suffix}"),
+    )?;
+    let both_numbers = builder.build_and(
+        left_is_number,
+        right_is_number,
+        &format!("dynamic.add.both.number.{suffix}"),
+    )?;
+
+    let fast_block = context.append_basic_block(function, &format!("dynamic.add.fast.{suffix}"));
+    let slow_block = context.append_basic_block(function, &format!("dynamic.add.slow.{suffix}"));
+    let merge_block = context.append_basic_block(function, &format!("dynamic.add.merge.{suffix}"));
+    builder.build_conditional_branch(both_numbers, fast_block, slow_block)?;
+
+    builder.position_at_end(fast_block);
+    let left_payload = builder
+        .build_extract_value(
+            left_dynamic,
+            1,
+            &format!("dynamic.add.left.payload.{suffix}"),
+        )?
+        .into_int_value();
+    let right_payload = builder
+        .build_extract_value(
+            right_dynamic,
+            1,
+            &format!("dynamic.add.right.payload.{suffix}"),
+        )?
+        .into_int_value();
+    let left_number = builder
+        .build_bit_cast(
+            left_payload,
+            f64_type,
+            &format!("dynamic.add.left.number.{suffix}"),
+        )?
+        .into_float_value();
+    let right_number = builder
+        .build_bit_cast(
+            right_payload,
+            f64_type,
+            &format!("dynamic.add.right.number.{suffix}"),
+        )?
+        .into_float_value();
+    let sum = builder.build_float_add(
+        left_number,
+        right_number,
+        &format!("dynamic.add.number.{suffix}"),
+    )?;
+    let fast_dynamic = to_dynamic(
+        builder,
+        sum.into(),
+        ValueType::Number,
+        i8_type,
+        i64_type,
+        dynamic_type,
+    )?;
+    builder.build_unconditional_branch(merge_block)?;
+
+    builder.position_at_end(slow_block);
+    let left_ptr =
+        builder.build_alloca(dynamic_type, &format!("dynamic.add.left.slot.{suffix}"))?;
+    builder.build_store(left_ptr, left_dynamic)?;
+    let right_ptr =
+        builder.build_alloca(dynamic_type, &format!("dynamic.add.right.slot.{suffix}"))?;
+    builder.build_store(right_ptr, right_dynamic)?;
+    let result_ptr =
+        builder.build_alloca(dynamic_type, &format!("dynamic.add.slow.result.{suffix}"))?;
+    builder.build_store(result_ptr, dynamic_type.const_zero())?;
+
+    let call = builder.build_call(
+        dynamic_binary,
+        &[
+            i8_type
+                .const_int(DynamicBinaryOperator::Add as u64, false)
+                .into(),
+            left_ptr.into(),
+            right_ptr.into(),
+            result_ptr.into(),
+        ],
+        &format!("dynamic.add.fallback.{suffix}"),
+    )?;
+    let status = call
+        .try_as_basic_value()
+        .basic()
+        .context("dynamic add fallback không trả status")?
+        .into_int_value();
+    let slow_dynamic = builder
+        .build_load(
+            dynamic_type,
+            result_ptr,
+            &format!("dynamic.add.slow.load.{suffix}"),
+        )?
+        .into_struct_value();
+    let slow_continue = propagate_call_completion(
+        context,
+        builder,
+        function,
+        function_is_entry,
+        status,
+        slow_dynamic,
+        dynamic_type,
+        i8_type,
+        throw_uncaught,
+        recursion_leave,
+        &format!("dynamic.add.fallback.{suffix}"),
+    )?;
+    builder.build_unconditional_branch(merge_block)?;
+
+    builder.position_at_end(merge_block);
+    let phi = builder.build_phi(dynamic_type, &format!("dynamic.add.result.{suffix}"))?;
+    let incoming_values: [(BasicValueEnum<'ctx>, inkwell::basic_block::BasicBlock<'ctx>); 2] = [
+        (fast_dynamic.into(), fast_block),
+        (slow_dynamic.into(), slow_continue),
+    ];
+    let incoming_refs = incoming_values
+        .iter()
+        .map(|(value, block)| (value as &dyn BasicValue<'ctx>, *block))
+        .collect::<Vec<_>>();
+    phi.add_incoming(&incoming_refs);
+
+    Ok((phi.as_basic_value().into_struct_value(), merge_block))
+}
+
 fn propagate_call_completion<'ctx>(
     context: &'ctx LlvmContext,
     builder: &inkwell::builder::Builder<'ctx>,

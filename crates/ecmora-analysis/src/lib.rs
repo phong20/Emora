@@ -13,6 +13,7 @@ use ecmora_value::{BinaryOperator as SemBinary, UnaryOperator as SemUnary, Value
 use std::collections::{HashMap, HashSet};
 
 mod abstract_value;
+mod aggregate_scalar;
 mod async_normalize;
 mod callable_native;
 pub mod effects;
@@ -27,6 +28,8 @@ use specialization::*;
 use support::*;
 
 pub fn analyze(hir: &HirProgram) -> Result<Program> {
+    let scalarized_hir = aggregate_scalar::scalarize(hir)?;
+    let hir = &scalarized_hir;
     if callable_native::requires_generic_callable_lowering(hir) {
         return callable_native::analyze(hir);
     }
