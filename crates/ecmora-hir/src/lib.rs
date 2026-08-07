@@ -20,6 +20,41 @@ pub struct Program {
     /// Promise-focused class metadata retained without forcing the general
     /// JavaScript class object model into every native compilation.
     pub promise_subclasses: Vec<PromiseSubclass>,
+    /// General class declarations retained as source-ordered metadata. The
+    /// frontend leaves a matching @class_declare_* marker in statements; the
+    /// class_native pass replaces that marker before object/SSA lowering.
+    pub classes: Vec<ClassDeclaration>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassDeclaration {
+    pub name: String,
+    pub parent: Option<String>,
+    pub constructor: Option<Function>,
+    pub elements: Vec<ClassElement>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum ClassElement {
+    Method {
+        key: ClassKey,
+        function: Function,
+        kind: ClassMethodKind,
+        r#static: bool,
+    },
+    Field {
+        key: ClassKey,
+        value: Option<Expression>,
+        r#static: bool,
+    },
+    StaticBlock(Vec<Statement>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ClassKey {
+    Public(String),
+    Private(String),
 }
 
 #[derive(Debug, Clone)]

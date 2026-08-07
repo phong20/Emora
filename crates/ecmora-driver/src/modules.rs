@@ -6,9 +6,9 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use ecmora_hir::{
-    ArrayElement, AssignmentTarget, ExportBinding, Expression, ExpressionKind, ForInit,
-    ImportSpecifier, MemberProperty, ObjectEntry, ObjectProperty, Program, PromiseSubclass,
-    Statement, StatementKind,
+    ArrayElement, AssignmentTarget, ClassDeclaration, ClassElement, ExportBinding, Expression,
+    ExpressionKind, ForInit, ImportSpecifier, MemberProperty, ObjectEntry, ObjectProperty, Program,
+    PromiseSubclass, Statement, StatementKind,
 };
 
 pub(super) fn load_program(entry: &Path) -> Result<Program> {
@@ -26,6 +26,7 @@ pub(super) fn load_program(entry: &Path) -> Result<Program> {
         exports: Vec::new(),
         export_all: Vec::new(),
         promise_subclasses: loader.promise_subclasses,
+        classes: loader.classes,
     })
 }
 
@@ -37,6 +38,7 @@ struct ModuleLoader {
     pending: HashMap<PathBuf, PendingModule>,
     statements: Vec<Statement>,
     promise_subclasses: Vec<PromiseSubclass>,
+    classes: Vec<ClassDeclaration>,
 }
 
 struct PendingModule {
@@ -72,11 +74,15 @@ impl ModuleLoader {
         let id = self.next_id;
         self.next_id += 1;
         let mut rename = HashMap::new();
-        for name in top_level_names(&hir.statements).into_iter().chain(
-            hir.promise_subclasses
-                .iter()
-                .map(|class| class.name.clone()),
-        ) {
+        for name in top_level_names(&hir.statements)
+            .into_iter()
+            .chain(
+                hir.promise_subclasses
+                    .iter()
+                    .map(|class| class.name.clone()),
+            )
+            .chain(hir.classes.iter().map(|class| class.name.clone()))
+        {
             rename.insert(name.clone(), format!("__m{id}_{}", sanitize(&name)));
         }
         let mut provisional_exports = HashMap::new();
@@ -142,8 +148,12 @@ impl ModuleLoader {
         for class in &mut hir.promise_subclasses {
             rename_promise_subclass(class, &rename, &namespaces);
         }
+        for class in &mut hir.classes {
+            rename_general_class(class, &rename, &namespaces);
+        }
         self.statements.extend(hir.statements);
         self.promise_subclasses.extend(hir.promise_subclasses);
+        self.classes.extend(hir.classes);
 
         let mut exports = HashMap::new();
         for ExportBinding {
@@ -181,6 +191,40 @@ impl ModuleLoader {
         self.loaded.insert(path.to_owned(), exports.clone());
         self.predeclared.insert(path.to_owned(), exports.clone());
         Ok(exports)
+    }
+}
+
+fn rename_general_class(
+    class: &mut ClassDeclaration,
+    rename: &HashMap<String, String>,
+    namespaces: &HashMap<String, HashMap<String, String>>,
+) {
+    if let Some(name) = rename.get(&class.name) {
+        class.name = name.clone();
+    }
+    if let Some(parent) = &mut class.parent {
+        if let Some(name) = rename.get(parent) {
+            *parent = name.clone();
+        }
+    }
+    if let Some(constructor) = &mut class.constructor {
+        rename_class_function(constructor, rename, namespaces);
+    }
+
+    for element in &mut class.elements {
+        match element {
+            ClassElement::Method { function, .. } => {
+                rename_class_function(function, rename, namespaces);
+            }
+            ClassElement::Field { value, .. } => {
+                if let Some(value) = value {
+                    rename_expression(value, rename, namespaces, &HashSet::new());
+                }
+            }
+            ClassElement::StaticBlock(body) => {
+                rename_scope(body, rename, namespaces, false, &HashSet::new());
+            }
+        }
     }
 }
 
@@ -477,6 +521,12 @@ fn rename_expression(
 ) {
     match &mut expression.kind {
         ExpressionKind::Global(name) => {
+            if let Some(class_name) = name.strip_prefix("@class_declare_") {
+                if let Some(new_name) = rename.get(class_name) {
+                    *name = format!("@class_declare_{new_name}");
+                }
+                return;
+            }
             if let Some(exports) = namespaces.get(name) {
                 expression.kind = ExpressionKind::Object(
                     exports

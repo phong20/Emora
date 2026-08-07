@@ -16,7 +16,10 @@ mod abstract_value;
 mod aggregate_scalar;
 mod async_normalize;
 mod callable_native;
+mod class_native;
+mod completion_native;
 pub mod effects;
+mod generator_native;
 mod numeric;
 mod specialization;
 mod static_graph;
@@ -29,8 +32,11 @@ use specialization::*;
 use support::*;
 
 pub fn analyze(hir: &HirProgram) -> Result<Program> {
-    let graph_hir = static_graph::lower(hir)?;
-    let scalarized_hir = aggregate_scalar::scalarize(&graph_hir)?;
+    let class_hir = class_native::lower(hir)?;
+    let generator_hir = generator_native::lower(&class_hir)?;
+    let graph_hir = static_graph::lower(&generator_hir)?;
+    let completion_hir = completion_native::lower(&graph_hir)?;
+    let scalarized_hir = aggregate_scalar::scalarize(&completion_hir)?;
     let hir = &scalarized_hir;
     if callable_native::requires_generic_callable_lowering(hir) {
         return callable_native::analyze(hir);
@@ -4209,6 +4215,7 @@ mod throw_lowering_tests {
             exports: Vec::new(),
             export_all: Vec::new(),
             promise_subclasses: Vec::new(),
+            classes: Vec::new(),
         }
     }
 

@@ -85,6 +85,7 @@ pub(super) fn lower(program: &Program) -> Result<Program> {
         .map(|binding| binding.local.clone())
         .collect::<HashSet<_>>();
     let graph_object_names = collect_prototype_object_names(&program.statements);
+    let forced_functions = collect_exception_inline_functions(&program.statements);
     let mut lowerer = GraphLowerer {
         exported,
         graph_object_names,
@@ -95,6 +96,7 @@ pub(super) fn lower(program: &Program) -> Result<Program> {
         next_synthetic: 0,
         this_stack: Vec::new(),
         active_closures: HashSet::new(),
+        forced_functions,
         control_depth: 0,
         function_depth: 0,
     };
@@ -116,6 +118,7 @@ struct GraphLowerer {
     next_synthetic: u32,
     this_stack: Vec<Option<ObjectId>>,
     active_closures: HashSet<ClosureId>,
+    forced_functions: HashSet<String>,
     control_depth: usize,
     function_depth: usize,
 }
@@ -220,7 +223,10 @@ impl GraphLowerer {
             let Some(name) = &function.name else {
                 continue;
             };
-            if self.function_depth > 0 || function_needs_static_inline(function) {
+            if self.function_depth > 0
+                || self.forced_functions.contains(name)
+                || function_needs_static_inline(function)
+            {
                 let closure = self.new_closure(function.clone(), None);
                 self.bind_static(name.clone(), StaticBinding::Closure(closure))?;
             }
@@ -1923,8 +1929,7 @@ impl GraphLowerer {
             for argument in arguments {
                 let mut lowered = self.lower_expression(argument)?;
                 prefix.append(&mut lowered.prefix);
-                evaluated_arguments
-                    .push(require_runtime(lowered.value, "static closure argument")?);
+                evaluated_arguments.push(lowered.value);
             }
 
             let renamed = self.rename_function_for_inline(&closure.function)?;
@@ -1941,21 +1946,33 @@ impl GraphLowerer {
                 let value = evaluated_arguments
                     .get(index)
                     .cloned()
-                    .unwrap_or_else(|| undefined_expression(span));
-                prefix.push(variable_statement(
-                    VariableKind::Let,
-                    name.clone(),
-                    Some(value),
-                    span,
-                ));
-                self.shadow_runtime(name.clone());
+                    .unwrap_or_else(|| StaticValue::Runtime(undefined_expression(span)));
+                match value {
+                    StaticValue::Runtime(value) => {
+                        prefix.push(variable_statement(
+                            VariableKind::Let,
+                            name.clone(),
+                            Some(value),
+                            span,
+                        ));
+                        self.shadow_runtime(name.clone());
+                    }
+                    StaticValue::Object(id) => {
+                        self.bind_static(name.clone(), StaticBinding::Object(id))?;
+                    }
+                    StaticValue::Closure(closure) => {
+                        self.bind_static(name.clone(), StaticBinding::Closure(closure))?;
+                    }
+                }
                 parameter_names.push(name);
             }
             for extra in evaluated_arguments.iter().skip(parameter_names.len()) {
-                prefix.push(Statement {
-                    kind: StatementKind::Expression(extra.clone()),
-                    span: extra.span,
-                });
+                if let StaticValue::Runtime(extra) = extra {
+                    prefix.push(Statement {
+                        kind: StatementKind::Expression(extra.clone()),
+                        span: extra.span,
+                    });
+                }
             }
 
             self.this_stack.push(receiver.or(closure.receiver));
@@ -2009,9 +2026,6 @@ impl GraphLowerer {
         prefix: &mut Vec<Statement>,
         span: Span,
     ) -> Result<Lowered> {
-        if function.body.iter().any(statement_contains_try_or_finally) {
-            bail!("try/finally in static closure needs completion-record SSA")
-        }
         let result_name = self.fresh_name("inline_result");
         let label = self.fresh_name("inline_exit");
         prefix.push(variable_statement(
@@ -2265,37 +2279,215 @@ fn statement_contains_return(statement: &Statement) -> bool {
     }
 }
 
-fn statement_contains_try_or_finally(statement: &Statement) -> bool {
+fn collect_exception_inline_functions(statements: &[Statement]) -> HashSet<String> {
+    let functions = statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            StatementKind::FunctionDeclaration(function) => function
+                .name
+                .as_ref()
+                .map(|name| (name.clone(), function.clone())),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut forced = functions
+        .iter()
+        .filter(|(_, function)| {
+            function
+                .body
+                .iter()
+                .any(statement_contains_direct_exception)
+        })
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    loop {
+        let mut changed = false;
+        for (name, function) in &functions {
+            if forced.contains(name) {
+                continue;
+            }
+            if function
+                .body
+                .iter()
+                .any(|statement| statement_calls_any(statement, &forced))
+            {
+                forced.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    forced
+}
+
+fn statement_contains_direct_exception(statement: &Statement) -> bool {
     match &statement.kind {
-        StatementKind::Try { .. } => true,
-        StatementKind::Block(body) => body.iter().any(statement_contains_try_or_finally),
+        StatementKind::Try { .. } | StatementKind::Throw(_) => true,
+        StatementKind::Block(body) => body.iter().any(statement_contains_direct_exception),
         StatementKind::If {
             consequent,
             alternate,
             ..
         } => {
-            statement_contains_try_or_finally(consequent)
+            statement_contains_direct_exception(consequent)
                 || alternate
                     .as_deref()
-                    .is_some_and(statement_contains_try_or_finally)
+                    .is_some_and(statement_contains_direct_exception)
         }
         StatementKind::While { body, .. }
         | StatementKind::DoWhile { body, .. }
         | StatementKind::For { body, .. }
         | StatementKind::ForIn { body, .. }
         | StatementKind::ForOf { body, .. }
-        | StatementKind::Labeled { body, .. } => statement_contains_try_or_finally(body),
+        | StatementKind::Labeled { body, .. } => statement_contains_direct_exception(body),
         StatementKind::Switch { cases, .. } => cases
             .iter()
             .flat_map(|case| &case.consequent)
-            .any(statement_contains_try_or_finally),
+            .any(statement_contains_direct_exception),
         StatementKind::FunctionDeclaration(_)
         | StatementKind::Empty
         | StatementKind::Debugger
         | StatementKind::Expression(_)
         | StatementKind::VariableDeclaration { .. }
         | StatementKind::Return(_)
-        | StatementKind::Throw(_)
+        | StatementKind::Break(_)
+        | StatementKind::Continue(_) => false,
+    }
+}
+
+fn statement_calls_any(statement: &Statement, names: &HashSet<String>) -> bool {
+    fn expression(value: &Expression, names: &HashSet<String>) -> bool {
+        match &value.kind {
+            ExpressionKind::Call { callee, arguments } => {
+                matches!(&callee.kind, ExpressionKind::Global(name) if names.contains(name))
+                    || expression(callee, names)
+                    || arguments.iter().any(|value| expression(value, names))
+            }
+            ExpressionKind::Member { object, property } => {
+                expression(object, names)
+                    || matches!(property, MemberProperty::Computed(value) if expression(value, names))
+            }
+            ExpressionKind::Object(entries) => entries.iter().any(|entry| match entry {
+                ObjectEntry::Property(property) => expression(&property.value, names),
+                ObjectEntry::Spread(value) => expression(value, names),
+                ObjectEntry::Accessor { .. } => false,
+            }),
+            ExpressionKind::Array(elements) => elements.iter().any(|element| match element {
+                ArrayElement::Expression(value) | ArrayElement::Spread(value) => {
+                    expression(value, names)
+                }
+                ArrayElement::Hole => false,
+            }),
+            ExpressionKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                expression(test, names)
+                    || expression(consequent, names)
+                    || expression(alternate, names)
+            }
+            ExpressionKind::Unary { argument, .. } | ExpressionKind::Await(argument) => {
+                expression(argument, names)
+            }
+            ExpressionKind::Binary { left, right, .. }
+            | ExpressionKind::Logical { left, right, .. } => {
+                expression(left, names) || expression(right, names)
+            }
+            ExpressionKind::Assignment { value, .. } => expression(value, names),
+            ExpressionKind::New { callee, arguments } => {
+                expression(callee, names) || arguments.iter().any(|value| expression(value, names))
+            }
+            ExpressionKind::Function(_)
+            | ExpressionKind::Update { .. }
+            | ExpressionKind::String(_)
+            | ExpressionKind::Number(_)
+            | ExpressionKind::BigInt(_)
+            | ExpressionKind::Bool(_)
+            | ExpressionKind::Null
+            | ExpressionKind::This
+            | ExpressionKind::Global(_) => false,
+        }
+    }
+    match &statement.kind {
+        StatementKind::Expression(value) | StatementKind::Throw(value) => expression(value, names),
+        StatementKind::VariableDeclaration { declarations, .. } => declarations
+            .iter()
+            .filter_map(|value| value.init.as_ref())
+            .any(|value| expression(value, names)),
+        StatementKind::Block(body) => body.iter().any(|value| statement_calls_any(value, names)),
+        StatementKind::If {
+            test,
+            consequent,
+            alternate,
+        } => {
+            expression(test, names)
+                || statement_calls_any(consequent, names)
+                || alternate
+                    .as_deref()
+                    .is_some_and(|value| statement_calls_any(value, names))
+        }
+        StatementKind::While { test, body } | StatementKind::DoWhile { body, test } => {
+            expression(test, names) || statement_calls_any(body, names)
+        }
+        StatementKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            init.as_ref().is_some_and(|init| match init {
+                ForInit::Expression(value) => expression(value, names),
+                ForInit::VariableDeclaration { declarations, .. } => declarations
+                    .iter()
+                    .filter_map(|value| value.init.as_ref())
+                    .any(|value| expression(value, names)),
+            }) || test.as_ref().is_some_and(|value| expression(value, names))
+                || update
+                    .as_ref()
+                    .is_some_and(|value| expression(value, names))
+                || statement_calls_any(body, names)
+        }
+        StatementKind::ForIn { right, body, .. } | StatementKind::ForOf { right, body, .. } => {
+            expression(right, names) || statement_calls_any(body, names)
+        }
+        StatementKind::Switch {
+            discriminant,
+            cases,
+        } => {
+            expression(discriminant, names)
+                || cases.iter().any(|case| {
+                    case.test
+                        .as_ref()
+                        .is_some_and(|value| expression(value, names))
+                        || case
+                            .consequent
+                            .iter()
+                            .any(|value| statement_calls_any(value, names))
+                })
+        }
+        StatementKind::Labeled { body, .. } => statement_calls_any(body, names),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            statement_calls_any(block, names)
+                || handler
+                    .as_ref()
+                    .is_some_and(|handler| statement_calls_any(&handler.body, names))
+                || finalizer
+                    .as_deref()
+                    .is_some_and(|value| statement_calls_any(value, names))
+        }
+        StatementKind::Return(value) => {
+            value.as_ref().is_some_and(|value| expression(value, names))
+        }
+        StatementKind::FunctionDeclaration(_)
+        | StatementKind::Empty
+        | StatementKind::Debugger
         | StatementKind::Break(_)
         | StatementKind::Continue(_) => false,
     }
@@ -3081,7 +3273,21 @@ fn rewrite_returns(statement: &Statement, label: &str, result: &str) -> Statemen
             label: nested.clone(),
             body: Box::new(rewrite_returns(body, label, result)),
         },
-        StatementKind::Try { .. } => statement.kind.clone(),
+        StatementKind::Try {
+            block,
+            handler,
+            finalizer,
+        } => StatementKind::Try {
+            block: Box::new(rewrite_returns(block, label, result)),
+            handler: handler.as_ref().map(|handler| CatchClause {
+                parameter: handler.parameter.clone(),
+                body: Box::new(rewrite_returns(&handler.body, label, result)),
+                span: handler.span,
+            }),
+            finalizer: finalizer
+                .as_deref()
+                .map(|finalizer| Box::new(rewrite_returns(finalizer, label, result))),
+        },
         StatementKind::FunctionDeclaration(_) => statement.kind.clone(),
         StatementKind::Empty
         | StatementKind::Debugger

@@ -16,6 +16,7 @@ use oxc_ast::ast::{
     UpdateOperator as OxcUpdateOperator, VariableDeclaration, VariableDeclarationKind,
 };
 use oxc_span::Span as OxcSpan;
+use std::collections::HashSet;
 
 pub fn lower_program(program: &Program<'_>) -> Result<HirProgram> {
     let mut statements = Vec::new();
@@ -23,10 +24,32 @@ pub fn lower_program(program: &Program<'_>) -> Result<HirProgram> {
     let mut exports = Vec::new();
     let mut export_all = Vec::new();
     let mut promise_subclasses = Vec::new();
+    let mut classes = Vec::new();
+    let mut promise_class_names = HashSet::from(["Promise".to_owned()]);
     for statement in &program.body {
         match statement {
             Statement::ClassDeclaration(class) => {
-                promise_subclasses.push(lower_promise_subclass(class)?);
+                let name = class
+                    .id
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("class declaration phải có tên"))?
+                    .name
+                    .to_string();
+                let parent = match class.super_class.as_ref() {
+                    Some(Expression::Identifier(identifier)) => Some(identifier.name.to_string()),
+                    Some(_) => None,
+                    None => None,
+                };
+                if parent
+                    .as_ref()
+                    .is_some_and(|parent| promise_class_names.contains(parent))
+                {
+                    promise_subclasses.push(lower_promise_subclass(class)?);
+                    promise_class_names.insert(name);
+                } else {
+                    classes.push(lower_general_class(class)?);
+                    statements.push(class_marker(&name, class.span));
+                }
             }
             Statement::ImportDeclaration(declaration) => {
                 let specifiers = declaration
@@ -152,6 +175,7 @@ pub fn lower_program(program: &Program<'_>) -> Result<HirProgram> {
         exports,
         export_all,
         promise_subclasses,
+        classes,
     })
 }
 
@@ -514,6 +538,134 @@ fn sanitize_binding_name(name: &str) -> String {
             }
         })
         .collect()
+}
+
+fn class_marker(name: &str, span: OxcSpan) -> HirStatement {
+    HirStatement {
+        kind: StatementKind::Expression(HirExpression {
+            kind: ExpressionKind::Global(format!("@class_declare_{name}")),
+            span: convert_span(span),
+        }),
+        span: convert_span(span),
+    }
+}
+
+fn lower_general_class(class: &oxc_ast::ast::Class<'_>) -> Result<ecmora_hir::ClassDeclaration> {
+    use oxc_ast::ast::{ClassElement as OxcClassElement, MethodDefinitionKind};
+
+    let name = class
+        .id
+        .as_ref()
+        .ok_or_else(|| anyhow!("native class declaration phải có tên"))?
+        .name
+        .to_string();
+    let parent = match class.super_class.as_ref() {
+        Some(Expression::Identifier(identifier)) => Some(identifier.name.to_string()),
+        Some(_) => bail!("class `{name}` extends expression phải là identifier tĩnh"),
+        None => None,
+    };
+
+    if !class.decorators.is_empty() {
+        bail!("decorated class `{name}` needs decorator evaluation lowering")
+    }
+
+    let mut constructor = None;
+    let mut elements = Vec::new();
+    for element in &class.body.body {
+        match element {
+            OxcClassElement::MethodDefinition(method) => {
+                if !method.decorators.is_empty() {
+                    bail!("decorated class method in `{name}` needs decorator lowering")
+                }
+                let mut function = lower_function(&method.value, false)?;
+                if method.kind == MethodDefinitionKind::Constructor {
+                    if method.r#static {
+                        bail!("constructor cannot be static")
+                    }
+                    if constructor.replace(function).is_some() {
+                        bail!("class `{name}` có nhiều constructor")
+                    }
+                    continue;
+                }
+                let key = lower_class_key(&method.key, method.computed)?;
+                function.name = Some(match &key {
+                    ecmora_hir::ClassKey::Public(name) | ecmora_hir::ClassKey::Private(name) => {
+                        name.clone()
+                    }
+                });
+                let kind = match method.kind {
+                    MethodDefinitionKind::Method => ecmora_hir::ClassMethodKind::Method,
+                    MethodDefinitionKind::Get => ecmora_hir::ClassMethodKind::Get,
+                    MethodDefinitionKind::Set => ecmora_hir::ClassMethodKind::Set,
+                    MethodDefinitionKind::Constructor => unreachable!(),
+                };
+                elements.push(ecmora_hir::ClassElement::Method {
+                    key,
+                    function,
+                    kind,
+                    r#static: method.r#static,
+                });
+            }
+            OxcClassElement::PropertyDefinition(property) => {
+                if property.declare || !property.decorators.is_empty() {
+                    bail!(
+                        "declare/decorated class field in `{name}` is not runtime-native class syntax"
+                    )
+                }
+                elements.push(ecmora_hir::ClassElement::Field {
+                    key: lower_class_key(&property.key, property.computed)?,
+                    value: property.value.as_ref().map(lower_expression).transpose()?,
+                    r#static: property.r#static,
+                });
+            }
+            OxcClassElement::StaticBlock(block) => {
+                elements.push(ecmora_hir::ClassElement::StaticBlock(
+                    block
+                        .body
+                        .iter()
+                        .map(lower_statement)
+                        .collect::<Result<Vec<_>>>()?,
+                ));
+            }
+            OxcClassElement::AccessorProperty(_) => {
+                bail!("auto-accessor class fields need backing-slot descriptor lowering")
+            }
+            OxcClassElement::TSIndexSignature(_) => {
+                bail!("TypeScript class index signature has no JavaScript runtime class semantics")
+            }
+        }
+    }
+
+    Ok(ecmora_hir::ClassDeclaration {
+        name,
+        parent,
+        constructor,
+        elements,
+        span: convert_span(class.span),
+    })
+}
+
+fn lower_class_key(
+    key: &oxc_ast::ast::PropertyKey<'_>,
+    computed: bool,
+) -> Result<ecmora_hir::ClassKey> {
+    if let oxc_ast::ast::PropertyKey::PrivateIdentifier(private) = key {
+        return Ok(ecmora_hir::ClassKey::Private(private.name.to_string()));
+    }
+    let name = key
+        .static_name()
+        .ok_or_else(|| anyhow!("computed class key chưa chứng minh được là static literal"))?
+        .into_owned();
+    if computed && name.is_empty() {
+        bail!("computed class key rỗng không hợp lệ")
+    }
+    Ok(ecmora_hir::ClassKey::Public(name))
+}
+
+const UNRESOLVED_PRIVATE_PREFIX: &str = "@private_unresolved_";
+
+fn unresolved_private_member(name: &str) -> String {
+    format!("{UNRESOLVED_PRIVATE_PREFIX}{name}")
 }
 
 fn lower_promise_subclass(class: &oxc_ast::ast::Class<'_>) -> Result<ecmora_hir::PromiseSubclass> {
@@ -1138,6 +1290,28 @@ fn lower_expression(expression: &Expression<'_>) -> Result<HirExpression> {
             },
             member.span,
         ),
+        Expression::PrivateFieldExpression(member) => (
+            ExpressionKind::Member {
+                object: Box::new(lower_expression(&member.object)?),
+                property: MemberProperty::Static(unresolved_private_member(
+                    &member.field.name.to_string(),
+                )),
+            },
+            member.span,
+        ),
+        Expression::PrivateInExpression(expression) => (
+            ExpressionKind::Binary {
+                left: Box::new(HirExpression {
+                    kind: ExpressionKind::String(unresolved_private_member(
+                        &expression.left.name.to_string(),
+                    )),
+                    span: convert_span(expression.left.span),
+                }),
+                operator: BinaryOperator::In,
+                right: Box::new(lower_expression(&expression.right)?),
+            },
+            expression.span,
+        ),
         Expression::ObjectExpression(object) => {
             let mut properties = Vec::with_capacity(object.properties.len());
             for item in &object.properties {
@@ -1475,6 +1649,12 @@ fn lower_assignment_target(target: &SimpleAssignmentTarget<'_>) -> Result<Assign
         SimpleAssignmentTarget::StaticMemberExpression(member) => Ok(AssignmentTarget::Member {
             object: Box::new(lower_expression(&member.object)?),
             property: MemberProperty::Static(member.property.name.to_string()),
+        }),
+        SimpleAssignmentTarget::PrivateFieldExpression(member) => Ok(AssignmentTarget::Member {
+            object: Box::new(lower_expression(&member.object)?),
+            property: MemberProperty::Static(unresolved_private_member(
+                &member.field.name.to_string(),
+            )),
         }),
         SimpleAssignmentTarget::ComputedMemberExpression(member) => Ok(AssignmentTarget::Member {
             object: Box::new(lower_expression(&member.object)?),

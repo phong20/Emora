@@ -62,6 +62,29 @@ pub fn summarize(program: &Program) -> SemanticSummary {
             visit_function(&method.function, &mut summary);
         }
     }
+    for class in &program.classes {
+        summary.effects.insert(EffectSet::CLASS_CONSTRUCT);
+        if let Some(constructor) = &class.constructor {
+            visit_function(constructor, &mut summary);
+        }
+        for element in &class.elements {
+            match element {
+                ecmora_hir::ClassElement::Method { function, .. } => {
+                    visit_function(function, &mut summary)
+                }
+                ecmora_hir::ClassElement::Field { value, .. } => {
+                    if let Some(value) = value {
+                        visit_expression(value, &mut summary);
+                    }
+                }
+                ecmora_hir::ClassElement::StaticBlock(body) => {
+                    for statement in body {
+                        visit_statement(statement, &mut summary);
+                    }
+                }
+            }
+        }
+    }
     summary
 }
 
@@ -457,6 +480,7 @@ mod tests {
             exports: Vec::new(),
             export_all: Vec::new(),
             promise_subclasses: Vec::new(),
+            classes: Vec::new(),
         };
         let summary = summarize(&program);
         assert!(summary.intrinsic_proxy);

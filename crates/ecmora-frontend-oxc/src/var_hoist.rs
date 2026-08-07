@@ -16,7 +16,26 @@ pub(crate) fn normalize_var_hoisting(mut program: Program) -> Result<Program> {
             normalize_function(&mut method.function)?;
         }
     }
+    for class in &mut program.classes {
+        normalize_class(class)?;
+    }
     Ok(program)
+}
+
+fn normalize_class(class: &mut ecmora_hir::ClassDeclaration) -> Result<()> {
+    if let Some(constructor) = &mut class.constructor {
+        normalize_function(constructor)?;
+    }
+    for element in &mut class.elements {
+        match element {
+            ecmora_hir::ClassElement::Method { function, .. } => normalize_function(function)?,
+            ecmora_hir::ClassElement::StaticBlock(body) => {
+                normalize_function_scope(body, &HashSet::new())?;
+            }
+            ecmora_hir::ClassElement::Field { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 fn normalize_function(function: &mut Function) -> Result<()> {
