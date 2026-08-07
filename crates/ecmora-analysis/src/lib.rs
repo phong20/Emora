@@ -7,7 +7,8 @@ use ecmora_hir::{
 };
 use ecmora_ir::{
     BasicBlock, BinaryNumberOperator, BlockId, Builtin, CompareNumberOperator, Function,
-    Instruction, Parameter, Program, Terminator, UnaryNumberOperator, ValueId, ValueType,
+    Instruction, Parameter, Program, Terminator, UnaryBoolOperator, UnaryNumberOperator, ValueId,
+    ValueType,
 };
 use ecmora_value::{BinaryOperator as SemBinary, UnaryOperator as SemUnary, Value};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,7 @@ mod callable_native;
 mod class_native;
 mod completion_native;
 pub mod effects;
+mod generator_cfg;
 mod generator_native;
 mod numeric;
 mod specialization;
@@ -1137,6 +1139,19 @@ impl Lowerer {
         labels: &[String],
     ) -> Result<()> {
         let discriminant = self.lower_expression(discriminant)?;
+
+        // ECMAScript CaseBlock is one lexical statement-list scope shared by
+        // all cases. Program/Block lowering already predeclares statement-list
+        // declarations; switch must do the same before case-test dispatch.
+        let switch_statements = cases
+            .iter()
+            .flat_map(|case| case.consequent.iter().cloned())
+            .collect::<Vec<_>>();
+        self.scopes.push(HashMap::new());
+        self.used_bindings
+            .push(collect_used_names(&switch_statements));
+        self.predeclare(&switch_statements)?;
+
         let outer_scopes = self.scopes.clone();
         let exit = self.new_block("switch.exit");
         let case_blocks = cases
@@ -1305,6 +1320,8 @@ impl Lowerer {
                 }
             }
         }
+        self.used_bindings.pop();
+        self.scopes.pop();
         Ok(())
     }
 
@@ -1762,6 +1779,19 @@ impl Lowerer {
                     return self.lower_number_unary(*operator, argument);
                 }
                 let operand = self.lower_expression(argument)?;
+                if *operator == UnaryOperator::Not {
+                    if let Some(known) = operand.2.as_ref() {
+                        return Ok(self.emit_value(Value::Bool(!ecmora_value::to_boolean(known))));
+                    }
+                    let boolean = self.to_boolean(operand)?;
+                    let result = self.new_value();
+                    self.emit(Instruction::UnaryBool {
+                        result,
+                        operator: UnaryBoolOperator::Not,
+                        operand: boolean,
+                    });
+                    return Ok((result, ValueType::Bool, None));
+                }
                 if *operator == UnaryOperator::Void {
                     let _ = operand;
                     return Ok(self.emit_value(Value::Undefined));

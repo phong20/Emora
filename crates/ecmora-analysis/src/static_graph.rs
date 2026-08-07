@@ -215,6 +215,14 @@ impl GraphLowerer {
         bail!("static binding `{name}` does not exist")
     }
 
+    fn function_is_static_only(&self, name: &str, function: &Function) -> bool {
+        self.function_depth > 0
+            || self.forced_functions.contains(name)
+            || name.starts_with("@gen_factory_")
+            || name.starts_with("@gen_resume_")
+            || function_needs_static_inline(function)
+    }
+
     fn predeclare_static_functions(&mut self, statements: &[Statement]) -> Result<()> {
         for statement in statements {
             let StatementKind::FunctionDeclaration(function) = &statement.kind else {
@@ -223,10 +231,7 @@ impl GraphLowerer {
             let Some(name) = &function.name else {
                 continue;
             };
-            if self.function_depth > 0
-                || self.forced_functions.contains(name)
-                || function_needs_static_inline(function)
-            {
+            if self.function_is_static_only(name, function) {
                 let closure = self.new_closure(function.clone(), None);
                 self.bind_static(name.clone(), StaticBinding::Closure(closure))?;
             }
@@ -530,7 +535,7 @@ impl GraphLowerer {
             StatementKind::FunctionDeclaration(function) => {
                 if let Some(name) = &function.name {
                     if matches!(self.lookup_static(name), Some(StaticBinding::Closure(_)))
-                        && (self.function_depth > 0 || function_needs_static_inline(function))
+                        && self.function_is_static_only(name, function)
                     {
                         Vec::new()
                     } else {
@@ -2585,6 +2590,13 @@ fn expression_needs_static_inline(expression: &Expression) -> bool {
         }),
         ExpressionKind::Call { callee, arguments } => {
             is_object_graph_builtin(callee)
+                || matches!(
+                    &callee.kind,
+                    ExpressionKind::Member {
+                        property: MemberProperty::Static(method),
+                        ..
+                    } if matches!(method.as_str(), "next" | "return" | "throw")
+                )
                 || expression_needs_static_inline(callee)
                 || arguments.iter().any(expression_needs_static_inline)
         }
@@ -2626,12 +2638,14 @@ fn expression_needs_static_inline(expression: &Expression) -> bool {
             expression_needs_static_inline(callee)
                 || arguments.iter().any(expression_needs_static_inline)
         }
+        ExpressionKind::Global(name) => {
+            name.starts_with("@gen_factory_") || name.starts_with("@gen_resume_")
+        }
         ExpressionKind::String(_)
         | ExpressionKind::Number(_)
         | ExpressionKind::BigInt(_)
         | ExpressionKind::Bool(_)
-        | ExpressionKind::Null
-        | ExpressionKind::Global(_) => false,
+        | ExpressionKind::Null => false,
     }
 }
 

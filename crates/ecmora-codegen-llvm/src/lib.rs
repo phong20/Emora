@@ -308,11 +308,6 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
         ),
         None,
     );
-    let dynamic_unary = module.add_function(
-        "ecmora_dynamic_unary",
-        i8_type.fn_type(&[i8_type.into(), ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
     let dynamic_binary = module.add_function(
         "ecmora_dynamic_binary",
         i8_type.fn_type(
@@ -1664,6 +1659,18 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         operand,
                         operand_type,
                     } => {
+                        let dynamic_unary = module
+                            .get_function("ecmora_dynamic_unary")
+                            .unwrap_or_else(|| {
+                                module.add_function(
+                                    "ecmora_dynamic_unary",
+                                    i8_type.fn_type(
+                                        &[i8_type.into(), ptr_type.into(), ptr_type.into()],
+                                        false,
+                                    ),
+                                    None,
+                                )
+                            });
                         let operand_ptr = box_value_pointer(
                             &builder,
                             values

@@ -54,6 +54,9 @@ struct Lowered {
 /// fallback. Straight-line generators, sent values, `yield*` over a local generator, and
 /// statically finite `for..of` generator consumption are fully erased here.
 pub(super) fn lower(program: &Program) -> Result<Program> {
+    if crate::generator_cfg::requires_general(program) {
+        return crate::generator_cfg::lower(program);
+    }
     let templates = collect_templates(&program.statements)?;
     if templates.is_empty() {
         return Ok(program.clone());
