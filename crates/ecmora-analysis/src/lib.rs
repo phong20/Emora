@@ -19,6 +19,7 @@ mod callable_native;
 pub mod effects;
 mod numeric;
 mod specialization;
+mod static_graph;
 mod support;
 
 use abstract_value::AbstractValue;
@@ -28,7 +29,8 @@ use specialization::*;
 use support::*;
 
 pub fn analyze(hir: &HirProgram) -> Result<Program> {
-    let scalarized_hir = aggregate_scalar::scalarize(hir)?;
+    let graph_hir = static_graph::lower(hir)?;
+    let scalarized_hir = aggregate_scalar::scalarize(&graph_hir)?;
     let hir = &scalarized_hir;
     if callable_native::requires_generic_callable_lowering(hir) {
         return callable_native::analyze(hir);

@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use ecmora_ir::{
     BinaryNumberOperator, Builtin, CallArgument, CompareNumberOperator, DynamicBinaryOperator,
-    DynamicUnaryOperator, Instruction, Program, Terminator, UnaryBoolOperator, UnaryNumberOperator,
-    ValueId, ValueType,
+    Instruction, Program, Terminator, UnaryBoolOperator, UnaryNumberOperator, ValueId, ValueType,
 };
 use inkwell::{
     AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
@@ -154,56 +153,6 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
             ],
             false,
         ),
-        None,
-    );
-    let object_get_number = module.add_function(
-        "ecmora_object_get_number",
-        f64_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
-    let object_set_number = module.add_function(
-        "ecmora_object_set_number",
-        context
-            .void_type()
-            .fn_type(&[ptr_type.into(), ptr_type.into(), f64_type.into()], false),
-        None,
-    );
-    let object_get_bool = module.add_function(
-        "ecmora_object_get_bool",
-        bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
-    let object_set_bool = module.add_function(
-        "ecmora_object_set_bool",
-        context
-            .void_type()
-            .fn_type(&[ptr_type.into(), ptr_type.into(), bool_type.into()], false),
-        None,
-    );
-    let object_get_string = module.add_function(
-        "ecmora_object_get_string",
-        ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
-    let object_set_string = module.add_function(
-        "ecmora_object_set_string",
-        context
-            .void_type()
-            .fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
-    let object_set_undefined = module.add_function(
-        "ecmora_object_set_undefined",
-        context
-            .void_type()
-            .fn_type(&[ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
-    let object_set_null = module.add_function(
-        "ecmora_object_set_null",
-        context
-            .void_type()
-            .fn_type(&[ptr_type.into(), ptr_type.into()], false),
         None,
     );
     let object_delete = module.add_function(
