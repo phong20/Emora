@@ -1,21 +1,13 @@
 #include "callable_abi.h"
+#include "object_abi.h"
+#include "value_abi.h"
+
+/* ECMORA_SPLIT_RUNTIME_V11: explicit domain dependencies; no monolithic runtime. */
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-enum {
-    ECMORA_UNDEFINED = 0,
-    ECMORA_NULL = 1,
-    ECMORA_NUMBER = 2,
-    ECMORA_BOOL = 3,
-    ECMORA_STRING = 4,
-    ECMORA_OBJECT = 5,
-    ECMORA_CALLABLE = 6,
-    ECMORA_PROMISE = 7,
-    ECMORA_CELL = 8
-};
 
 #define ECMORA_CALLABLE_MAGIC UINT64_C(0x45434d4f52414341)
 
@@ -65,33 +57,6 @@ __declspec(thread) static InvocationFrame *ecmora_invocation_top = NULL;
 #else
 static _Thread_local InvocationFrame *ecmora_invocation_top = NULL;
 #endif
-
-extern void *ecmora_object_new(void);
-extern void *ecmora_object_new_with_prototype(void *prototype);
-extern void *ecmora_object_get_prototype(void *object);
-extern bool ecmora_object_get_value(
-    void *object,
-    const char *key,
-    EcmoraValue *out
-);
-extern void ecmora_object_set_value(
-    void *object,
-    const char *key,
-    const EcmoraValue *value
-);
-extern bool ecmora_object_delete(void *object, const char *key);
-extern void ecmora_object_set_index(
-    void *object,
-    uint32_t index,
-    const EcmoraValue *value
-);
-extern uint32_t ecmora_object_length(void *object);
-extern bool ecmora_object_get_index(
-    void *object,
-    uint32_t index,
-    EcmoraValue *out
-);
-extern double ecmora_primitive_to_number(uint8_t tag, uint64_t payload);
 
 static EcmoraValue ecmora_undefined(void) {
     EcmoraValue value = { ECMORA_UNDEFINED, 0 };

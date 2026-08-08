@@ -3,11 +3,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "runtime_value.h"
 
-typedef struct {
-    uint8_t tag;
-    uint64_t payload;
-} EcmoraValue;
+/* ECMORA_SPLIT_RUNTIME_V11: EcmoraValue lives in the shared ABI type header. */
 
 enum {
     ECMORA_CALLABLE_CONSTRUCTABLE = 1u << 0,

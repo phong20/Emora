@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env,
     ffi::OsString,
     fs,
@@ -94,6 +95,168 @@ pub fn build_file(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("native LLVM codegen/link thất bại cho {}", path.display()))
 }
 
+/* ECMORA_SPLIT_RUNTIME_V11: no monolithic native runtime.
+ *
+ * Runtime translation units are selected from concrete SSA instructions, then
+ * dependency-closed. External declarations present but unused in LLVM IR do
+ * not force their runtime modules into the executable.
+ */
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NativeRuntimeModule {
+    Object,
+    Value,
+    Frame,
+    Cell,
+    Promise,
+    Diagnostic,
+    Recursion,
+    Callable,
+}
+
+impl NativeRuntimeModule {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Object => "object_abi.c",
+            Self::Value => "value_abi.c",
+            Self::Frame => "frame_abi.c",
+            Self::Cell => "cell_abi.c",
+            Self::Promise => "promise_abi.c",
+            Self::Diagnostic => "diagnostic_abi.c",
+            Self::Recursion => "recursion_abi.c",
+            Self::Callable => "callable_abi.c",
+        }
+    }
+}
+
+fn required_native_runtime_modules(program: &ecmora_ir::Program) -> BTreeSet<NativeRuntimeModule> {
+    use ecmora_ir::{Instruction, Terminator};
+
+    let mut modules = BTreeSet::new();
+
+    for function in &program.functions {
+        // LLVM codegen emits enter/leave for every ECMAScript function.
+        if function.return_type.is_some() {
+            modules.insert(NativeRuntimeModule::Recursion);
+        }
+
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match instruction {
+                    Instruction::Parameter { .. } => {
+                        modules.insert(NativeRuntimeModule::Frame);
+                    }
+                    Instruction::Capture { .. }
+                    | Instruction::ClosureNew { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::CurrentThis { .. }
+                    | Instruction::CurrentCallable { .. }
+                    | Instruction::ArgumentsObject { .. }
+                    | Instruction::RestArray { .. }
+                    | Instruction::ArrayPush { .. }
+                    | Instruction::ArraySpread { .. }
+                    | Instruction::DynamicUnary { .. }
+                    | Instruction::DynamicBinary { .. }
+                    | Instruction::DynamicGet { .. }
+                    | Instruction::DynamicSet { .. }
+                    | Instruction::DynamicDelete { .. }
+                    | Instruction::ClosureNewGeneric { .. }
+                    | Instruction::CallValue { .. }
+                    | Instruction::ConstructValue { .. }
+                    | Instruction::BindValue { .. }
+                    | Instruction::TypeOfDynamic { .. } => {
+                        modules.insert(NativeRuntimeModule::Callable);
+                    }
+
+                    Instruction::CellNew { .. }
+                    | Instruction::CellGet { .. }
+                    | Instruction::CellSet { .. } => {
+                        modules.insert(NativeRuntimeModule::Cell);
+                    }
+
+                    Instruction::PromiseResolved { .. }
+                    | Instruction::PromiseRejected { .. }
+                    | Instruction::PromisePending { .. }
+                    | Instruction::PromiseSettle { .. }
+                    | Instruction::PromiseThen { .. }
+                    | Instruction::MicrotaskDrain => {
+                        modules.insert(NativeRuntimeModule::Promise);
+                    }
+
+                    Instruction::ObjectNew { .. }
+                    | Instruction::ObjectNewWithPrototype { .. }
+                    | Instruction::ObjectGet { .. }
+                    | Instruction::ObjectSet { .. }
+                    | Instruction::ObjectDelete { .. }
+                    | Instruction::ObjectSetPrototype { .. }
+                    | Instruction::ObjectDefineAccessor { .. }
+                    | Instruction::ObjectGetPrototype { .. } => {
+                        modules.insert(NativeRuntimeModule::Object);
+                    }
+
+                    Instruction::ToBoolean { .. } | Instruction::ToNumber { .. } => {
+                        modules.insert(NativeRuntimeModule::Value);
+                    }
+
+                    Instruction::CallBuiltin { .. } => {
+                        // Static console formatting may compile to libc printf,
+                        // while tagged values use ecmora_print_dynamic.
+                        modules.insert(NativeRuntimeModule::Diagnostic);
+                    }
+
+                    Instruction::ConstUndefined { .. }
+                    | Instruction::ConstNull { .. }
+                    | Instruction::ConstNumber { .. }
+                    | Instruction::ConstBool { .. }
+                    | Instruction::ConstString { .. }
+                    | Instruction::UnaryNumber { .. }
+                    | Instruction::UnaryBool { .. }
+                    | Instruction::BinaryNumber { .. }
+                    | Instruction::CompareNumber { .. }
+                    | Instruction::CompareString { .. }
+                    | Instruction::CompareObject { .. }
+                    | Instruction::Phi { .. }
+                    | Instruction::CallDirect { .. } => {}
+                }
+            }
+
+            match &block.terminator {
+                Terminator::ThrowValue { .. } => {
+                    modules.insert(NativeRuntimeModule::Diagnostic);
+                }
+                Terminator::TailCallDirect { .. } => {
+                    modules.insert(NativeRuntimeModule::Frame);
+                }
+                Terminator::Jump(_)
+                | Terminator::Branch { .. }
+                | Terminator::ReturnI32(_)
+                | Terminator::ReturnValue { .. }
+                | Terminator::Unreachable => {}
+            }
+        }
+    }
+
+    // Translation-unit dependencies. callable_abi.c owns dynamic operations
+    // and constructor/call semantics and directly references object/value ABI.
+    // promise_abi.c invokes closures when draining Promise jobs.
+    loop {
+        let before = modules.len();
+
+        if modules.contains(&NativeRuntimeModule::Promise) {
+            modules.insert(NativeRuntimeModule::Callable);
+        }
+        if modules.contains(&NativeRuntimeModule::Callable) {
+            modules.insert(NativeRuntimeModule::Object);
+            modules.insert(NativeRuntimeModule::Value);
+        }
+
+        if modules.len() == before {
+            break;
+        }
+    }
+
+    modules
+}
+
 fn build_ssa_file(path: &Path, ssa: &ecmora_ir::Program) -> Result<PathBuf> {
     let object_suffix = if cfg!(windows) { "obj" } else { "o" };
 
@@ -111,24 +274,31 @@ fn build_ssa_file(path: &Path, ssa: &ecmora_ir::Program) -> Result<PathBuf> {
     // để resolve `puts`.
     let clang = find_clang()?;
 
-    let output = Command::new(&clang)
-        .arg(&object_path)
-        .arg(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("ecmora-runtime")
-                .join("native")
-                .join("object_runtime.c"),
-        )
-        .arg(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("ecmora-runtime")
-                .join("native")
-                .join("callable_abi.c"),
-        )
-        .arg("-o")
-        .arg(&executable_path)
+    let runtime_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("ecmora-runtime")
+        .join("native");
+    let runtime_modules = required_native_runtime_modules(ssa);
+
+    if env::var_os("ECMORA_TRACE_RUNTIME_LINK").is_some() {
+        let names = runtime_modules
+            .iter()
+            .map(|module| module.filename())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[ecmora-driver] native runtime modules: {}",
+            names.join(", ")
+        );
+    }
+
+    let mut command = Command::new(&clang);
+    command.arg(&object_path);
+    for module in &runtime_modules {
+        command.arg(runtime_dir.join(module.filename()));
+    }
+    command.arg("-o").arg(&executable_path);
+
+    let output = command
         .output()
         .with_context(|| format!("không thể chạy linker {:?}", clang))?;
 
