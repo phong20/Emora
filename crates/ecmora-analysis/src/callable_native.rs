@@ -83,9 +83,7 @@ pub(super) fn analyze(program: &HirProgram) -> Result<Program> {
         blocks,
     }];
     functions.append(&mut lowerer.generated_functions);
-    let program = Program { functions };
-    ecmora_ir::verify_program(&program)?;
-    Ok(program)
+    crate::finalize_native_program(Program { functions })
 }
 
 impl GenericLowerer {
@@ -511,12 +509,25 @@ impl GenericLowerer {
                 self.collect_expression_writes(right, writes);
                 self.collect_statement_writes(body, writes);
             }
+            StatementKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.collect_expression_writes(discriminant, writes);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        self.collect_expression_writes(test, writes);
+                    }
+                    for statement in &case.consequent {
+                        self.collect_statement_writes(statement, writes);
+                    }
+                }
+            }
             StatementKind::Empty
             | StatementKind::Debugger
             | StatementKind::FunctionDeclaration(_)
             | StatementKind::Break(_)
             | StatementKind::Continue(_)
-            | StatementKind::Switch { .. }
             | StatementKind::Try { .. } => {}
         }
     }
@@ -824,14 +835,15 @@ impl GenericLowerer {
                     body,
                     Some(label),
                 ),
-                _ => bail!("generic callable path chỉ hỗ trợ label trên loop"),
+                _ => self.lower_labeled_block(label, body),
             },
             StatementKind::ForIn { .. } | StatementKind::ForOf { .. } => {
                 bail!("generic callable path chưa hạ iterator protocol")
             }
-            StatementKind::Switch { .. } => {
-                bail!("generic callable path chưa hạ switch completion")
-            }
+            StatementKind::Switch {
+                discriminant,
+                cases,
+            } => self.lower_switch(discriminant, cases),
             StatementKind::Try { .. } => {
                 bail!("generic callable path chưa hạ try/catch/finally LLVM completion")
             }
@@ -907,6 +919,151 @@ impl GenericLowerer {
         if !then_reaches && !else_reaches {
             self.set_terminator(Terminator::Unreachable);
         }
+        Ok(())
+    }
+
+    /// General generator runtime switch invariant:
+    ///
+    /// generator_cfg emits one outer `while (true) { switch (frame.pc) {...} }`
+    /// dispatcher. Lower it to explicit IR CFG exactly once; never recursively
+    /// macro-expand it through static_graph.
+    fn lower_switch(
+        &mut self,
+        discriminant: &Expression,
+        cases: &[ecmora_hir::SwitchCase],
+    ) -> Result<()> {
+        if cases
+            .iter()
+            .flat_map(|case| &case.consequent)
+            .any(|statement| {
+                matches!(
+                    &statement.kind,
+                    StatementKind::VariableDeclaration { .. }
+                        | StatementKind::FunctionDeclaration(_)
+                )
+            })
+        {
+            bail!(
+                "generic switch with direct lexical declarations needs shared CaseBlock TDZ lowering"
+            )
+        }
+
+        // Any outer mutable cell written by a case must have one representation
+        // valid for every dispatch/fallthrough path.
+        let mut writes = HashMap::new();
+        for case in cases {
+            if let Some(test) = &case.test {
+                self.collect_expression_writes(test, &mut writes);
+            }
+            for statement in &case.consequent {
+                self.collect_statement_writes(statement, &mut writes);
+            }
+        }
+        for (name, written_type) in writes {
+            if let Some(binding) = self.find_binding_mut(&name) {
+                binding.value_type = Self::join_type(binding.value_type, written_type);
+            }
+        }
+
+        let discriminant = self.lower_expression(discriminant)?;
+        let exit = self.new_block("generic.switch.exit");
+        let case_blocks = (0..cases.len())
+            .map(|index| self.new_block(format!("generic.switch.case.{index}")))
+            .collect::<Vec<_>>();
+
+        let default_target = cases
+            .iter()
+            .position(|case| case.test.is_none())
+            .and_then(|index| case_blocks.get(index).copied())
+            .unwrap_or(exit);
+
+        let tested_cases = cases
+            .iter()
+            .enumerate()
+            .filter_map(|(index, case)| case.test.as_ref().map(|test| (index, test)))
+            .collect::<Vec<_>>();
+
+        let test_blocks = tested_cases
+            .iter()
+            .enumerate()
+            .map(|(order, _)| self.new_block(format!("generic.switch.test.{order}")))
+            .collect::<Vec<_>>();
+
+        let dispatch = test_blocks.first().copied().unwrap_or(default_target);
+        self.set_terminator(Terminator::Jump(dispatch));
+
+        // Case selectors are evaluated in source order. `default` is the
+        // final no-match target even when it appears in the middle.
+        for (order, ((case_index, test), test_block)) in
+            tested_cases.iter().zip(test_blocks.iter()).enumerate()
+        {
+            self.current = test_block.0 as usize;
+            let test_value = self.lower_expression(test)?;
+            let equal = self.emit_dynamic_binary(
+                DynamicBinaryOperator::StrictEqual,
+                discriminant,
+                test_value,
+            );
+            let condition = self.to_boolean(equal)?;
+            let miss = test_blocks
+                .get(order + 1)
+                .copied()
+                .unwrap_or(default_target);
+
+            self.set_terminator(Terminator::Branch {
+                condition,
+                then_block: case_blocks[*case_index],
+                else_block: miss,
+            });
+        }
+
+        let base_state = self.snapshot_scopes();
+        self.controls.push(ControlTarget {
+            label: None,
+            break_target: exit,
+            continue_target: None,
+        });
+
+        for (index, case) in cases.iter().enumerate() {
+            self.current = case_blocks[index].0 as usize;
+            self.scopes = base_state.clone();
+
+            for statement in &case.consequent {
+                if self.blocks[self.current].terminator.is_some() {
+                    break;
+                }
+                self.lower_statement(statement)?;
+            }
+
+            if self.blocks[self.current].terminator.is_none() {
+                let fallthrough = case_blocks.get(index + 1).copied().unwrap_or(exit);
+                self.set_terminator(Terminator::Jump(fallthrough));
+            }
+        }
+
+        self.controls.pop();
+        self.current = exit.0 as usize;
+        self.scopes = base_state;
+        Ok(())
+    }
+
+    /// completion_native erases try/catch/finally into labeled CFG regions.
+    fn lower_labeled_block(&mut self, label: &str, body: &Statement) -> Result<()> {
+        let exit = self.new_block(format!("generic.label.{label}.exit"));
+        self.controls.push(ControlTarget {
+            label: Some(label.to_owned()),
+            break_target: exit,
+            continue_target: None,
+        });
+
+        self.lower_statement(body)?;
+        self.controls.pop();
+
+        if self.blocks[self.current].terminator.is_none() {
+            self.set_terminator(Terminator::Jump(exit));
+        }
+
+        self.current = exit.0 as usize;
         Ok(())
     }
 

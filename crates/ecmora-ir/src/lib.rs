@@ -1094,6 +1094,216 @@ fn require_block(function: &Function, block: BlockId) -> Result<()> {
     }
 }
 
+/// Canonicalize provisional SSA control flow before strict verification/codegen.
+///
+/// Structured lowering may allocate blocks that later become unreachable or
+/// record a control edge before an enclosing lowering step redirects/removes
+/// that edge. A phi is not allowed to preserve those historical edges: its
+/// incoming set is defined solely by the final CFG.
+///
+/// This pass deliberately does NOT weaken value types and does NOT invent
+/// missing values. If a reachable real predecessor has no phi value, lowering
+/// is malformed and the pass fails.
+pub fn canonicalize_cfg(program: &mut Program) -> Result<()> {
+    for function in &mut program.functions {
+        canonicalize_function_cfg(function)?;
+    }
+    Ok(())
+}
+
+fn terminator_successors(terminator: &Terminator) -> Vec<BlockId> {
+    match terminator {
+        Terminator::Jump(target) => vec![*target],
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        Terminator::ReturnI32(_)
+        | Terminator::ReturnValue { .. }
+        | Terminator::ThrowValue { .. }
+        | Terminator::TailCallDirect { .. }
+        | Terminator::Unreachable => Vec::new(),
+    }
+}
+
+fn remap_cfg_target(
+    target: &mut BlockId,
+    remap: &[Option<BlockId>],
+    function_name: &str,
+) -> Result<()> {
+    let old = *target;
+    *target = remap
+        .get(old.0 as usize)
+        .copied()
+        .flatten()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "reachable CFG của `{function_name}` trỏ tới block bị prune %b{}",
+                old.0
+            )
+        })?;
+    Ok(())
+}
+
+fn remap_terminator(
+    terminator: &mut Terminator,
+    remap: &[Option<BlockId>],
+    function_name: &str,
+) -> Result<()> {
+    match terminator {
+        Terminator::Jump(target) => remap_cfg_target(target, remap, function_name),
+        Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => {
+            remap_cfg_target(then_block, remap, function_name)?;
+            remap_cfg_target(else_block, remap, function_name)
+        }
+        Terminator::ReturnI32(_)
+        | Terminator::ReturnValue { .. }
+        | Terminator::ThrowValue { .. }
+        | Terminator::TailCallDirect { .. }
+        | Terminator::Unreachable => Ok(()),
+    }
+}
+
+fn canonicalize_function_cfg(function: &mut Function) -> Result<()> {
+    if function.blocks.is_empty() {
+        bail!("function `{}` không có entry block", function.name)
+    }
+
+    let block_count = function.blocks.len();
+    let mut successors = vec![Vec::<BlockId>::new(); block_count];
+
+    for (index, block) in function.blocks.iter().enumerate() {
+        for target in terminator_successors(&block.terminator) {
+            if target.0 as usize >= block_count {
+                bail!(
+                    "function `{}` có CFG edge %b{} -> block không tồn tại %b{}",
+                    function.name,
+                    index,
+                    target.0
+                )
+            }
+            successors[index].push(target);
+        }
+    }
+
+    let mut reachable = vec![false; block_count];
+    reachable[0] = true;
+    let mut work = VecDeque::from([BlockId(0)]);
+    while let Some(block) = work.pop_front() {
+        for successor in &successors[block.0 as usize] {
+            let index = successor.0 as usize;
+            if !reachable[index] {
+                reachable[index] = true;
+                work.push_back(*successor);
+            }
+        }
+    }
+
+    let mut predecessors = vec![HashSet::<BlockId>::new(); block_count];
+    for (source_index, targets) in successors.iter().enumerate() {
+        if !reachable[source_index] {
+            continue;
+        }
+        let source = BlockId(source_index as u32);
+        for target in targets {
+            if reachable[target.0 as usize] {
+                predecessors[target.0 as usize].insert(source);
+            }
+        }
+    }
+
+    let mut remap = vec![None; block_count];
+    let mut next_id = 0u32;
+    for (old_index, is_reachable) in reachable.iter().copied().enumerate() {
+        if is_reachable {
+            remap[old_index] = Some(BlockId(next_id));
+            next_id += 1;
+        }
+    }
+
+    let function_name = function.name.clone();
+    let old_blocks = std::mem::take(&mut function.blocks);
+    let mut new_blocks = Vec::with_capacity(next_id as usize);
+
+    for (old_index, mut block) in old_blocks.into_iter().enumerate() {
+        if !reachable[old_index] {
+            continue;
+        }
+
+        let expected = &predecessors[old_index];
+
+        for instruction in &mut block.instructions {
+            let Instruction::Phi {
+                result, incoming, ..
+            } = instruction
+            else {
+                continue;
+            };
+
+            // Keep only actual reachable CFG predecessors. This removes both
+            // unreachable and stale historical lowering edges.
+            incoming.retain(|(predecessor, _)| expected.contains(predecessor));
+
+            let actual = incoming
+                .iter()
+                .map(|(predecessor, _)| *predecessor)
+                .collect::<HashSet<_>>();
+
+            if actual.len() != incoming.len() {
+                bail!(
+                    "CFG canonicalization: phi %v{} trong `{}` có predecessor trùng",
+                    result.0,
+                    function_name
+                )
+            }
+
+            // Never make malformed SSA pass by guessing a value. A missing
+            // REAL predecessor means lowering itself is wrong.
+            if &actual != expected {
+                let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+                bail!(
+                    "CFG canonicalization không thể tự bịa SSA value: phi %v{} trong `{}` thiếu predecessor thật {:?}",
+                    result.0,
+                    function_name,
+                    missing
+                )
+            }
+
+            if incoming.is_empty() {
+                bail!(
+                    "CFG canonicalization: reachable phi %v{} trong `{}` không có predecessor",
+                    result.0,
+                    function_name
+                )
+            }
+
+            for (predecessor, _) in incoming.iter_mut() {
+                let old = *predecessor;
+                *predecessor = remap[old.0 as usize].ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "phi %v{} của `{}` giữ predecessor bị prune %b{}",
+                        result.0,
+                        function_name,
+                        old.0
+                    )
+                })?;
+            }
+            incoming.sort_by_key(|(predecessor, _)| predecessor.0);
+        }
+
+        remap_terminator(&mut block.terminator, &remap, &function_name)?;
+        new_blocks.push(block);
+    }
+
+    function.blocks = new_blocks;
+    Ok(())
+}
+
 pub fn verify_program(program: &Program) -> Result<()> {
     let _ = value_types(program)?;
     for function in &program.functions {
@@ -1606,6 +1816,139 @@ pub fn dump_program(program: &Program) -> String {
         writeln!(&mut output, "}}\n").unwrap();
     }
     output
+}
+
+#[cfg(test)]
+mod cfg_canonicalization_tests {
+    use super::*;
+
+    #[test]
+    fn unreachable_phi_edge_is_pruned_without_widening_number() {
+        let live = ValueId(0);
+        let merged = ValueId(1);
+        let dead = ValueId(2);
+
+        let mut program = Program {
+            functions: vec![Function {
+                name: "js.cfg".to_owned(),
+                parameters: Vec::new(),
+                captures: Vec::new(),
+                return_type: Some(ValueType::Number),
+                blocks: vec![
+                    BasicBlock {
+                        name: "entry".to_owned(),
+                        instructions: vec![Instruction::ConstNumber {
+                            result: live,
+                            value: 42.0,
+                        }],
+                        terminator: Terminator::Jump(BlockId(1)),
+                    },
+                    BasicBlock {
+                        name: "join".to_owned(),
+                        instructions: vec![Instruction::Phi {
+                            result: merged,
+                            value_type: ValueType::Number,
+                            incoming: vec![(BlockId(0), live), (BlockId(2), dead)],
+                        }],
+                        terminator: Terminator::ReturnValue {
+                            value: merged,
+                            value_type: ValueType::Number,
+                        },
+                    },
+                    BasicBlock {
+                        name: "dead".to_owned(),
+                        instructions: vec![Instruction::ConstUndefined { result: dead }],
+                        terminator: Terminator::Jump(BlockId(1)),
+                    },
+                ],
+            }],
+        };
+
+        assert!(verify_program(&program).is_err());
+        canonicalize_cfg(&mut program).unwrap();
+
+        let function = &program.functions[0];
+        assert_eq!(function.blocks.len(), 2);
+        let Instruction::Phi {
+            value_type,
+            incoming,
+            ..
+        } = &function.blocks[1].instructions[0]
+        else {
+            panic!("join must keep its phi")
+        };
+        assert_eq!(*value_type, ValueType::Number);
+        assert_eq!(incoming, &vec![(BlockId(0), live)]);
+        verify_program(&program).unwrap();
+    }
+
+    #[test]
+    fn stale_reachable_non_predecessor_is_pruned() {
+        let condition = ValueId(0);
+        let live = ValueId(1);
+        let stale = ValueId(2);
+        let merged = ValueId(3);
+
+        let mut program = Program {
+            functions: vec![Function {
+                name: "js.stale".to_owned(),
+                parameters: Vec::new(),
+                captures: Vec::new(),
+                return_type: Some(ValueType::Number),
+                blocks: vec![
+                    BasicBlock {
+                        name: "entry".to_owned(),
+                        instructions: vec![
+                            Instruction::ConstBool {
+                                result: condition,
+                                value: true,
+                            },
+                            Instruction::ConstNumber {
+                                result: live,
+                                value: 7.0,
+                            },
+                        ],
+                        terminator: Terminator::Branch {
+                            condition,
+                            then_block: BlockId(1),
+                            else_block: BlockId(2),
+                        },
+                    },
+                    BasicBlock {
+                        name: "join".to_owned(),
+                        instructions: vec![Instruction::Phi {
+                            result: merged,
+                            value_type: ValueType::Number,
+                            incoming: vec![(BlockId(0), live), (BlockId(2), stale)],
+                        }],
+                        terminator: Terminator::ReturnValue {
+                            value: merged,
+                            value_type: ValueType::Number,
+                        },
+                    },
+                    BasicBlock {
+                        name: "other".to_owned(),
+                        instructions: vec![Instruction::ConstNumber {
+                            result: stale,
+                            value: 9.0,
+                        }],
+                        terminator: Terminator::ReturnValue {
+                            value: stale,
+                            value_type: ValueType::Number,
+                        },
+                    },
+                ],
+            }],
+        };
+
+        canonicalize_cfg(&mut program).unwrap();
+        let Instruction::Phi { incoming, .. } = &program.functions[0].blocks[1].instructions[0]
+        else {
+            panic!("join must keep its phi")
+        };
+        assert_eq!(incoming, &vec![(BlockId(0), live)]);
+        verify_program(&program).unwrap();
+    }
 }
 
 #[cfg(test)]

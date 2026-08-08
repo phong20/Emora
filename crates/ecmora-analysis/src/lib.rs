@@ -6,9 +6,9 @@ use ecmora_hir::{
     VariableKind,
 };
 use ecmora_ir::{
-    BasicBlock, BinaryNumberOperator, BlockId, Builtin, CompareNumberOperator, Function,
-    Instruction, Parameter, Program, Terminator, UnaryBoolOperator, UnaryNumberOperator, ValueId,
-    ValueType,
+    BasicBlock, BinaryNumberOperator, BlockId, Builtin, CompareNumberOperator,
+    DynamicBinaryOperator, Function, Instruction, Parameter, Program, Terminator,
+    UnaryBoolOperator, UnaryNumberOperator, ValueId, ValueType,
 };
 use ecmora_value::{BinaryOperator as SemBinary, UnaryOperator as SemUnary, Value};
 use std::collections::{HashMap, HashSet};
@@ -33,16 +33,69 @@ use effects::validate_native_semantics;
 use specialization::*;
 use support::*;
 
-pub fn analyze(hir: &HirProgram) -> Result<Program> {
-    let class_hir = class_native::lower(hir)?;
-    let generator_hir = generator_native::lower(&class_hir)?;
-    let graph_hir = static_graph::lower(&generator_hir)?;
-    let completion_hir = completion_native::lower(&graph_hir)?;
-    let scalarized_hir = aggregate_scalar::scalarize(&completion_hir)?;
-    let hir = &scalarized_hir;
-    if callable_native::requires_generic_callable_lowering(hir) {
-        return callable_native::analyze(hir);
+fn analysis_trace(phase: &str) {
+    if std::env::var_os("ECMORA_TRACE_PHASES").is_some() {
+        eprintln!("[ecmora-analysis] {phase}");
     }
+}
+
+/// Finalize provisional SSA produced by analysis before exposing it to the
+/// optimizer/codegen pipeline.
+///
+/// Analysis may create provisional/unreachable CFG fragments while lowering
+/// structured control flow. Phi semantics are defined by real CFG
+/// predecessors, not by syntactic edge bookkeeping captured earlier.
+pub(crate) fn finalize_native_program(mut program: Program) -> Result<Program> {
+    ecmora_ir::canonicalize_cfg(&mut program)?;
+    ecmora_ir::verify_program(&program)?;
+    Ok(program)
+}
+
+pub fn analyze(hir: &HirProgram) -> Result<Program> {
+    analysis_trace("class_native:begin");
+    let class_hir = class_native::lower(hir)?;
+    analysis_trace("class_native:end");
+
+    // general_generator_runtime_callable: a resumable generator has runtime
+    // object identity and runtime methods. Do not feed it into static_graph's
+    // closed-world macro-inliner.
+    let general_generator = generator_cfg::requires_general(&class_hir);
+
+    analysis_trace("generator_native:begin");
+    let generator_hir = generator_native::lower(&class_hir)?;
+    analysis_trace("generator_native:end");
+
+    if general_generator {
+        analysis_trace("generator_runtime_completion:begin");
+        let completion_hir = completion_native::lower(&generator_hir)?;
+        analysis_trace("generator_runtime_completion:end");
+
+        analysis_trace("generator_runtime_callable:begin");
+        let result = callable_native::analyze(&completion_hir);
+        analysis_trace("generator_runtime_callable:end");
+        return result;
+    }
+
+    analysis_trace("static_graph:begin");
+    let graph_hir = static_graph::lower(&generator_hir)?;
+    analysis_trace("static_graph:end");
+
+    analysis_trace("completion_native:begin");
+    let completion_hir = completion_native::lower(&graph_hir)?;
+    analysis_trace("completion_native:end");
+
+    analysis_trace("aggregate_scalar:begin");
+    let scalarized_hir = aggregate_scalar::scalarize(&completion_hir)?;
+    analysis_trace("aggregate_scalar:end");
+    let hir = &scalarized_hir;
+    analysis_trace("callable_decision:begin");
+    if callable_native::requires_generic_callable_lowering(hir) {
+        analysis_trace("callable_generic:begin");
+        let result = callable_native::analyze(hir);
+        analysis_trace("callable_generic:end");
+        return result;
+    }
+    analysis_trace("callable_decision:typed");
     validate_native_semantics(hir)?;
     if !hir.promise_subclasses.is_empty() {
         bail!("Promise subclass/@@species requires compatibility constructor objects")
@@ -58,7 +111,9 @@ pub fn analyze(hir: &HirProgram) -> Result<Program> {
         strict: hir.strict,
         ..Default::default()
     };
+    analysis_trace("typed_lowerer:begin");
     lowerer.lower_scope(&hir.statements)?;
+    analysis_trace("typed_lowerer:end");
     // An abrupt top-level completion must not execute queued work that appears
     // after the throw. The ThrowValue terminator goes straight to LLVM.
     if lowerer.blocks[lowerer.current].terminator.is_none() {
@@ -83,9 +138,10 @@ pub fn analyze(hir: &HirProgram) -> Result<Program> {
         blocks,
     }];
     functions.append(&mut lowerer.generated_functions);
-    let program = Program { functions };
-    ecmora_ir::verify_program(&program)?;
-    Ok(program)
+    analysis_trace("finalize_native_program:begin");
+    let result = finalize_native_program(Program { functions });
+    analysis_trace("finalize_native_program:end");
+    result
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +302,262 @@ struct Lowerer {
     last_callable: Option<ValueId>,
     used_bindings: Vec<HashSet<String>>,
     abstract_values: HashMap<ValueId, AbstractValue>,
+}
+
+/// Conservative loop mutation analysis.
+///
+/// The old lowerer created a phi for every initialized binding. Besides
+/// bloating SSA, that destroyed compile-time constants for loop invariants.
+/// In the generator dispatcher this was especially harmful: `resume_kind`
+/// became an unknown Number at loop.header even when `.next()` supplied a
+/// constant NEXT_KIND, so dead `.return`/`.throw` branches survived.
+///
+/// Bindings not written by loop test/body/update remain ordinary SSA values
+/// across the loop and retain constant/shape information for SCCP.
+#[derive(Default)]
+struct LoopWriteCollector {
+    writes: HashSet<String>,
+}
+
+fn collect_loop_writes(
+    test: Option<&Expression>,
+    body: &Statement,
+    update: Option<&Expression>,
+) -> HashSet<String> {
+    let mut collector = LoopWriteCollector::default();
+    if let Some(test) = test {
+        collector.expression(test);
+    }
+    collector.statement(body);
+    if let Some(update) = update {
+        collector.expression(update);
+    }
+    collector.writes
+}
+
+impl LoopWriteCollector {
+    fn assignment_target(&mut self, target: &AssignmentTarget) {
+        match target {
+            AssignmentTarget::Identifier(name) => {
+                self.writes.insert(name.clone());
+            }
+            AssignmentTarget::Member { object, property } => {
+                self.expression(object);
+                if let MemberProperty::Computed(property) = property {
+                    self.expression(property);
+                }
+            }
+        }
+    }
+
+    fn statements(&mut self, statements: &[Statement]) {
+        for statement in statements {
+            self.statement(statement);
+        }
+    }
+
+    fn statement(&mut self, statement: &Statement) {
+        match &statement.kind {
+            StatementKind::Empty
+            | StatementKind::Debugger
+            | StatementKind::Break(_)
+            | StatementKind::Continue(_)
+            | StatementKind::FunctionDeclaration(_) => {}
+
+            StatementKind::Expression(expression) | StatementKind::Throw(expression) => {
+                self.expression(expression)
+            }
+
+            StatementKind::Return(expression) => {
+                if let Some(expression) = expression {
+                    self.expression(expression);
+                }
+            }
+
+            StatementKind::VariableDeclaration { declarations, .. } => {
+                for declaration in declarations {
+                    if let Some(init) = &declaration.init {
+                        self.expression(init);
+                    }
+                }
+            }
+
+            StatementKind::Block(statements) => self.statements(statements),
+
+            StatementKind::If {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.expression(test);
+                self.statement(consequent);
+                if let Some(alternate) = alternate {
+                    self.statement(alternate);
+                }
+            }
+
+            StatementKind::While { test, body } => {
+                self.expression(test);
+                self.statement(body);
+            }
+
+            StatementKind::DoWhile { body, test } => {
+                self.statement(body);
+                self.expression(test);
+            }
+
+            StatementKind::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
+                if let Some(init) = init {
+                    match init {
+                        ForInit::Expression(expression) => self.expression(expression),
+                        ForInit::VariableDeclaration { declarations, .. } => {
+                            for declaration in declarations {
+                                if let Some(init) = &declaration.init {
+                                    self.expression(init);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(test) = test {
+                    self.expression(test);
+                }
+                self.statement(body);
+                if let Some(update) = update {
+                    self.expression(update);
+                }
+            }
+
+            StatementKind::ForIn { right, body, .. } | StatementKind::ForOf { right, body, .. } => {
+                self.expression(right);
+                self.statement(body);
+            }
+
+            StatementKind::Switch {
+                discriminant,
+                cases,
+            } => {
+                self.expression(discriminant);
+                for case in cases {
+                    if let Some(test) = &case.test {
+                        self.expression(test);
+                    }
+                    self.statements(&case.consequent);
+                }
+            }
+
+            StatementKind::Labeled { body, .. } => self.statement(body),
+
+            StatementKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                self.statement(block);
+                if let Some(handler) = handler {
+                    self.statement(&handler.body);
+                }
+                if let Some(finalizer) = finalizer {
+                    self.statement(finalizer);
+                }
+            }
+        }
+    }
+
+    fn expression(&mut self, expression: &Expression) {
+        match &expression.kind {
+            ExpressionKind::String(_)
+            | ExpressionKind::Number(_)
+            | ExpressionKind::BigInt(_)
+            | ExpressionKind::Bool(_)
+            | ExpressionKind::Null
+            | ExpressionKind::Global(_)
+            | ExpressionKind::This
+            | ExpressionKind::Function(_) => {}
+
+            ExpressionKind::Member { object, property } => {
+                self.expression(object);
+                if let MemberProperty::Computed(property) = property {
+                    self.expression(property);
+                }
+            }
+
+            ExpressionKind::Object(entries) => {
+                for entry in entries {
+                    match entry {
+                        ObjectEntry::Property(property) => {
+                            if let MemberProperty::Computed(key) = &property.key {
+                                self.expression(key);
+                            }
+                            self.expression(&property.value);
+                        }
+                        ObjectEntry::Spread(expression) => self.expression(expression),
+                        ObjectEntry::Accessor { get, set, .. } => {
+                            if let Some(get) = get {
+                                self.expression(get);
+                            }
+                            if let Some(set) = set {
+                                self.expression(set);
+                            }
+                        }
+                    }
+                }
+            }
+
+            ExpressionKind::Array(elements) => {
+                for element in elements {
+                    match element {
+                        ArrayElement::Expression(expression) | ArrayElement::Spread(expression) => {
+                            self.expression(expression)
+                        }
+                        ArrayElement::Hole => {}
+                    }
+                }
+            }
+
+            ExpressionKind::Conditional {
+                test,
+                consequent,
+                alternate,
+            } => {
+                self.expression(test);
+                self.expression(consequent);
+                self.expression(alternate);
+            }
+
+            ExpressionKind::Unary { argument, .. } | ExpressionKind::Await(argument) => {
+                self.expression(argument)
+            }
+
+            ExpressionKind::Binary { left, right, .. }
+            | ExpressionKind::Logical { left, right, .. } => {
+                self.expression(left);
+                self.expression(right);
+            }
+
+            ExpressionKind::Assignment { target, value, .. } => {
+                self.assignment_target(target);
+                self.expression(value);
+            }
+
+            ExpressionKind::Update { target, .. } => {
+                self.assignment_target(target);
+            }
+
+            ExpressionKind::Call { callee, arguments }
+            | ExpressionKind::New { callee, arguments } => {
+                self.expression(callee);
+                for argument in arguments {
+                    self.expression(argument);
+                }
+            }
+        }
+    }
 }
 
 impl Lowerer {
@@ -469,6 +781,88 @@ impl Lowerer {
                 binding.value = None;
             }
         }
+        Ok(())
+    }
+
+    /// Merge the SSA environment carried by blocks that all jump to the current
+    /// block. `edges` is control-flow truth: callers pass exactly the
+    /// predecessor states whose terminators target this block.
+    ///
+    /// A one-predecessor block does not need phis. Multiple predecessors join
+    /// differing concrete representations to Dynamic. This helper never
+    /// invents an incoming value.
+    fn merge_predecessor_scopes(&mut self, edges: &[ControlEdge]) -> Result<()> {
+        let Some((_, first_scopes)) = edges.first() else {
+            bail!("merge_predecessor_scopes cần ít nhất một predecessor")
+        };
+
+        self.scopes = first_scopes.clone();
+
+        if edges.len() == 1 {
+            return Ok(());
+        }
+
+        for scope_index in 0..self.scopes.len() {
+            let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
+
+            for name in names {
+                let first = edges[0].1[scope_index]
+                    .get(&name)
+                    .ok_or_else(|| anyhow::anyhow!("predecessor thiếu binding `{name}`"))?
+                    .clone();
+
+                let mut initialized = first.initialized;
+                let mut value_type = first.value_type;
+                let mut same_value = true;
+                let mut same_known = true;
+
+                for (_, scopes) in edges.iter().skip(1) {
+                    let binding = scopes[scope_index]
+                        .get(&name)
+                        .ok_or_else(|| anyhow::anyhow!("predecessor thiếu binding `{name}`"))?;
+                    initialized &= binding.initialized;
+                    same_value &= binding.value_id == first.value_id;
+                    same_known &= binding.value == first.value;
+                    if binding.value_type != value_type {
+                        value_type = ValueType::Dynamic;
+                    }
+                }
+
+                if same_value {
+                    let binding = self.scopes[scope_index].get_mut(&name).unwrap();
+                    *binding = first;
+                    binding.initialized = initialized;
+                    if !same_known {
+                        binding.value = None;
+                    }
+                    continue;
+                }
+
+                let incoming = edges
+                    .iter()
+                    .map(|(block, scopes)| {
+                        let binding = scopes[scope_index]
+                            .get(&name)
+                            .expect("predecessor binding shape changed");
+                        (*block, binding.value_id)
+                    })
+                    .collect::<Vec<_>>();
+
+                let result = self.new_value();
+                self.emit(Instruction::Phi {
+                    result,
+                    value_type,
+                    incoming,
+                });
+
+                let binding = self.scopes[scope_index].get_mut(&name).unwrap();
+                binding.value_id = result;
+                binding.value_type = value_type;
+                binding.initialized = initialized;
+                binding.value = None;
+            }
+        }
+
         Ok(())
     }
 
@@ -717,6 +1111,7 @@ impl Lowerer {
         if has_for_scope {
             self.scopes.push(HashMap::new());
         }
+
         if let Some(init) = init {
             match init {
                 ForInit::Expression(expression) => {
@@ -743,6 +1138,7 @@ impl Lowerer {
                             },
                         );
                     }
+
                     for declaration in declarations {
                         let value = match &declaration.init {
                             Some(expression) => self.lower_expression(expression)?,
@@ -758,6 +1154,10 @@ impl Lowerer {
             }
         }
 
+        // Compute mutation facts after `for` initialization, because the
+        // initializer executes once and is not loop-carried.
+        let loop_writes = collect_loop_writes(test, body, update);
+
         let preheader = BlockId(self.current as u32);
         let header = self.new_block("loop.header");
         let body_block = self.new_block("loop.body");
@@ -766,14 +1166,17 @@ impl Lowerer {
         self.set_terminator(Terminator::Jump(header));
 
         self.current = header.0 as usize;
-        let mut phis = Vec::<(usize, String, usize, ValueId, ValueType, Option<Value>)>::new();
+
+        // Loop CFG invariant: phi operands come from actual header predecessors.
+        let mut phis = Vec::<(usize, String, usize, ValueId, ValueType)>::new();
         for scope_index in 0..self.scopes.len() {
             let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
             for name in names {
                 let binding = self.scopes[scope_index].get(&name).unwrap().clone();
-                if !binding.initialized {
+                if !binding.initialized || binding.cell.is_some() || !loop_writes.contains(&name) {
                     continue;
                 }
+
                 let result = self.new_value();
                 let instruction_index = self.blocks[self.current].instructions.len();
                 self.emit(Instruction::Phi {
@@ -781,6 +1184,7 @@ impl Lowerer {
                     value_type: binding.value_type,
                     incoming: vec![(preheader, binding.value_id)],
                 });
+
                 let header_binding = self.scopes[scope_index].get_mut(&name).unwrap();
                 header_binding.value_id = result;
                 header_binding.value = if binding.value_type == ValueType::Object {
@@ -788,37 +1192,62 @@ impl Lowerer {
                 } else {
                     None
                 };
+
                 phis.push((
                     scope_index,
                     name,
                     instruction_index,
                     result,
                     binding.value_type,
-                    binding.value.clone(),
                 ));
             }
         }
 
-        let condition = match test {
+        let (known_test, condition) = match test {
             Some(test) => {
                 let value = self.lower_expression(test)?;
-                self.to_boolean(value)?
+                let known = value.2.as_ref().map(ecmora_value::to_boolean);
+                let condition = match known {
+                    Some(_) => None,
+                    None => Some(self.to_boolean(value)?),
+                };
+                (known, condition)
             }
-            None => self.emit_value(Value::Bool(true)).0,
+            None => (Some(true), None),
         };
-        self.set_terminator(Terminator::Branch {
-            condition,
-            then_block: body_block,
-            else_block: exit,
-        });
+
+        let header_exit_scopes = self.scopes.clone();
+
+        match known_test {
+            Some(true) => self.set_terminator(Terminator::Jump(body_block)),
+            Some(false) => self.set_terminator(Terminator::Jump(exit)),
+            None => self.set_terminator(Terminator::Branch {
+                condition: condition.expect("unknown loop test needs a condition"),
+                then_block: body_block,
+                else_block: exit,
+            }),
+        }
+
+        // A statically false loop never executes body/update.
+        if known_test == Some(false) {
+            self.current = exit.0 as usize;
+            self.scopes = header_exit_scopes;
+            if has_for_scope {
+                self.scopes.pop();
+            }
+            return Ok(());
+        }
 
         self.current = body_block.0 as usize;
+        self.scopes = header_exit_scopes.clone();
         self.control_targets.push(ControlTarget::iteration(
             labels,
             exit,
             update_block.unwrap_or(header),
         ));
+
         self.lower_statement(body)?;
+
         let control = self
             .control_targets
             .pop()
@@ -826,52 +1255,46 @@ impl Lowerer {
         let continue_edges = control.continue_edges;
         let break_edges = control.break_edges;
 
-        let body_reaches_backedge = self.blocks[self.current].terminator.is_none();
-        let body_end = BlockId(self.current as u32);
-        if body_reaches_backedge {
+        let natural_body_edge = if self.blocks[self.current].terminator.is_none() {
+            let block = BlockId(self.current as u32);
+            let scopes = self.scopes.clone();
             self.set_terminator(Terminator::Jump(update_block.unwrap_or(header)));
-        }
+            Some((block, scopes))
+        } else {
+            None
+        };
+
+        let mut header_edges = Vec::<ControlEdge>::new();
+
         if let Some(update_block) = update_block {
+            let mut update_edges = continue_edges;
+            if let Some(edge) = natural_body_edge {
+                update_edges.push(edge);
+            }
+
             self.current = update_block.0 as usize;
-            if !continue_edges.is_empty() {
-                for scope_index in 0..self.scopes.len() {
-                    let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
-                    for name in names {
-                        let mut incoming = Vec::new();
-                        if body_reaches_backedge {
-                            incoming.push((
-                                body_end,
-                                self.scopes[scope_index].get(&name).unwrap().value_id,
-                            ));
-                        }
-                        for (block, scopes) in &continue_edges {
-                            incoming
-                                .push((*block, scopes[scope_index].get(&name).unwrap().value_id));
-                        }
-                        if incoming.len() > 1 {
-                            let binding = self.scopes[scope_index].get(&name).unwrap().clone();
-                            let result = self.new_value();
-                            self.emit(Instruction::Phi {
-                                result,
-                                value_type: binding.value_type,
-                                incoming,
-                            });
-                            let binding = self.scopes[scope_index].get_mut(&name).unwrap();
-                            binding.value_id = result;
-                            binding.value = None;
-                        }
-                    }
+
+            if update_edges.is_empty() {
+                self.set_terminator(Terminator::Unreachable);
+            } else {
+                self.merge_predecessor_scopes(&update_edges)?;
+                self.lower_expression(update.expect("update block requires update expression"))?;
+
+                if self.blocks[self.current].terminator.is_none() {
+                    let backedge = BlockId(self.current as u32);
+                    let backedge_scopes = self.scopes.clone();
+                    self.set_terminator(Terminator::Jump(header));
+                    header_edges.push((backedge, backedge_scopes));
                 }
             }
-            self.lower_expression(update.unwrap())?;
-            if self.blocks[self.current].terminator.is_none() {
-                self.set_terminator(Terminator::Jump(header));
+        } else {
+            if let Some(edge) = natural_body_edge {
+                header_edges.push(edge);
             }
+            header_edges.extend(continue_edges);
         }
-        let backedge = BlockId(self.current as u32);
-        let backedge_scopes = self.scopes.clone();
-        for (scope_index, name, instruction_index, _, _, _) in &phis {
-            let back = backedge_scopes[*scope_index].get(name).unwrap();
+
+        for (scope_index, name, instruction_index, _, _) in &phis {
             let Instruction::Phi {
                 value_type,
                 incoming,
@@ -880,69 +1303,43 @@ impl Lowerer {
             else {
                 unreachable!()
             };
-            if *value_type != back.value_type {
-                bail!(
-                    "loop thay đổi kiểu `{name}` từ {:?} sang {:?}; dynamic loop operation chưa được hỗ trợ",
-                    value_type,
-                    back.value_type
-                )
-            }
-            if body_reaches_backedge {
-                incoming.push((backedge, back.value_id));
-            }
-            if update_block.is_none() {
-                for (continue_block, continue_scopes) in &continue_edges {
-                    let value = continue_scopes[*scope_index].get(name).unwrap();
-                    incoming.push((*continue_block, value.value_id));
+
+            for (block, scopes) in &header_edges {
+                let value = scopes[*scope_index].get(name).ok_or_else(|| {
+                    anyhow::anyhow!("loop predecessor %b{} thiếu binding `{name}`", block.0)
+                })?;
+
+                if *value_type != ValueType::Dynamic && *value_type != value.value_type {
+                    bail!(
+                        "loop-carried binding `{name}` đổi representation từ {:?} sang {:?} tại predecessor %b{}; \
+                         analysis cần type fixed-point/tagged plan trước khi hạ LLVM",
+                        value_type,
+                        value.value_type,
+                        block.0
+                    )
                 }
+
+                incoming.push((*block, value.value_id));
             }
         }
 
+        let mut exit_edges = break_edges;
+        if known_test.is_none() {
+            exit_edges.push((header, header_exit_scopes));
+        }
+
         self.current = exit.0 as usize;
-        // Values visible after the loop are the header phi values and are unknown.
-        for (scope_index, name, _, result, value_type, shape) in phis {
-            let binding = self.scopes[scope_index].get_mut(&name).unwrap();
-            binding.value_id = result;
-            binding.value_type = value_type;
-            binding.value = if value_type == ValueType::Object {
-                shape
-            } else {
-                None
-            };
+
+        if exit_edges.is_empty() {
+            self.set_terminator(Terminator::Unreachable);
+        } else {
+            self.merge_predecessor_scopes(&exit_edges)?;
         }
-        if !break_edges.is_empty() {
-            for scope_index in 0..self.scopes.len() {
-                let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
-                for name in names {
-                    let normal = self.scopes[scope_index].get(&name).unwrap().clone();
-                    let mut incoming = vec![(header, normal.value_id)];
-                    let mut value_type = normal.value_type;
-                    for (block, scopes) in &break_edges {
-                        let binding = scopes[scope_index].get(&name).unwrap();
-                        incoming.push((*block, binding.value_id));
-                        if binding.value_type != value_type {
-                            value_type = ValueType::Dynamic;
-                        }
-                    }
-                    if incoming.iter().all(|(_, value)| *value == normal.value_id) {
-                        continue;
-                    }
-                    let result = self.new_value();
-                    self.emit(Instruction::Phi {
-                        result,
-                        value_type,
-                        incoming,
-                    });
-                    let binding = self.scopes[scope_index].get_mut(&name).unwrap();
-                    binding.value_id = result;
-                    binding.value_type = value_type;
-                    binding.value = None;
-                }
-            }
-        }
+
         if has_for_scope {
             self.scopes.pop();
         }
+
         Ok(())
     }
 
@@ -1014,121 +1411,155 @@ impl Lowerer {
         self.set_terminator(Terminator::Jump(body_block));
 
         self.current = body_block.0 as usize;
-        let mut phis = Vec::new();
+
+        let loop_writes = collect_loop_writes(Some(test), body, None);
+
+        // Do/while CFG invariant: test predecessors are merged before evaluating the test.
+        let mut phis = Vec::<(usize, String, usize, ValueId, ValueType)>::new();
         for scope_index in 0..self.scopes.len() {
             let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
             for name in names {
                 let binding = self.scopes[scope_index].get(&name).unwrap().clone();
-                if !binding.initialized {
+                if !binding.initialized || binding.cell.is_some() || !loop_writes.contains(&name) {
                     continue;
                 }
+
                 let result = self.new_value();
-                let index = self.blocks[self.current].instructions.len();
+                let instruction_index = self.blocks[self.current].instructions.len();
                 self.emit(Instruction::Phi {
                     result,
                     value_type: binding.value_type,
                     incoming: vec![(preheader, binding.value_id)],
                 });
-                self.scopes[scope_index].get_mut(&name).unwrap().value_id = result;
-                phis.push((scope_index, name, index, result, binding.value_type));
+
+                let body_binding = self.scopes[scope_index].get_mut(&name).unwrap();
+                body_binding.value_id = result;
+                body_binding.value = if binding.value_type == ValueType::Object {
+                    binding.value.clone()
+                } else {
+                    None
+                };
+
+                phis.push((
+                    scope_index,
+                    name,
+                    instruction_index,
+                    result,
+                    binding.value_type,
+                ));
             }
         }
+
         self.control_targets
             .push(ControlTarget::iteration(labels, exit, test_block));
         self.lower_statement(body)?;
+
         let control = self
             .control_targets
             .pop()
             .expect("do-while control target disappeared");
         let continue_edges = control.continue_edges;
         let break_edges = control.break_edges;
-        let body_reaches_test = self.blocks[self.current].terminator.is_none();
-        let body_end = BlockId(self.current as u32);
-        if body_reaches_test {
+
+        let natural_body_edge = if self.blocks[self.current].terminator.is_none() {
+            let block = BlockId(self.current as u32);
+            let scopes = self.scopes.clone();
             self.set_terminator(Terminator::Jump(test_block));
+            Some((block, scopes))
+        } else {
+            None
+        };
+
+        let mut test_edges = continue_edges;
+        if let Some(edge) = natural_body_edge {
+            test_edges.push(edge);
         }
-        let body_scopes = self.scopes.clone();
 
         self.current = test_block.0 as usize;
-        if !continue_edges.is_empty() {
-            for scope_index in 0..self.scopes.len() {
-                let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
-                for name in names {
-                    let mut incoming = Vec::new();
-                    if body_reaches_test {
-                        incoming.push((
-                            body_end,
-                            body_scopes[scope_index].get(&name).unwrap().value_id,
-                        ));
-                    }
-                    for (block, scopes) in &continue_edges {
-                        incoming.push((*block, scopes[scope_index].get(&name).unwrap().value_id));
-                    }
-                    if incoming.len() > 1 {
-                        let value_type = body_scopes[scope_index].get(&name).unwrap().value_type;
-                        let result = self.new_value();
-                        self.emit(Instruction::Phi {
-                            result,
-                            value_type,
-                            incoming,
-                        });
-                        self.scopes[scope_index].get_mut(&name).unwrap().value_id = result;
-                    }
-                }
-            }
-        }
-        let test_value = self.lower_expression(test)?;
-        let condition = self.to_boolean(test_value)?;
-        self.set_terminator(Terminator::Branch {
-            condition,
-            then_block: body_block,
-            else_block: exit,
-        });
-        let backedge = BlockId(self.current as u32);
-        let test_scopes = self.scopes.clone();
-        for (scope_index, name, index, _, _) in &phis {
-            let value = test_scopes[*scope_index].get(name).unwrap();
-            let Instruction::Phi {
-                incoming,
-                value_type,
-                ..
-            } = &mut self.blocks[body_block.0 as usize].instructions[*index]
-            else {
-                unreachable!()
+
+        let mut body_backedge: Option<ControlEdge> = None;
+        let mut normal_exit_edge: Option<ControlEdge> = None;
+
+        if test_edges.is_empty() {
+            self.set_terminator(Terminator::Unreachable);
+        } else {
+            self.merge_predecessor_scopes(&test_edges)?;
+
+            let test_value = self.lower_expression(test)?;
+            let known_test = test_value.2.as_ref().map(ecmora_value::to_boolean);
+            let condition = match known_test {
+                Some(_) => None,
+                None => Some(self.to_boolean(test_value)?),
             };
-            if *value_type != value.value_type {
-                bail!("do-while đổi kiểu binding `{name}`")
-            }
-            incoming.push((backedge, value.value_id));
-        }
-        self.current = exit.0 as usize;
-        for (scope_index, name, _, _result, value_type) in &phis {
-            let binding = self.scopes[*scope_index].get_mut(name).unwrap();
-            binding.value_id = test_scopes[*scope_index].get(name).unwrap().value_id;
-            binding.value_type = *value_type;
-            binding.value = None;
-        }
-        if !break_edges.is_empty() {
-            for scope_index in 0..self.scopes.len() {
-                let names = self.scopes[scope_index].keys().cloned().collect::<Vec<_>>();
-                for name in names {
-                    let normal = self.scopes[scope_index].get(&name).unwrap().clone();
-                    let mut incoming = vec![(test_block, normal.value_id)];
-                    for (block, scopes) in &break_edges {
-                        incoming.push((*block, scopes[scope_index].get(&name).unwrap().value_id));
-                    }
-                    if incoming.len() > 1 {
-                        let result = self.new_value();
-                        self.emit(Instruction::Phi {
-                            result,
-                            value_type: normal.value_type,
-                            incoming,
-                        });
-                        self.scopes[scope_index].get_mut(&name).unwrap().value_id = result;
-                    }
+
+            let edge_block = BlockId(self.current as u32);
+            let edge_scopes = self.scopes.clone();
+
+            match known_test {
+                Some(true) => {
+                    self.set_terminator(Terminator::Jump(body_block));
+                    body_backedge = Some((edge_block, edge_scopes));
+                }
+                Some(false) => {
+                    self.set_terminator(Terminator::Jump(exit));
+                    normal_exit_edge = Some((edge_block, edge_scopes));
+                }
+                None => {
+                    self.set_terminator(Terminator::Branch {
+                        condition: condition.expect("unknown do-while test needs condition"),
+                        then_block: body_block,
+                        else_block: exit,
+                    });
+                    body_backedge = Some((edge_block, edge_scopes.clone()));
+                    normal_exit_edge = Some((edge_block, edge_scopes));
                 }
             }
         }
+
+        if let Some((backedge, scopes)) = &body_backedge {
+            for (scope_index, name, instruction_index, _, _) in &phis {
+                let value = scopes[*scope_index].get(name).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "do-while predecessor %b{} thiếu binding `{name}`",
+                        backedge.0
+                    )
+                })?;
+
+                let Instruction::Phi {
+                    incoming,
+                    value_type,
+                    ..
+                } = &mut self.blocks[body_block.0 as usize].instructions[*instruction_index]
+                else {
+                    unreachable!()
+                };
+
+                if *value_type != ValueType::Dynamic && *value_type != value.value_type {
+                    bail!(
+                        "do-while loop-carried binding `{name}` đổi representation từ {:?} sang {:?} tại predecessor %b{}; \
+                         analysis cần type fixed-point/tagged plan trước khi hạ LLVM",
+                        value_type,
+                        value.value_type,
+                        backedge.0
+                    )
+                }
+
+                incoming.push((*backedge, value.value_id));
+            }
+        }
+
+        let mut exit_edges = break_edges;
+        if let Some(edge) = normal_exit_edge {
+            exit_edges.push(edge);
+        }
+
+        self.current = exit.0 as usize;
+        if exit_edges.is_empty() {
+            self.set_terminator(Terminator::Unreachable);
+        } else {
+            self.merge_predecessor_scopes(&exit_edges)?;
+        }
+
         Ok(())
     }
 
@@ -1351,6 +1782,20 @@ impl Lowerer {
     ) -> Result<()> {
         let condition_value = self.lower_expression(test)?;
         let condition_is_true = condition_value.2.as_ref().map(ecmora_value::to_boolean);
+
+        // SCCP: a known branch is control flow, not merely known-value metadata.
+        // The test has already been evaluated, so all of its side effects are
+        // preserved. The unselected arm must not become a fake SSA predecessor.
+        if let Some(selected) = condition_is_true {
+            return if selected {
+                self.lower_statement(consequent)
+            } else if let Some(alternate) = alternate {
+                self.lower_statement(alternate)
+            } else {
+                Ok(())
+            };
+        }
+
         let condition = self.to_boolean(condition_value)?;
         let then_block = self.new_block("if.then");
         let else_block = self.new_block("if.else");
@@ -1915,10 +2360,9 @@ impl Lowerer {
                     _ => None,
                 };
                 if matches!(operator, BinaryOperator::In | BinaryOperator::InstanceOf) {
-                    return match known {
-                        Some(value) => Ok(self.emit_value(value)),
-                        None => bail!("in/instanceof dynamic native IR chưa được hỗ trợ"),
-                    };
+                    if let Some(value) = known {
+                        return Ok(self.emit_value(value));
+                    }
                 }
                 if left.1 == ValueType::Number && right.1 == ValueType::Number {
                     if let Some(operator) = number_operator(*operator) {
@@ -1979,7 +2423,16 @@ impl Lowerer {
                 match known {
                     Some(value) => Ok(self.emit_value(value)),
                     None => {
-                        bail!("dynamic/coercing binary operation chưa được hỗ trợ trong native IR")
+                        let result = self.new_value();
+                        self.emit(Instruction::DynamicBinary {
+                            result,
+                            operator: native_dynamic_binary_operator(*operator),
+                            left: left.0,
+                            left_type: left.1,
+                            right: right.0,
+                            right_type: right.1,
+                        });
+                        Ok((result, ValueType::Dynamic, None))
                     }
                 }
             }
@@ -2020,33 +2473,10 @@ impl Lowerer {
                 operator,
                 prefix,
             } => {
-                if let AssignmentTarget::Member { object, property } = target {
-                    let old = self.lower_object_get(object, property)?;
-                    if old.1 != ValueType::Number {
-                        bail!("object update ++/-- hiện cần Number")
-                    }
-                    let one = self.emit_value(Value::Number(1.0));
-                    let result = self.new_value();
-                    self.emit(Instruction::BinaryNumber {
-                        result,
-                        operator: if *operator == UpdateOperator::Increment {
-                            BinaryNumberOperator::Add
-                        } else {
-                            BinaryNumberOperator::Subtract
-                        },
-                        left: old.0,
-                        right: one.0,
-                    });
-                    let object_value = self.lower_expression(object)?;
-                    let key = self.lower_property_key(property)?;
-                    self.emit(Instruction::ObjectSet {
-                        object: object_value.0,
-                        key,
-                        value: result,
-                        value_type: ValueType::Number,
-                    });
-                    let new = (result, ValueType::Number, None);
-                    return Ok(if *prefix { new } else { old });
+                if let AssignmentTarget::Member { .. } = target {
+                    bail!(
+                        "heap property ++/-- cần dedicated native UpdateProperty op;                          lowering cũ đánh giá receiver hai lần nên đã bị loại bỏ"
+                    )
                 }
                 let AssignmentTarget::Identifier(name) = target else {
                     unreachable!()
@@ -2124,66 +2554,58 @@ impl Lowerer {
         object_expression: &Expression,
         property: &MemberProperty,
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
-        let retain_known_shape = matches!(
-            &object_expression.kind,
-            ExpressionKind::Global(name) if name.starts_with("@destructure.")
-        );
         let object = self.lower_expression(object_expression)?;
-        if object.1 != ValueType::Object {
-            bail!("property access hiện cần Object")
+        if !matches!(object.1, ValueType::Object | ValueType::Dynamic) {
+            bail!(
+                "property access cần Object/Dynamic, nhận {:?}; primitive property boxing chưa được hạ",
+                object.1
+            )
         }
         let key = self.lower_property_key(property)?;
-        if let Some(accessor) = self.static_accessors.get(&(object.0, key.clone())).cloned() {
-            if let Some(getter) = accessor.getter {
-                let value = self.lower_inline_call(
-                    "accessor.get",
-                    &getter.function,
-                    &[],
-                    Some(&getter.captures),
-                )?;
-                if let Some(callable) = self.last_callable.take() {
-                    self.emit(Instruction::ObjectDefineAccessor {
-                        object: object.0,
-                        key: key.clone(),
-                        getter: Some(callable),
-                        setter: None,
-                        enumerable: true,
-                        configurable: true,
-                    });
+
+        // A compile-time accessor closure can stay on the typed/inlined path.
+        // Once the object itself is Dynamic, generic runtime Get owns the
+        // property semantics instead.
+        if object.1 == ValueType::Object {
+            if let Some(accessor) = self.static_accessors.get(&(object.0, key.clone())).cloned() {
+                if let Some(getter) = accessor.getter {
+                    let value = self.lower_inline_call(
+                        "accessor.get",
+                        &getter.function,
+                        &[],
+                        Some(&getter.captures),
+                    )?;
+                    if let Some(callable) = self.last_callable.take() {
+                        self.emit(Instruction::ObjectDefineAccessor {
+                            object: object.0,
+                            key: key.clone(),
+                            getter: Some(callable),
+                            setter: None,
+                            enumerable: true,
+                            configurable: true,
+                        });
+                    }
+                    return Ok(value);
                 }
-                return Ok(value);
+                return Ok(self.emit_value(Value::Undefined));
             }
-            return Ok(self.emit_value(Value::Undefined));
         }
-        let shape_value = object
-            .2
-            .as_ref()
-            .map(|object| ecmora_value::get_property(object, &key));
-        let value_type = shape_value
-            .as_ref()
-            .map(type_of)
-            .unwrap_or(ValueType::Dynamic);
-        if value_type == ValueType::Dynamic {
-            bail!("không suy ra được kiểu property `{key}`")
-        }
+
+        // Heap object invariant: surviving heap properties are tagged ECMAScript values.
+        //
+        // Closed-world object literals that can be proven scalar are removed by
+        // aggregate_scalar before this Lowerer. A property that still lives in
+        // the heap may legally change Number -> String -> Undefined, may be
+        // absent, or may be supplied by prototype/accessor semantics. Therefore
+        // a heap Get is a tagged load, not a speculative concrete unbox.
         let result = self.new_value();
-        self.emit(Instruction::ObjectGet {
+        self.emit(Instruction::DynamicGet {
             result,
             object: object.0,
+            object_type: object.1,
             key,
-            value_type,
         });
-        // Loads are runtime values; retaining a literal here would make loop
-        // exits print the state from the compiler's first abstract iteration.
-        Ok((
-            result,
-            value_type,
-            if retain_known_shape {
-                shape_value
-            } else {
-                None
-            },
-        ))
+        Ok((result, ValueType::Dynamic, None))
     }
 
     fn lower_object_assignment(
@@ -2193,12 +2615,20 @@ impl Lowerer {
         operator: AssignmentOperator,
         rhs_expression: &Expression,
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
+        // Evaluate receiver/key exactly once and before RHS, matching ECMAScript
+        // assignment evaluation order.
         let object = self.lower_expression(object_expression)?;
-        if object.1 != ValueType::Object {
-            bail!("property assignment hiện cần Object")
+        if !matches!(object.1, ValueType::Object | ValueType::Dynamic) {
+            bail!(
+                "property assignment cần Object/Dynamic, nhận {:?}; primitive setter boxing chưa được hạ",
+                object.1
+            )
         }
         let key = self.lower_property_key(property)?;
-        if operator == AssignmentOperator::Assign {
+
+        // Preserve the closed-world accessor fast path when the receiver has a
+        // statically identified object.
+        if operator == AssignmentOperator::Assign && object.1 == ValueType::Object {
             if let Some(accessor) = self.static_accessors.get(&(object.0, key.clone())).cloned() {
                 if let Some(setter) = accessor.setter {
                     let value = self.lower_expression(rhs_expression)?;
@@ -2239,53 +2669,54 @@ impl Lowerer {
                 }
             }
         }
-        let value = if operator == AssignmentOperator::Assign {
-            self.lower_expression(rhs_expression)?
-        } else {
-            let old_shape = object
-                .2
-                .as_ref()
-                .map(|object| ecmora_value::get_property(object, &key));
-            let old_type = old_shape
-                .as_ref()
-                .map(type_of)
-                .unwrap_or(ValueType::Dynamic);
-            let old_id = self.new_value();
-            self.emit(Instruction::ObjectGet {
-                result: old_id,
+
+        if operator == AssignmentOperator::Assign {
+            let value = self.lower_expression(rhs_expression)?;
+            self.emit(Instruction::DynamicSet {
                 object: object.0,
-                key: key.clone(),
-                value_type: old_type,
+                object_type: object.1,
+                key,
+                value: value.0,
+                value_type: value.1,
             });
-            let binary = assignment_binary(operator).ok_or_else(|| {
-                anyhow::anyhow!("logical object assignment động chưa được hỗ trợ")
-            })?;
-            let rhs_hint = (old_type == ValueType::Number).then_some(ValueType::Number);
-            let rhs = self.lower_expression_with_hint(rhs_expression, rhs_hint)?;
-            if old_type != ValueType::Number || rhs.1 != ValueType::Number {
-                bail!("compound object assignment hiện cần Number")
-            }
-            let native_operator = number_operator_for_sem(binary)
-                .ok_or_else(|| anyhow::anyhow!("compound object operator chưa được hỗ trợ"))?;
-            let result = self.new_value();
-            self.emit(Instruction::BinaryNumber {
-                result,
-                operator: native_operator,
-                left: old_id,
-                right: rhs.0,
-            });
-            (result, ValueType::Number, None)
-        };
-        self.emit(Instruction::ObjectSet {
-            object: object.0,
-            key: key.clone(),
-            value: value.0,
-            value_type: value.1,
-        });
-        if let (Some(object), Some(known)) = (object.2.as_ref(), value.2.clone()) {
-            ecmora_value::set_property(object, key, known)?;
+            return Ok(value);
         }
-        Ok(value)
+
+        let dynamic_operator = native_dynamic_assignment_operator(operator).ok_or_else(|| {
+            anyhow::anyhow!(
+                "logical heap property assignment cần short-circuit CFG lowering; \
+                 không được hạ thành eager DynamicBinary"
+            )
+        })?;
+
+        let old = self.new_value();
+        self.emit(Instruction::DynamicGet {
+            result: old,
+            object: object.0,
+            object_type: object.1,
+            key: key.clone(),
+        });
+
+        let rhs = self.lower_expression(rhs_expression)?;
+        let result = self.new_value();
+        self.emit(Instruction::DynamicBinary {
+            result,
+            operator: dynamic_operator,
+            left: old,
+            left_type: ValueType::Dynamic,
+            right: rhs.0,
+            right_type: rhs.1,
+        });
+
+        self.emit(Instruction::DynamicSet {
+            object: object.0,
+            object_type: object.1,
+            key,
+            value: result,
+            value_type: ValueType::Dynamic,
+        });
+
+        Ok((result, ValueType::Dynamic, None))
     }
 
     fn lower_conditional(
@@ -2296,6 +2727,16 @@ impl Lowerer {
     ) -> Result<(ValueId, ValueType, Option<Value>)> {
         let test = self.lower_expression(test)?;
         let known_test = test.2.as_ref().map(ecmora_value::to_boolean);
+
+        // SCCP: do not materialize the unselected conditional-expression arm.
+        if let Some(selected) = known_test {
+            return if selected {
+                self.lower_expression(consequent)
+            } else {
+                self.lower_expression(alternate)
+            };
+        }
+
         let condition = self.to_boolean(test)?;
         let then_block = self.new_block("conditional.then");
         let else_block = self.new_block("conditional.else");
@@ -4227,6 +4668,56 @@ impl Lowerer {
         });
         result
     }
+}
+
+fn native_dynamic_binary_operator(operator: BinaryOperator) -> DynamicBinaryOperator {
+    match operator {
+        BinaryOperator::Add => DynamicBinaryOperator::Add,
+        BinaryOperator::Subtract => DynamicBinaryOperator::Subtract,
+        BinaryOperator::Multiply => DynamicBinaryOperator::Multiply,
+        BinaryOperator::Divide => DynamicBinaryOperator::Divide,
+        BinaryOperator::Remainder => DynamicBinaryOperator::Remainder,
+        BinaryOperator::Exponential => DynamicBinaryOperator::Exponential,
+        BinaryOperator::Equal => DynamicBinaryOperator::Equal,
+        BinaryOperator::NotEqual => DynamicBinaryOperator::NotEqual,
+        BinaryOperator::StrictEqual => DynamicBinaryOperator::StrictEqual,
+        BinaryOperator::StrictNotEqual => DynamicBinaryOperator::StrictNotEqual,
+        BinaryOperator::LessThan => DynamicBinaryOperator::LessThan,
+        BinaryOperator::LessEqual => DynamicBinaryOperator::LessEqual,
+        BinaryOperator::GreaterThan => DynamicBinaryOperator::GreaterThan,
+        BinaryOperator::GreaterEqual => DynamicBinaryOperator::GreaterEqual,
+        BinaryOperator::ShiftLeft => DynamicBinaryOperator::ShiftLeft,
+        BinaryOperator::ShiftRight => DynamicBinaryOperator::ShiftRight,
+        BinaryOperator::ShiftRightZeroFill => DynamicBinaryOperator::ShiftRightZeroFill,
+        BinaryOperator::BitwiseOr => DynamicBinaryOperator::BitwiseOr,
+        BinaryOperator::BitwiseXor => DynamicBinaryOperator::BitwiseXor,
+        BinaryOperator::BitwiseAnd => DynamicBinaryOperator::BitwiseAnd,
+        BinaryOperator::In => DynamicBinaryOperator::In,
+        BinaryOperator::InstanceOf => DynamicBinaryOperator::InstanceOf,
+    }
+}
+
+fn native_dynamic_assignment_operator(
+    operator: AssignmentOperator,
+) -> Option<DynamicBinaryOperator> {
+    Some(match operator {
+        AssignmentOperator::Assign
+        | AssignmentOperator::LogicalOr
+        | AssignmentOperator::LogicalAnd
+        | AssignmentOperator::LogicalNullish => return None,
+        AssignmentOperator::Add => DynamicBinaryOperator::Add,
+        AssignmentOperator::Subtract => DynamicBinaryOperator::Subtract,
+        AssignmentOperator::Multiply => DynamicBinaryOperator::Multiply,
+        AssignmentOperator::Divide => DynamicBinaryOperator::Divide,
+        AssignmentOperator::Remainder => DynamicBinaryOperator::Remainder,
+        AssignmentOperator::Exponential => DynamicBinaryOperator::Exponential,
+        AssignmentOperator::ShiftLeft => DynamicBinaryOperator::ShiftLeft,
+        AssignmentOperator::ShiftRight => DynamicBinaryOperator::ShiftRight,
+        AssignmentOperator::ShiftRightZeroFill => DynamicBinaryOperator::ShiftRightZeroFill,
+        AssignmentOperator::BitwiseOr => DynamicBinaryOperator::BitwiseOr,
+        AssignmentOperator::BitwiseXor => DynamicBinaryOperator::BitwiseXor,
+        AssignmentOperator::BitwiseAnd => DynamicBinaryOperator::BitwiseAnd,
+    })
 }
 
 #[cfg(test)]

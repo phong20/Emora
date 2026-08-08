@@ -758,8 +758,32 @@ impl GraphLowerer {
                     }
                     StaticValue::Runtime(object_value) => {
                         let property = self.lower_member_property(property)?;
+                        let mut prefix = object.prefix;
+
+                        // ANF invariant: a non-atomic runtime Member receiver is materialized exactly once.
+                        //
+                        // Calls, object/array literals, conditionals and other
+                        // compound receivers must not stay nested below a
+                        // property read. Besides preserving exactly-once
+                        // evaluation, this exposes transient object literals as
+                        // declarations to aggregate_scalar, so {value, done}
+                        // results can become scalar SSA instead of a recursive
+                        // aggregate expression.
+                        let object_value = if runtime_member_receiver_needs_anf(&object_value) {
+                            let temporary = self.fresh_name("member_base");
+                            prefix.push(variable_statement(
+                                VariableKind::Let,
+                                temporary.clone(),
+                                Some(object_value),
+                                span,
+                            ));
+                            global_expression(temporary, span)
+                        } else {
+                            object_value
+                        };
+
                         Ok(Lowered {
-                            prefix: object.prefix,
+                            prefix,
                             value: StaticValue::Runtime(Expression {
                                 kind: ExpressionKind::Member {
                                     object: Box::new(object_value),
@@ -2088,6 +2112,25 @@ impl GraphLowerer {
         }
         rename_function(function, &mapping)
     }
+}
+
+/// Return true when a runtime receiver should cross an ANF statement boundary
+/// before a property access.
+///
+/// Global/This are already atomic references. Primitive literals are also
+/// atomic (their eventual property semantics are validated by later lowering).
+/// Everything else may contain evaluation, allocation, or a nested aggregate.
+fn runtime_member_receiver_needs_anf(expression: &Expression) -> bool {
+    !matches!(
+        &expression.kind,
+        ExpressionKind::Global(_)
+            | ExpressionKind::This
+            | ExpressionKind::String(_)
+            | ExpressionKind::Number(_)
+            | ExpressionKind::BigInt(_)
+            | ExpressionKind::Bool(_)
+            | ExpressionKind::Null
+    )
 }
 
 fn require_runtime(value: StaticValue, context: &str) -> Result<Expression> {

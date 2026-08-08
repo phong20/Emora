@@ -501,6 +501,13 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                 )?;
             }
             for instruction in &block.instructions {
+                if matches!(instruction, Instruction::Phi { .. }) {
+                    continue;
+                }
+
+                // LLVM CFG cursor invariant: every IR instruction starts at the tracked block exit.
+                builder.position_at_end(llvm_block_exits[index]);
+
                 match instruction {
                     Instruction::Parameter {
                         result,
@@ -2515,6 +2522,11 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                     }
                 }
             }
+            // LLVM CFG cursor invariant: the IR terminator belongs to the tracked block exit.
+            // Helpers such as propagate_call_completion/build_guarded_dynamic_add
+            // may move Builder and then update llvm_block_exits[index].
+            builder.position_at_end(llvm_block_exits[index]);
+
             match &block.terminator {
                 Terminator::Jump(target) => {
                     builder.build_unconditional_branch(llvm_blocks[target.0 as usize])?;
@@ -2667,6 +2679,20 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                 }
             }
         }
+        // Source LLVM blocks must terminate even when an IR instruction
+        // splits execution into helper continuation blocks.
+        for (index, llvm_block) in llvm_blocks.iter().enumerate() {
+            if llvm_block.get_terminator().is_none() {
+                bail!(
+                    "LLVM CFG invariant violated: original block %b{} `{}` in function `{}` has no terminator after lowering; tracked exit={:?}",
+                    index,
+                    function.blocks[index].name,
+                    function.name,
+                    llvm_block_exits[index].get_name(),
+                )
+            }
+        }
+
         for block in &function.blocks {
             for instruction in &block.instructions {
                 let Instruction::Phi {
@@ -2684,7 +2710,29 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                         .get(value_id)
                         .copied()
                         .with_context(|| format!("SSA value %v{} chưa được codegen", value_id.0))?;
+                    let predecessor = llvm_block_exits[block_id.0 as usize];
+
+                    // Dynamic PHI edge invariant: materialize boxing in the predecessor before its terminator.
+                    //
+                    // `to_dynamic` emits real LLVM instructions. PHI wiring runs
+                    // after source-block terminators already exist, so boxing at
+                    // the Builder's current cursor can append instructions after
+                    // a terminator and corrupt an otherwise valid basic block.
+                    //
+                    // PHI incoming conversions are edge materialization. The
+                    // tracked predecessor exit is the exact LLVM block that
+                    // corresponds to this SSA incoming edge, so insert the pure
+                    // boxing sequence immediately before its terminator.
                     let value: BasicValueEnum<'ctx> = if *value_type == ValueType::Dynamic {
+                        let terminator = predecessor.get_terminator().with_context(|| {
+                                format!(
+                                    "dynamic phi %v{} predecessor %b{} / LLVM block `{}` thiếu terminator trước edge materialization",
+                                    result.0,
+                                    block_id.0,
+                                    predecessor.get_name().to_string_lossy(),
+                                )
+                            })?;
+                        builder.position_before(&terminator);
                         to_dynamic(
                             &builder,
                             value,
@@ -2697,13 +2745,27 @@ fn build_module<'ctx>(context: &'ctx LlvmContext, program: &Program) -> Result<M
                     } else {
                         value
                     };
-                    incoming_values.push((value, llvm_block_exits[block_id.0 as usize]));
+
+                    incoming_values.push((value, predecessor));
                 }
                 let refs = incoming_values
                     .iter()
                     .map(|(value, block)| (value as &dyn BasicValue<'ctx>, *block))
                     .collect::<Vec<_>>();
                 phi.add_incoming(&refs);
+            }
+        }
+
+        // Validate after PHI wiring, not only before it. This catches any LLVM
+        // instruction accidentally emitted after a terminator by edge
+        // materialization or a future PHI conversion.
+        for llvm_block in main.get_basic_blocks() {
+            if llvm_block.get_terminator().is_none() {
+                bail!(
+                    "LLVM CFG invalid after PHI edge materialization: function `{}`, block `{}` has no final terminator",
+                    function.name,
+                    llvm_block.get_name().to_string_lossy(),
+                )
             }
         }
     }
